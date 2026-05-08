@@ -224,7 +224,7 @@ def run_full_benchmark(tasks: list[dict], mode: str, dataset_md5: str) -> None:
                 problem_text=task["text"],
                 test_list=task["test_list"],
                 mode=mode,
-                prompt_repetition=args.prompt_repetition,
+                prompt_repetition=True,
             )
         except Exception as exc:
             tqdm.write(f"  [{label}] ERROR: {exc}")
