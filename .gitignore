@@ -1,0 +1,26 @@
+# Environment / secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# vLLM PR clone
+vllm_pr/
+vllm/
+
+# Experiment outputs (large; store separately)
+experiments/outputs/
+experiments/logs/
+experiments/charts/
+
+# Keep the CSV and metadata (small, useful for version control)
+!experiments/results.csv
+!experiments/run_metadata.json
+!experiments/aggregate_metrics.json
+
+# OS
+.DS_Store
