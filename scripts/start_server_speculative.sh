@@ -54,7 +54,7 @@ if lsof -Pi :"$PORT" -sTCP:LISTEN -t > /dev/null 2>&1; then
 fi
 
 # Build speculative-config JSON
-SPEC_CONFIG="{\"model\": \"$DRAFT_MODEL\", \"num_speculative_tokens\": $NUM_SPEC_TOKENS}"
+SPEC_CONFIG="{\"method\":\"mtp\",\"model\":\"$DRAFT_MODEL\",\"num_speculative_tokens\":$NUM_SPEC_TOKENS}"
 
 python -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" \
