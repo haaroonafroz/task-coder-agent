@@ -1,8 +1,8 @@
 # RunPod RTX 4090 / A100 / H100 - Optimized for Gemma 4 MTP Speculative Decoding
 # CUDA 12.8+ wheels for SM 80+ (Ampere/Ada/Hopper architecture)
 
---extra-index-url https://wheels.vllm.ai/cu129/
---extra-index-url https://download.pytorch.org/whl/cu129
+#--extra-index-url https://wheels.vllm.ai/cu129/
+#--extra-index-url https://download.pytorch.org/whl/cu129
 
 # 1. PyTorch 2.10 (Required for vLLM 0.19.1+)
 
@@ -21,7 +21,7 @@ vllm==0.20.1
 
 transformers @ git+https://github.com/huggingface/transformers.git
 accelerate==1.2.0
-bitsandbytes>=0.45.0
+bitsandbytes>=0.48.0
 huggingface_hub>=0.23.0
 safetensors>=0.4.0
 
