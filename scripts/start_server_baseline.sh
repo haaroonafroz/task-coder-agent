@@ -31,7 +31,7 @@ python -m vllm.entrypoints.openai.api_server \
     --max-model-len "$MAX_MODEL_LEN" \
     --reasoning-parser qwen3 \
     --enable-prefix-caching \
-    --enable-auto-tool-choice \
     --trust-remote-code \
+    --host 0.0.0.0 \
     --port "$PORT" \
     2>&1 | tee "$LOG_FILE" &
