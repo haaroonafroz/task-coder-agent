@@ -3,7 +3,7 @@ set -euo pipefail
 
 MODEL="Qwen/Qwen3.6-35B-A3B"  # Original model
 NUM_SPEC_TOKENS=3
-PORT=8001
+PORT=8002
 GPU_MEM_UTIL=0.90
 MAX_MODEL_LEN=32768
 LOG_FILE="experiments/logs/speculative_server.log"

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 MODEL="QuantTrio/Qwen3.6-35B-A3B-AWQ"  # or "Qwen/Qwen3.6-35B-A3B"
-PORT=8000
+PORT=8003
 GPU_MEM_UTIL=0.90
 MAX_MODEL_LEN=32768
 LOG_FILE="experiments/logs/baseline_server.log"
