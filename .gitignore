@@ -33,3 +33,4 @@ datasets/*.json
 .DS_Store
 *.cache/
 .cursorignore
+*atomic-llama-cpp-turboquant/
