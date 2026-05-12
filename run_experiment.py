@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from pipeline.graph import run_task
 from pipeline.agents import run_planner, run_generator, run_refiner  # for calibration mode
-
+from pipeline.log_parser import update_results_with_acceptance_rates
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -59,6 +59,7 @@ CSV_FIELDNAMES = [
     "planner_prefill_ms", "planner_decode_ms", "planner_total_ms", "planner_tokens_generated",
     "generator_prefill_ms", "generator_decode_ms", "generator_total_ms", "generator_tokens_generated",
     "refiner_prefill_ms", "refiner_decode_ms", "refiner_total_ms", "refiner_tokens_generated",
+    "doc_generator_prefill_ms", "doc_generator_decode_ms", "doc_generator_total_ms", "doc_generator_tokens_generated",
     "pipeline_total_ms",
     "test_pass", "test_error_message",
     "acceptance_rate_generator",  # speculative mode only
@@ -265,6 +266,10 @@ def run_full_benchmark(tasks: list[dict], mode: str, dataset_md5: str) -> None:
             "refiner_decode_ms": state.get("refiner_decode_ms"),
             "refiner_total_ms": state.get("refiner_total_ms"),
             "refiner_tokens_generated": state.get("refiner_tokens"),
+            "doc_generator_prefill_ms": state.get("doc_generator_prefill_ms"),
+            "doc_generator_decode_ms": state.get("doc_generator_decode_ms"),
+            "doc_generator_total_ms": state.get("doc_generator_total_ms"),
+            "doc_generator_tokens_generated": state.get("doc_generator_tokens"),
             "pipeline_total_ms": state.get("pipeline_total_ms"),
             "test_pass": state.get("test_passed"),
             "test_error_message": state.get("test_stderr", ""),
@@ -278,6 +283,11 @@ def run_full_benchmark(tasks: list[dict], mode: str, dataset_md5: str) -> None:
 
     meta[f"run_complete_{mode}"] = True
     save_metadata(meta)
+
+    if mode == "speculative":
+        from pipeline.log_parser import update_results_with_acceptance_rates
+        log_path = ROOT / "experiments" / "logs" / "speculative_server.log"
+        update_results_with_acceptance_rates(RESULTS_CSV, log_path, mode="speculative")
 
 
 # ---------------------------------------------------------------------------
