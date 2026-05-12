@@ -8,9 +8,13 @@ __pycache__/
 .venv/
 venv/
 
-# vLLM PR clone
+# vLLM PR clone (vLLM branch)
 vllm_pr/
 vllm/
+
+# GGUF model files (large binary files, download via scripts/download_models.sh)
+models/*.gguf
+models/*.bin
 
 # Experiment outputs (large; store separately)
 experiments/outputs/
@@ -18,10 +22,14 @@ experiments/logs/
 experiments/charts/
 
 # Keep the CSV and metadata (small, useful for version control)
-!experiments/results.csv
-!experiments/run_metadata.json
-!experiments/aggregate_metrics.json
+*experiments/results.csv
+*experiments/run_metadata.json
+*experiments/aggregate_metrics.json
+
+#datasets
+datasets/*.json
 
 # OS
 .DS_Store
 *.cache/
+.cursorignore
