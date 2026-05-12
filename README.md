@@ -78,6 +78,19 @@ All four variants have Google-published MTP assistant (drafter) models. Every si
 
 > KV cache adds ~4 GB at 4096 context. 26B A4B at INT4 fits a 24 GB card and delivers near-31B quality — best option if upgrading from E4B.
 
+## Qwen 3.6 Model Reference
+
+| Model | Total Params | Active Params | HuggingFace |
+|-------|--------------|---------------|-------------|
+| Qwen3.6-35B-A3B | 35B | 3B (256 experts, 8 routed + 1 shared) | [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) |
+
+### VRAM Requirements (bitsandbytes 8-bit)
+
+| Mode | Memory Usage | Min GPU |
+|------|--------------|---------|
+| Baseline | ~10-12 GB | 16 GB |
+| MTP (2 tokens) | ~11-13 GB | 16 GB |
+
 ### Quantization flags for vLLM
 
 ```bash

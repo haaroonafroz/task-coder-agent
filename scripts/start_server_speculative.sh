@@ -1,69 +1,51 @@
 #!/usr/bin/env bash
 # =============================================================================
-# start_server_speculative.sh
+# start_server_speculative.sh - Qwen 3.6 MTP Configuration
 #
-# Launches the speculative (MTP) vLLM server.
-# Section 6.3 of the implementation plan.
-#
-# Port: 8001
-# Target: google/gemma-4-E4B-it
-# Draft:  google/gemma-4-E4B-it-assistant   (the ONLY correct choice)
-# Speculative tokens: 4
-#
-# IMPORTANT: Run ONLY after the baseline server is fully stopped.
-# Running both simultaneously will exceed 2x16GB VRAM budget.
+# Qwen 3.6 has NATIVE MTP - no separate draft model needed!
+# The model itself generates speculative tokens internally.
 # =============================================================================
 
 set -euo pipefail
 
-MODEL="google/gemma-4-E4B-it"
-DRAFT_MODEL="google/gemma-4-E4B-it-assistant"
-NUM_SPEC_TOKENS=4
+MODEL="Qwen/Qwen3.6-35B-A3B"  # 35B total, 3B active params (MoE)
+NUM_SPEC_TOKENS=3              # Start with 2, can increase to 3-5
 PORT=8001
-GPU_MEM_UTIL=0.85
-MAX_MODEL_LEN=4096
+GPU_MEM_UTIL=0.95               # Slightly higher for MoE efficiency
+MAX_MODEL_LEN=32768              # Qwen supports longer contexts
 LOG_FILE="experiments/logs/speculative_server.log"
 
 mkdir -p experiments/logs
 
 echo "========================================================"
-echo " Starting SPECULATIVE (MTP) vLLM server"
-echo " Target: $MODEL"
-echo " Draft:  $DRAFT_MODEL"
-echo " Spec tokens: $NUM_SPEC_TOKENS"
+echo " Starting Qwen 3.6 SPECULATIVE (Native MTP) vLLM server"
+echo " Model:  $MODEL"
 echo " Port:   $PORT"
-echo " Quant:  bitsandbytes 8-bit"
+echo " Spec tokens: $NUM_SPEC_TOKENS"
+echo " GPU util: $GPU_MEM_UTIL"
 echo " Log:    $LOG_FILE"
 echo "========================================================"
 
-# Safety check: ensure baseline server is not running
-if lsof -Pi :8000 -sTCP:LISTEN -t > /dev/null 2>&1; then
-    echo "[WARNING] Baseline server is still running on port 8000."
-    echo "          Running both simultaneously may exceed 32GB VRAM."
-    read -r -p "Continue anyway? [y/N] " CONT
-    if [[ "${CONT,,}" != "y" ]]; then
-        echo "Aborting. Stop baseline server first."
-        exit 1
-    fi
-fi
-
-# Verify port is free
+# Safety check
 if lsof -Pi :"$PORT" -sTCP:LISTEN -t > /dev/null 2>&1; then
-    echo "[ERROR] Port $PORT is already in use. Kill existing process first."
+    echo "[ERROR] Port $PORT is already in use."
     exit 1
 fi
 
-# Build speculative-config JSON
-SPEC_CONFIG="{\"method\":\"mtp\",\"model\":\"$DRAFT_MODEL\",\"num_speculative_tokens\":$NUM_SPEC_TOKENS}"
+# Qwen 3.6 native MTP config - NOTICE: no "model" field needed!
+SPEC_CONFIG="{\"method\":\"mtp\",\"num_speculative_tokens\":$NUM_SPEC_TOKENS}"
+BNB_CONFIG='{"load_in_4bit":true,"bnb_4bit_compute_dtype":"float16","bnb_4bit_quant_type":"nf4","bnb_4bit_use_double_quant":true}'
 
 python -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" \
     --speculative-config "$SPEC_CONFIG" \
-    --dtype bfloat16 \
-    --quantization bitsandbytes \
+    --dtype float16 \
+    --quantization bitsandbytes  \
+    --model-loader-extra-config '{"load_in_4bit":true,"bnb_4bit_compute_dtype":"float16","bnb_4bit_quant_type":"nf4"}' \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --max-model-len "$MAX_MODEL_LEN" \
-    --enable-chunked-prefill \
+    --reasoning-parser qwen3 \
+    --enable-prefix-caching \
     --port "$PORT" \
     2>&1 | tee "$LOG_FILE" &
 
@@ -72,27 +54,22 @@ echo "Server PID: $SERVER_PID"
 echo "$SERVER_PID" > experiments/logs/speculative_server.pid
 
 echo ""
-echo "Waiting for server to become ready …"
+echo "Waiting for server to become ready ..."
 for i in $(seq 1 90); do
     if curl -sf "http://localhost:$PORT/v1/models" > /dev/null 2>&1; then
         echo "[OK] Speculative server is live at http://localhost:$PORT/v1"
         echo ""
-        echo "Verifying MTP is active in logs …"
-        if grep -q "Gemma4 MTP" "$LOG_FILE" 2>/dev/null; then
-            echo "[OK] MTP confirmed active (found 'Gemma4 MTP' in logs)."
+        echo "Verifying MTP is active in logs ..."
+        if grep -q "MTP\|speculative" "$LOG_FILE" 2>/dev/null; then
+            echo "[OK] MTP confirmed active in logs."
         else
-            echo "[WARNING] 'Gemma4 MTP' not found in logs yet."
-            echo "          Check $LOG_FILE for:"
-            echo "            'Gemma4 MTP: centroids masking enabled'"
-            echo "            'Gemma4 MTP: draft layer N -> target_layer...'"
-            echo "          If absent, speculative decoding is NOT active."
+            echo "[INFO] Check $LOG_FILE for speculative decoding activity."
         fi
         exit 0
     fi
-    echo "  ($i/90) waiting …"
+    echo "  ($i/90) waiting ..."
     sleep 5
 done
 
 echo "[TIMEOUT] Server did not respond after 7.5 minutes."
-echo "Check $LOG_FILE for errors."
 exit 1
