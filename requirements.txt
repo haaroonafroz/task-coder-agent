@@ -1,97 +1,47 @@
 # =============================================================================
-# Requirements for Qwen 3.6 MTP Speculative Decoding on V100 (CUDA 12.5)
+# Requirements for Qwen 3.6 MTP Speculative Decoding on RTX 4090 (24GB)
 # =============================================================================
-# GPU: NVIDIA V100 (2x16GB) - Compute Capability 7.0 (sm70)
-# CUDA: 12.5 (Driver 550.X series)
-# Python: 3.10 - 3.12 supported
-#
-# IMPORTANT NOTES:
-# 1. vLLM 0.19.1 has CUDA 12.8 binaries but CUDA has FORWARD compatibility.
-#    Wheels built for CUDA 12.8 work on CUDA 12.5 drivers.
-# 2. V100 (sm70) is supported but some features (FlashAttention v2, FP8) are 
-#    unavailable due to hardware limitations.
-# 3. Use xFormers or PyTorch SDPA for attention on V100.
+# GPU: NVIDIA RTX 4090 - Compute Capability 8.9 (sm89)
+# CUDA: 12.5+ 
+# VRAM: 24GB
 # =============================================================================
-
-# -----------------------------------------------------------------------------
-# 1. PyTorch - CUDA 12.4+ compatible (works with CUDA 12.5 drivers)
-# -----------------------------------------------------------------------------
 
 --extra-index-url https://download.pytorch.org/whl/cu124
 torch==2.11.0
 torchvision==0.26.0
 torchaudio==2.11.0
 
-
-# -----------------------------------------------------------------------------
-# 2. vLLM 0.19.1 - Qwen 3.6 Native MTP Support
-# -----------------------------------------------------------------------------
-# vLLM 0.19.1 introduces native MTP (Multi-Token Prediction) for Qwen models.
-# No separate draft model needed - MTP heads are built into the model itself.
-#
-# Installation options (pick ONE):
-#
-# Option A: Standard wheel (uses CUDA 12.8 binaries, forward compatible with 12.5)
+# vLLM 0.19.1 with CUDA 12.4+ support
 vllm==0.19.1
-#
-# Option B: If you encounter CUDA compatibility issues, use the cu124 wheel:
-# pip install https://github.com/vllm-project/vllm/releases/download/v0.19.1/vllm-0.19.1+cu124-cp38-abi3-manylinux_2_35_x86_64.whl --extra-index-url https://download.pytorch.org/whl/cu124
-#
-# Option C: For V100-specific build with sm70 support, use community image:
-# Docker: jajmangold/vllm-sm70 (unofficial, includes xFormers for Volta)
-# -----------------------------------------------------------------------------
 
+# AWQ quantization support (for pre-quantized models)
+autoawq>=0.2.7
 
-# -----------------------------------------------------------------------------
-# 3. Model Support - Qwen 3.6 requires latest transformers
-# -----------------------------------------------------------------------------
+# FlashAttention 2 - RTX 4090 supports this!
+flash-attn>=2.6.0
 
-# Qwen 3.6 models require transformers >= 4.49+ or main branch
+# Model Support
 transformers @ git+https://github.com/huggingface/transformers.git
-accelerate>=1.2.0
-bitsandbytes==0.48.0
+accelerate==1.2.0
 huggingface_hub>=0.25.0
 safetensors>=0.4.0
-autoawq>=0.2.0
 
-# SentencePiece for Qwen tokenizer
-sentencepiece>=0.1.99
-protobuf>=3.20.0
-
-# xFormers for efficient attention on V100 (sm70) - FlashAttention v2 unavailable
+# xFormers (optional but good for older GPU compatibility fallback)
 xformers==0.0.29.post1
 
-
-# -----------------------------------------------------------------------------
-# 4. Agentic Pipeline Dependencies
-# -----------------------------------------------------------------------------
-
+# Agentic Pipeline
 langgraph>=0.2.0
 openai>=2.0.0
 langchain-core>=0.2.0
 
-
-# -----------------------------------------------------------------------------
-# 5. Data Processing & Statistics
-# -----------------------------------------------------------------------------
-
+# Data & Stats
 pandas>=2.2.0
-numpy>=1.26.0,<2.0.0  # vLLM compatibility constraint
+numpy>=1.26.0,<2.0.0
 scipy>=1.13.0
 
-
-# -----------------------------------------------------------------------------
-# 6. Utilities
-# -----------------------------------------------------------------------------
-
+# Utilities
 tqdm>=4.66.0
 python-dotenv>=1.0.0
 matplotlib>=3.9.0
-
-
-# -----------------------------------------------------------------------------
-# 7. Optional: Enhanced Attention Backends for V100
-# -----------------------------------------------------------------------------
-# FlashInfer requires sm80+ (A100+), so V100 uses xFormers or PyTorch SDPA instead.
-# No flashinfer-python for V100 - hardware limitation.
-# -----------------------------------------------------------------------------
+sentencepiece>=0.1.99
+protobuf>=3.20.0
