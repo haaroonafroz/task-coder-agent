@@ -201,8 +201,8 @@ def run_full_benchmark(tasks: list[dict], mode: str, dataset_md5: str) -> None:
     meta = load_metadata()
     meta.setdefault("date", str(date.today()))
     meta.setdefault("target_model", "Qwen/Qwen3.6-35B-A3B")
-meta.setdefault("draft_model", "native-mtp")  # Qwen has built-in MTP
-meta.setdefault("num_speculative_tokens", 4)
+    meta.setdefault("draft_model", "native-mtp")  # Qwen has built-in MTP
+    meta.setdefault("num_speculative_tokens", 4)
     meta.setdefault("quantization", "bitsandbytes-8bit")
     meta.setdefault("temperature", 0)
     meta.setdefault("seed", 42)
