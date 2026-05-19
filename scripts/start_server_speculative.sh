@@ -26,9 +26,9 @@ if [ -f "$ENV_FILE" ]; then
 fi
 
 TARGET_FILE="${TARGET_MODEL_GGUF:-$REPO_ROOT/models/gemma-4-E4B-it-Q8_0.gguf}"
-DRAFT_FILE="${DRAFT_MODEL_GGUF:-$REPO_ROOT/models/gemma-4-E4B-it-assistant-F16.gguf}"
+# DRAFT_FILE="${DRAFT_MODEL_GGUF:-$REPO_ROOT/models/gemma-4-E4B-it-assistant-F16.gguf}"
 MODEL_ALIAS="${MODEL_ALIAS:-gemma-4-e4b-it}"
-CONTEXT_LEN="${CONTEXT_LEN:-32768}"
+CONTEXT_LEN="${CONTEXT_LEN:-8192}"
 N_GPU_LAYERS="${N_GPU_LAYERS:--1}"
 NUM_DRAFT_TOKENS="${NUM_DRAFT_TOKENS:-4}"
 PORT=8001
@@ -45,11 +45,11 @@ if [ ! -f "$TARGET_FILE" ]; then
     exit 1
 fi
 
-if [ ! -f "$DRAFT_FILE" ]; then
-    echo "[ERROR] Draft GGUF not found: $DRAFT_FILE"
-    echo "        Run: bash scripts/download_models.sh"
-    exit 1
-fi
+# if [ ! -f "$DRAFT_FILE" ]; then
+#     echo "[ERROR] Draft GGUF not found: $DRAFT_FILE"
+#     echo "        Run: bash scripts/download_models.sh"
+#     exit 1
+# fi
 
 if ! command -v llama-server &> /dev/null; then
     echo "[ERROR] llama-server not in PATH."
@@ -77,7 +77,7 @@ fi
 echo "========================================================"
 echo " Starting SPECULATIVE llama-server"
 echo " Target:  $(basename "$TARGET_FILE")"
-echo " Draft:   $(basename "$DRAFT_FILE")"
+# echo " Draft:   $(basename "$DRAFT_FILE")"
 echo " Alias:   $MODEL_ALIAS"
 echo " Context: $CONTEXT_LEN tokens"
 echo " Draft tokens: $NUM_DRAFT_TOKENS"
@@ -86,27 +86,25 @@ echo " Log:     $LOG_FILE"
 echo "========================================================"
 
 llama-server \
-    --model         "$REPO_ROOT/models/gemma-4-E4B-it-Q8_0.gguf" \
-    --mtp-head   "$REPO_ROOT/models/gemma-4-E4B-it-assistant.Q8_0.gguf" \
-    --spec-type mtp \
-    --draft-block-size 3 \
-    --draft-max 16 \
-    --draft-min 2 \
-    --alias         "$MODEL_ALIAS" \
-    --ctx-size      "$CONTEXT_LEN" \
-    --n-gpu-layers  "$N_GPU_LAYERS" \
+    --model "$TARGET_FILE" \
+    --alias "$MODEL_ALIAS" \
+    --ctx-size "$CONTEXT_LEN" \
+    --n-gpu-layers "$N_GPU_LAYERS" \
+    --device CUDA0,CUDA1 \
+    --split-mode layer \
+    --tensor-split 1,1 \
     --flash-attn on \
-    --reasoning-budget 0 \
-    --cache-type-k  q4_0 \
-    --cache-type-v  q4_0 \
+    --cache-type-k q4_0 \
+    --cache-type-v q4_0 \
     --cont-batching \
-    --chat-template-kwargs '{"enable_thinking":false}' # for Gemma-4-E4B
-    --port          "$PORT" \
-    --host          127.0.0.1 \
-    2>&1 | grep -E "(llama_|Server|HTTP|POST|ready|health|Error|error|done request|print_timing|release|slots are idle|Chat format|FAIL|PASS|Starting|Model|Port|draft|acceptance)" | tee "$LOG_FILE" &
+    --spec-type draft-mtp \
+    --spec-draft-n-max "$NUM_DRAFT_TOKENS" \
+    --port "$PORT" \
+    --host 127.0.0.1 \
+    --log-file "$LOG_FILE" \
+    --log-verbosity 3 &
 
 SERVER_PID=$!
-echo "Server PID: $SERVER_PID"
 echo "$SERVER_PID" > "$REPO_ROOT/experiments/logs/speculative_server.pid"
 
 echo ""

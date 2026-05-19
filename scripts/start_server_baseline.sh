@@ -3,15 +3,16 @@
 # start_server_baseline.sh
 #
 # Launches llama-server for baseline (standard autoregressive) decoding.
+# No speculative decoding — compare against start_server_speculative.sh.
 #
 # Port: 8000
-# Backend: llama.cpp (TurboQuant fork, built with sm_70 for V100)
+# Model: from .env (TARGET_MODEL_GGUF, MODEL_ALIAS) — default Qwen 3.6
 #
 # Prereqs:
-#   1. bash scripts/build_llamacpp.sh         (build once)
-#   2. export PATH="$HOME/llama-cpp-turboquant/build/bin:$PATH"
-#   3. bash scripts/download_models.sh        (download once)
-#   4. .env with TARGET_MODEL_GGUF and MODEL_ALIAS set
+#   1. Build llama.cpp with CUDA (see docs/build.md)
+#   2. export PATH="$REPO_ROOT/llama.cpp/build/bin:$PATH"
+#   3. bash scripts/download_models.sh --qwen36
+#   4. .env with TARGET_MODEL_GGUF and MODEL_ALIAS
 # =============================================================================
 
 set -euo pipefail
@@ -19,7 +20,6 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="$REPO_ROOT/.env"
 
-# Load .env
 if [ -f "$ENV_FILE" ]; then
     set -a
     # shellcheck disable=SC1090
@@ -27,30 +27,35 @@ if [ -f "$ENV_FILE" ]; then
     set +a
 fi
 
-TARGET_FILE="${TARGET_MODEL_GGUF:-$REPO_ROOT/models/gemma-4-E4B-it-Q8_0.gguf}"
-MODEL_ALIAS="${MODEL_ALIAS:-gemma-4-e4b-it}"
-CONTEXT_LEN="${CONTEXT_LEN:-32768}"
-# -1 = no limit on generated tokens (honour max_tokens from the API request)
+TARGET_FILE="${TARGET_MODEL_GGUF:-$REPO_ROOT/models/Qwen3.6-27B-UD-Q4_K_XL.gguf}"
+MODEL_ALIAS="${MODEL_ALIAS:-qwen36-27b-mtp}"
+CONTEXT_LEN="${CONTEXT_LEN:-8192}"
 N_GPU_LAYERS="${N_GPU_LAYERS:--1}"
 PORT=8000
 LOG_FILE="$REPO_ROOT/experiments/logs/baseline_server.log"
 
 mkdir -p "$REPO_ROOT/experiments/logs"
 
-# -----------------------------------------------------------------------
-# Prereq checks
-# -----------------------------------------------------------------------
 if [ ! -f "$TARGET_FILE" ]; then
     echo "[ERROR] GGUF file not found: $TARGET_FILE"
-    echo "        Run: bash scripts/download_models.sh"
+    echo "        Run: bash scripts/download_models.sh --qwen36"
     exit 1
 fi
 
 if ! command -v llama-server &> /dev/null; then
     echo "[ERROR] llama-server not in PATH."
-    echo "        Run: bash scripts/build_llamacpp.sh"
-    echo "        Then: export PATH=\"\$HOME/llama-cpp-turboquant/build/bin:\$PATH\""
+    echo "        export PATH=\"$REPO_ROOT/llama.cpp/build/bin:\$PATH\""
     exit 1
+fi
+
+if lsof -Pi :8001 -sTCP:LISTEN -t > /dev/null 2>&1; then
+    echo "[WARNING] Speculative server is running on port 8001."
+    echo "          Running both may exceed 32GB VRAM on 2x V100."
+    read -r -p "Continue anyway? [y/N] " CONT
+    if [[ "${CONT,,}" != "y" ]]; then
+        echo "Aborting. Stop speculative first: bash scripts/stop_server.sh speculative"
+        exit 1
+    fi
 fi
 
 if lsof -Pi :"$PORT" -sTCP:LISTEN -t > /dev/null 2>&1; then
@@ -59,28 +64,31 @@ if lsof -Pi :"$PORT" -sTCP:LISTEN -t > /dev/null 2>&1; then
 fi
 
 echo "========================================================"
-echo " Starting BASELINE llama-server"
+echo " Starting BASELINE llama-server (no speculative decoding)"
 echo " Model:   $(basename "$TARGET_FILE")"
 echo " Alias:   $MODEL_ALIAS"
 echo " Context: $CONTEXT_LEN tokens"
+echo " GPUs:    CUDA0,CUDA1 (layer split)"
 echo " Port:    $PORT"
 echo " Log:     $LOG_FILE"
 echo "========================================================"
 
 llama-server \
-    --model         "$TARGET_FILE" \
-    --alias         "$MODEL_ALIAS" \
-    --ctx-size      "$CONTEXT_LEN" \
-    --n-gpu-layers  "$N_GPU_LAYERS" \
-    --reasoning-budget 0 \
+    --model "$TARGET_FILE" \
+    --alias "$MODEL_ALIAS" \
+    --ctx-size "$CONTEXT_LEN" \
+    --n-gpu-layers "$N_GPU_LAYERS" \
+    --device CUDA0,CUDA1 \
+    --split-mode layer \
+    --tensor-split 1,1 \
     --flash-attn on \
-    --cache-type-k  q8_0 \
-    --cache-type-v  q8_0 \
+    --cache-type-k q4_0 \
+    --cache-type-v q4_0 \
     --cont-batching \
-    --chat-template-kwargs '{"enable_thinking":false}' # for Gemma-4-E4B
-    --port          "$PORT" \
-    --host          127.0.0.1 \
-    2>&1 | grep -E "(llama_|Server|HTTP|POST|ready|health|Error|error|done request|print_timing|release|slots are idle|Chat format|FAIL|PASS|Starting|Model|Port)" | tee "$LOG_FILE" &
+    --port "$PORT" \
+    --host 127.0.0.1 \
+    --log-verbosity 2 \
+    2>&1 | tee "$LOG_FILE" &
 
 SERVER_PID=$!
 echo "Server PID: $SERVER_PID"
@@ -88,17 +96,17 @@ echo "$SERVER_PID" > "$REPO_ROOT/experiments/logs/baseline_server.pid"
 
 echo ""
 echo "Waiting for server to become ready …"
-for i in $(seq 1 60); do
+for i in $(seq 1 90); do
     if curl -sf "http://localhost:$PORT/health" > /dev/null 2>&1; then
         echo "[OK] Baseline server is live at http://localhost:$PORT/v1"
         echo ""
         curl -s "http://localhost:$PORT/v1/models" | python3 -m json.tool 2>/dev/null || true
         exit 0
     fi
-    echo "  ($i/60) waiting …"
+    echo "  ($i/90) waiting …"
     sleep 5
 done
 
-echo "[TIMEOUT] Server did not respond after 5 minutes."
+echo "[TIMEOUT] Server did not respond after 7.5 minutes."
 echo "Check $LOG_FILE for errors."
 exit 1
