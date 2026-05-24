@@ -1,56 +1,55 @@
 {
-  "mission_id": "email-validator-001",
-  "title": "Python Email Validator Module",
-  "description": "Create a robust Python module for email validation including regex-based logic and a comprehensive test suite.",
+  "mission_id": "m-8f3a1b2c",
+  "title": "Email Validation Module",
+  "description": "Develop a Python module to validate email addresses using standard library tools, accompanied by a comprehensive pytest suite.",
   "workspace_root": "workspace/",
   "milestones": [
     {
       "id": "M1",
-      "title": "Setup Project Structure",
-      "description": "Initialize the directory structure and create the package skeleton.",
+      "title": "Initialize Module Structure",
+      "description": "Create the project directory layout and scaffold email_validator.py with a module docstring and a stub function validate_email(address: str) -> bool.",
       "depends_on": [],
       "target_files": [
-        "workspace/validator/__init__.py",
-        "workspace/tests/__init__.py"
+        "email_validator.py"
       ],
       "validation_contract": {
-        "type": "shell",
-        "command": "test -f workspace/validator/__init__.py && test -f workspace/tests/__init__.py",
-        "pass_criteria": "The package directories exist and contain __init__.py files."
+        "type": "structural",
+        "command": "python -c \"from email_validator import validate_email; assert callable(validate_email)\"",
+        "pass_criteria": "Module imports successfully and exports a callable validate_email function."
       },
-      "status": "completed"
+      "status": "pending"
     },
     {
       "id": "M2",
-      "title": "Implement Email Validation Logic",
-      "description": "Create the core email validation function using regex in validator/email.py.",
+      "title": "Implement Core Validation Logic",
+      "description": "Implement the validate_email function using the re module to check standard email format (local@domain.tld), handling None/empty inputs gracefully.",
       "depends_on": [
         "M1"
       ],
       "target_files": [
-        "workspace/validator/email.py"
+        "email_validator.py"
       ],
       "validation_contract": {
-        "type": "lint",
-        "command": "flake8 workspace/validator/email.py --max-line-length=120",
-        "pass_criteria": "Code passes flake8 linting."
+        "type": "shell",
+        "command": "python -c \"from email_validator import validate_email; assert validate_email('user@example.com') == True and validate_email('invalid') == False\"",
+        "pass_criteria": "Function correctly identifies a standard valid email and rejects a malformed string."
       },
-      "status": "completed"
+      "status": "pending"
     },
     {
       "id": "M3",
-      "title": "Develop Unit Tests",
-      "description": "Write pytest test cases covering valid and invalid email formats in tests/test_email.py.",
+      "title": "Develop Comprehensive Test Suite",
+      "description": "Write tests/test_email_validator.py using pytest to cover valid formats, invalid formats, edge cases (long local parts, subdomains, special characters), and ensure full coverage.",
       "depends_on": [
         "M2"
       ],
       "target_files": [
-        "workspace/tests/test_email.py"
+        "tests/test_email_validator.py"
       ],
       "validation_contract": {
         "type": "pytest",
-        "command": "pytest workspace/tests/test_email.py -v",
-        "pass_criteria": "All unit tests pass with at least 90% coverage."
+        "command": "pytest tests/test_email_validator.py -v",
+        "pass_criteria": "All pytest test cases pass without errors or failures."
       },
       "status": "pending"
     }
@@ -58,6 +57,7 @@
   "global_constraints": [
     "All Python files must pass flake8 with max-line-length=120.",
     "No external network calls during validation.",
-    "All code must reside within the workspace/ directory."
+    "Use only Python standard library (e.g., re, typing) for implementation.",
+    "All file paths in commands and target_files must be relative to workspace/."
   ]
 }
