@@ -1,0 +1,63 @@
+{
+  "mission_id": "email-validator-001",
+  "title": "Python Email Validator Module",
+  "description": "Create a robust Python module for email validation including regex-based logic and a comprehensive test suite.",
+  "workspace_root": "workspace/",
+  "milestones": [
+    {
+      "id": "M1",
+      "title": "Setup Project Structure",
+      "description": "Initialize the directory structure and create the package skeleton.",
+      "depends_on": [],
+      "target_files": [
+        "workspace/validator/__init__.py",
+        "workspace/tests/__init__.py"
+      ],
+      "validation_contract": {
+        "type": "shell",
+        "command": "test -f workspace/validator/__init__.py && test -f workspace/tests/__init__.py",
+        "pass_criteria": "The package directories exist and contain __init__.py files."
+      },
+      "status": "pending"
+    },
+    {
+      "id": "M2",
+      "title": "Implement Email Validation Logic",
+      "description": "Create the core email validation function using regex in validator/email.py.",
+      "depends_on": [
+        "M1"
+      ],
+      "target_files": [
+        "workspace/validator/email.py"
+      ],
+      "validation_contract": {
+        "type": "lint",
+        "command": "flake8 workspace/validator/email.py --max-line-length=120",
+        "pass_criteria": "Code passes flake8 linting."
+      },
+      "status": "pending"
+    },
+    {
+      "id": "M3",
+      "title": "Develop Unit Tests",
+      "description": "Write pytest test cases covering valid and invalid email formats in tests/test_email.py.",
+      "depends_on": [
+        "M2"
+      ],
+      "target_files": [
+        "workspace/tests/test_email.py"
+      ],
+      "validation_contract": {
+        "type": "pytest",
+        "command": "pytest workspace/tests/test_email.py -v",
+        "pass_criteria": "All unit tests pass with at least 90% coverage."
+      },
+      "status": "pending"
+    }
+  ],
+  "global_constraints": [
+    "All Python files must pass flake8 with max-line-length=120.",
+    "No external network calls during validation.",
+    "All code must reside within the workspace/ directory."
+  ]
+}
