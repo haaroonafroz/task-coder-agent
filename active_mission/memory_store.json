@@ -1,5 +1,19 @@
 {
-  "milestones": {},
+  "milestones": {
+    "M1": {
+      "status": "completed",
+      "updated_at": "2026-05-24T16:48:24",
+      "milestone_id": "M1",
+      "title": "Setup Project Structure",
+      "worker_summary": "Project structure already scaffolded with validator/__init__.py and tests/__init__.py in place.",
+      "files_modified": [],
+      "tool_calls_made": 1,
+      "retry_count": 0,
+      "verdict": "PASS",
+      "commit_hash": "45be111",
+      "elapsed_ms": 71686.17
+    }
+  },
   "error_log": [
     {
       "timestamp": "2026-05-24T15:02:49",

@@ -18,7 +18,7 @@
         "command": "test -f workspace/validator/__init__.py && test -f workspace/tests/__init__.py",
         "pass_criteria": "The package directories exist and contain __init__.py files."
       },
-      "status": "pending"
+      "status": "completed"
     },
     {
       "id": "M2",
