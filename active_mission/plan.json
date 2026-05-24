@@ -17,7 +17,7 @@
         "command": "python -c \"from email_validator import validate_email; assert callable(validate_email)\"",
         "pass_criteria": "Module imports successfully and exports a callable validate_email function."
       },
-      "status": "pending"
+      "status": "completed"
     },
     {
       "id": "M2",
