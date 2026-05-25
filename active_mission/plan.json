@@ -18,7 +18,7 @@
         "command": "pytest test_email_validator.py -v",
         "pass_criteria": "Tests should exist and the import path must be valid."
       },
-      "status": "pending"
+      "status": "completed"
     },
     {
       "id": "M2",
