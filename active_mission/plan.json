@@ -1,28 +1,29 @@
 {
-  "mission_id": "m-8f3a1b2c",
-  "title": "Email Validation Module",
-  "description": "Develop a Python module to validate email addresses using standard library tools, accompanied by a comprehensive pytest suite.",
+  "mission_id": "email-val-001",
+  "title": "Email Validator Module",
+  "description": "Create a robust Python module to validate email address formats using regex, including a test suite.",
   "workspace_root": "workspace/",
   "milestones": [
     {
       "id": "M1",
-      "title": "Initialize Module Structure",
-      "description": "Create the project directory layout and scaffold email_validator.py with a module docstring and a stub function validate_email(address: str) -> bool.",
+      "title": "Define Validator Interface",
+      "description": "Create the core validation function module and a basic test file structure.",
       "depends_on": [],
       "target_files": [
-        "email_validator.py"
+        "email_validator.py",
+        "test_email_validator.py"
       ],
       "validation_contract": {
-        "type": "structural",
-        "command": "python -c \"from email_validator import validate_email; assert callable(validate_email)\"",
-        "pass_criteria": "Module imports successfully and exports a callable validate_email function."
+        "type": "pytest",
+        "command": "pytest test_email_validator.py -v",
+        "pass_criteria": "Tests should exist and the import path must be valid."
       },
-      "status": "completed"
+      "status": "pending"
     },
     {
       "id": "M2",
-      "title": "Implement Core Validation Logic",
-      "description": "Implement the validate_email function using the re module to check standard email format (local@domain.tld), handling None/empty inputs gracefully.",
+      "title": "Implement Regex Validation",
+      "description": "Implement the email validation logic using the re module to check against common email patterns.",
       "depends_on": [
         "M1"
       ],
@@ -30,34 +31,32 @@
         "email_validator.py"
       ],
       "validation_contract": {
-        "type": "shell",
-        "command": "python -c \"from email_validator import validate_email; assert validate_email('user@example.com') == True and validate_email('invalid') == False\"",
-        "pass_criteria": "Function correctly identifies a standard valid email and rejects a malformed string."
+        "type": "pytest",
+        "command": "pytest test_email_validator.py -v",
+        "pass_criteria": "All tests must pass for valid and invalid email formats."
       },
       "status": "pending"
     },
     {
       "id": "M3",
-      "title": "Develop Comprehensive Test Suite",
-      "description": "Write tests/test_email_validator.py using pytest to cover valid formats, invalid formats, edge cases (long local parts, subdomains, special characters), and ensure full coverage.",
+      "title": "Linting and Cleanup",
+      "description": "Verify code quality and ensure adherence to PEP 8 standards.",
       "depends_on": [
         "M2"
       ],
       "target_files": [
-        "tests/test_email_validator.py"
+        "email_validator.py"
       ],
       "validation_contract": {
-        "type": "pytest",
-        "command": "pytest tests/test_email_validator.py -v",
-        "pass_criteria": "All pytest test cases pass without errors or failures."
+        "type": "lint",
+        "command": "flake8 email_validator.py --max-line-length=120",
+        "pass_criteria": "No linting errors reported."
       },
       "status": "pending"
     }
   ],
   "global_constraints": [
     "All Python files must pass flake8 with max-line-length=120.",
-    "No external network calls during validation.",
-    "Use only Python standard library (e.g., re, typing) for implementation.",
-    "All file paths in commands and target_files must be relative to workspace/."
+    "No external network calls during validation."
   ]
 }

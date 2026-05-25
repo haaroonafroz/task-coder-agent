@@ -1,19 +1,11 @@
-"""Email validation module providing utilities for validating email addresses."""
-
 import re
 
-_EMAIL_PATTERN = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
-
-
 def validate_email(address: str) -> bool:
-    """Validate an email address.
-
-    Args:
-        address: The email address string to validate.
-
-    Returns:
-        True if the address is valid, False otherwise.
-    """
-    if not address or not isinstance(address, str):
+    if not isinstance(address, str) or not address:
         return False
-    return bool(_EMAIL_PATTERN.match(address))
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    if re.match(pattern, address):
+        if '..' in address or address.startswith('.') or address.endswith('.'):
+            return False
+        return True
+    return False
