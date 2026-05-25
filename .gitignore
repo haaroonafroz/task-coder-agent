@@ -35,3 +35,7 @@ datasets/*.json
 .cursorignore
 llama.cpp/
 refactor.md
+workspace/
+
+# handoffs
+active_mission/handoffs/*.json
