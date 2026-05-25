@@ -68,7 +68,7 @@ case "$MODEL_ARG" in
         DRAFT_FILE="gemma-4-31B-it-assistant-Q8_0.gguf"
         MODEL_ALIAS="gemma-4-31b-it"
         ;;
-    --e4b|*)
+    --e4b)
         # Q8_0 (~4.3GB) — fits easily on a single 16GB V100
         TARGET_REPO="unsloth/gemma-4-E4B-it-GGUF"
         TARGET_FILE="gemma-4-E4B-it-Q8_0.gguf"
@@ -76,12 +76,18 @@ case "$MODEL_ARG" in
         DRAFT_FILE="gemma-4-E4B-it-assistant.Q8_0.gguf"
         MODEL_ALIAS="gemma-4-e4b-it"
         ;;
+    --qwopus27b|*)
+        # Q8_0 (~4.3GB) — fits easily on a single 16GB V100
+        TARGET_REPO="Jackrong/Qwopus3.6-27B-v2-MTP-GGUF"
+        TARGET_FILE="Qwopus3.6-27B-v2-MTP-Q4_K_M.gguf"
+        MODEL_ALIAS="qwopus-3.6-27b-v2-mtp"
+        ;;
 esac
 
 echo "========================================================"
 echo " Downloading GGUF models to $MODELS_DIR/"
 echo " Target : $TARGET_FILE  (from $TARGET_REPO)"
-echo " Draft  : $DRAFT_FILE  (from $DRAFT_REPO)"
+# echo " Draft  : $DRAFT_FILE  (from $DRAFT_REPO)"
 echo "========================================================"
 echo ""
 
@@ -120,10 +126,10 @@ PYEOF
 }
 
 download_file "$TARGET_REPO" "$TARGET_FILE"
-download_file "$DRAFT_REPO"  "$DRAFT_FILE"
+# download_file "$DRAFT_REPO"  "$DRAFT_FILE"
 
 TARGET_PATH="$MODELS_DIR/$TARGET_FILE"
-DRAFT_PATH="$MODELS_DIR/$DRAFT_FILE"
+# DRAFT_PATH="$MODELS_DIR/$DRAFT_FILE"
 
 echo ""
 echo "========================================================"
@@ -135,5 +141,5 @@ echo "Add these lines to your .env:"
 echo ""
 echo "  MODEL_ALIAS=$MODEL_ALIAS"
 echo "  TARGET_MODEL_GGUF=$TARGET_PATH"
-echo "  DRAFT_MODEL_GGUF=$DRAFT_PATH"
+# echo "  DRAFT_MODEL_GGUF=$DRAFT_PATH"
 echo "  TARGET_MODEL=$MODEL_ALIAS"

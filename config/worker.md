@@ -43,6 +43,25 @@ Emit **EXACTLY ONE** JSON object. No text before or after.
 ```
 Wait for the tool result before the next turn.
 
+### JSON escaping for `write_file` (critical)
+When putting Python source in `"content"`, the **outer** payload must be valid JSON.
+
+| Do | Don't |
+|---|---|
+| `evaluate('2 + 3')` inside content | `evaluate("2 + 3")` — bare `"` breaks JSON |
+| `evaluate(\"2 + 3\")` if you need double quotes | Unescaped `"` inside the content string |
+| `read_file` + `patch_file` for one-line fixes | Full-file `write_file` rewrite for tiny edits |
+
+Example valid tool call:
+```json
+{
+  "tool": "write_file",
+  "args": {
+    "file_path": "tests/test_evaluator.py",
+    "content": "import pytest\nfrom evaluator import evaluate\n\ndef test_add():\n    assert evaluate('2 + 3') == 5.0\n"
+  },
+  "reasoning": "Create tests using single-quoted Python strings."
+}
 
 ### Output format — done
 Only when every Target File exists:
@@ -82,6 +101,7 @@ Do NOT use `blocked` because a directory is missing — create it with `write_fi
 
 ## Hard constraints 
 - One JSON object per turn — never batch tool calls.
-- Never output raw Python, markdown fences, or prose outside JSON.
+- Never output markdown fences or prose outside the JSON object.
+- Python source code is allowed ONLY inside JSON string values (e.g. `write_file` → `content`).
 - Implement only what the milestone and validation contract require.
 - Code toward the validation command — read Validation Contract in your context.

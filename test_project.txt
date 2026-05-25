@@ -1,0 +1,31 @@
+Safe arithmetic expression evaluator
+Build a Python module that safely evaluates basic math expressions (+, -, *, /, parentheses, integers and floats).
+Split it into tokenizer.py (tokenize expressions into numbers/operators/parens) and evaluator.py (evaluate token stream with correct precedence).
+Include tests for valid expressions, division by zero, malformed input, whitespace, and nested parentheses.
+
+
+
+Password strength checker with pluggable rules
+Build a password validation system with password_validator.py (orchestrates checks) and password_rules.py (individual rule functions: min length, uppercase, digit, special char, no spaces).
+Return a structured result with is_valid and a list of failed rule names.
+Write comprehensive pytest tests including valid passwords, single-failure cases, and empty/None inputs.
+
+
+
+Mini inventory tracker (model + service)
+Build a small inventory system: item.py defines an Item dataclass (sku, name, quantity, price) with validation,
+and inventory.py manages a collection (add, remove, update quantity, get by sku, list low-stock items below a threshold).
+Use only the standard library. Include thorough tests for add/remove, duplicate sku handling, negative quantity rejection, and low-stock filtering.
+
+
+
+Text statistics pipeline
+Build a text analysis mini-pipeline: text_normalizer.py (lowercase, strip punctuation, split into words) and text_stats.py (word count, unique words, most common word, average word length).
+text_stats should depend on text_normalizer. Include tests with empty strings, punctuation-only input, repeated words, and mixed case.
+
+
+
+Roman numeral ↔ integer converter (bidirectional)
+Build roman numerals conversion with roman_encoder.py (int to roman) and roman_decoder.py (roman to int).
+Support standard subtractive notation (IV, IX, XL, etc.) and reject invalid strings like 'IIII' or 'IC'.
+Include comprehensive tests for 1-3999, invalid inputs, case insensitivity, and round-trip encode/decode.

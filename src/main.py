@@ -58,7 +58,7 @@ MAX_RETRY_CYCLES = 3         # validator FAIL → worker retry limit
 _NON_JSON_RETRIES = 3  # max format-recovery attempts per worker run
 
 MAX_TOKENS_ORCHESTRATOR = int(os.getenv("MAX_TOKENS_ORCHESTRATOR", "8192"))
-MAX_TOKENS_WORKER       = int(os.getenv("MAX_TOKENS_WORKER", "4096"))
+MAX_TOKENS_WORKER       = int(os.getenv("MAX_TOKENS_WORKER", "5120"))
 MAX_TOKENS_VALIDATOR    = int(os.getenv("MAX_TOKENS_VALIDATOR", "3072"))
 
 _PYTEST_INI = """\
@@ -822,28 +822,52 @@ def _worker_invalid_json_message(raw: str, target_files: list[str]) -> str:
 
     return msg
 
-def _parse_json_from_text(text: str) -> Optional[dict]:
-    """Extract and parse the first JSON object from a text string."""
-    import re
-    # Try raw parse
+def _load_json_candidate(text: str, *, repair: bool = False) -> Optional[Any]:
+    """Parse one JSON candidate; optionally repair with json-repair."""
+    if repair:
+        try:
+            import json_repair
+            return json_repair.loads(text)
+        except Exception:
+            return None
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        pass
-    # Try code block
+        return None
+
+
+def _parse_json_from_text(text: str) -> Optional[dict]:
+    """Extract and parse the first JSON object from a text string."""
+    import re
+
+    candidates: list[str] = []
+    stripped = text.strip()
+    if stripped:
+        candidates.append(stripped)
+
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if match:
-        try:
-            return json.loads(match.group(1))
-        except json.JSONDecodeError:
-            pass
-    # Find outermost {...}
+        candidates.append(match.group(1))
+
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
+        candidates.append(match.group())
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+
+        parsed = _load_json_candidate(candidate, repair=False)
+        if isinstance(parsed, dict):
+            return parsed
+
+        parsed = _load_json_candidate(candidate, repair=True)
+        if isinstance(parsed, dict):
+            print("    [Parser] Recovered malformed JSON via json-repair.")
+            return parsed
+
     return None
 
 
