@@ -1,5 +1,6 @@
 import re
 
+
 def validate_email(address: str) -> bool:
     if not isinstance(address, str) or not address:
         return False

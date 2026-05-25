@@ -35,7 +35,7 @@
         "command": "pytest test_email_validator.py -v",
         "pass_criteria": "All tests must pass for valid and invalid email formats."
       },
-      "status": "pending"
+      "status": "completed"
     },
     {
       "id": "M3",
