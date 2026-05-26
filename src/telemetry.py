@@ -1,5 +1,5 @@
 """
-Arize Phoenix observability layer — Phase 1.
+Arize Phoenix observability layer.
 
 Instruments every LLM call (Orchestrator, Worker, Validator) and every tool
 invocation with OpenInference-compliant OpenTelemetry spans.
@@ -13,7 +13,7 @@ invocation with OpenInference-compliant OpenTelemetry spans.
 
 Usage:
     from src.telemetry import initialize_observability, span_llm_call, span_tool_call
-    session = initialize_observability()
+    initialize_observability()
 """
 
 from __future__ import annotations
@@ -31,14 +31,16 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Read .env values
 # ---------------------------------------------------------------------------
+
 def _strip_protocol(host: str) -> str:
     """Remove http:// or https:// prefix so the host is bare (e.g. 127.0.0.1)."""
     return host.replace("https://", "").replace("http://", "").rstrip("/")
 
-_PHOENIX_HOST_RAW = os.getenv("PHOENIX_HOST", "127.0.0.1")
-_PHOENIX_HOST = _strip_protocol(_PHOENIX_HOST_RAW)
-_PHOENIX_PORT = int(os.getenv("PHOENIX_PORT", "6006"))
-_PHOENIX_EXTERNAL = os.getenv("PHOENIX_EXTERNAL", "false").strip().lower() == "true"
+
+_PHOENIX_HOST_RAW  = os.getenv("PHOENIX_HOST", "127.0.0.1")
+_PHOENIX_HOST      = _strip_protocol(_PHOENIX_HOST_RAW)
+_PHOENIX_PORT      = int(os.getenv("PHOENIX_PORT", "6006"))
+_PHOENIX_EXTERNAL  = os.getenv("PHOENIX_EXTERNAL", "false").strip().lower() == "true"
 
 _TRACER_NAME = "task-coder-agent"
 
@@ -54,7 +56,10 @@ except ImportError:
 try:
     from opentelemetry import trace
     from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import SimpleSpanProcessor, ConsoleSpanExporter
+    from opentelemetry.sdk.trace.export import (
+        BatchSpanProcessor,
+        ConsoleSpanExporter,
+    )
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
     _OTEL_AVAILABLE = True
 except ImportError:
@@ -66,7 +71,6 @@ try:
 except ImportError:
     _OPENINFERENCE_AVAILABLE = False
 
-_session = None
 _tracer_provider: Optional[object] = None
 
 
@@ -87,6 +91,10 @@ def initialize_observability(
       - If Phoenix / opentelemetry-sdk is not installed, falls back to
         a console span exporter (if console_fallback=True) or is a no-op.
 
+    Spans are exported via BatchSpanProcessor (non-blocking background thread)
+    rather than SimpleSpanProcessor to avoid adding OTLP round-trip latency
+    to every LLM call.
+
     Args:
         host:             Bare hostname (no http:// prefix).
         port:             Collector port.
@@ -96,39 +104,38 @@ def initialize_observability(
     Returns:
         The Phoenix session object, or None if Phoenix is not available.
     """
-    global _session, _tracer_provider
+    global _tracer_provider
 
     if not _OTEL_AVAILABLE:
         print("[Telemetry] opentelemetry-sdk not installed — observability disabled.")
         return None
 
-    # 1. Optionally launch Phoenix (only when it is not external)
+    # 1. Optionally launch Phoenix (only when not external)
     session = None
     if _PHOENIX_AVAILABLE and not external:
         try:
             session = px.launch_app(host=host, port=port)
-            _session = session
             print(f"[Telemetry] Phoenix started — dashboard at http://{host}:{port}")
         except Exception as exc:
             print(f"[Telemetry] Could not start Phoenix: {exc}")
     elif external:
         print(f"[Telemetry] External Phoenix detected — connecting to http://{host}:{port}")
 
-    # 2. Build TracerProvider with OTLP or console exporter
+    # 2. Build TracerProvider with BatchSpanProcessor (non-blocking exports)
     provider = TracerProvider()
     otlp_endpoint = f"http://{host}:{port}/v1/traces"
 
     if _PHOENIX_AVAILABLE or external:
         try:
             otlp_exporter = OTLPSpanExporter(endpoint=otlp_endpoint)
-            provider.add_span_processor(SimpleSpanProcessor(otlp_exporter))
-            print(f"[Telemetry] OTLP exporter → {otlp_endpoint}")
+            provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
+            print(f"[Telemetry] OTLP exporter → {otlp_endpoint} (batch mode)")
         except Exception as exc:
             print(f"[Telemetry] OTLP exporter setup failed: {exc}")
             if console_fallback:
-                provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
+                provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
     elif console_fallback:
-        provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
+        provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
         print("[Telemetry] Phoenix unavailable — spans logged to console.")
 
     trace.set_tracer_provider(provider)
@@ -188,16 +195,17 @@ def span_tool_call(tool_name: str, milestone_id: str):
 class _NoOpSpan:
     def __enter__(self):
         return self
+
     def __exit__(self, *_):
         pass
+
     def set_attribute(self, *_):
         pass
+
     def record_exception(self, *_):
         pass
 
 
 class _NoOpTracer:
     def start_as_current_span(self, *_, **__):
-        return _NoOpSpan()
-    def start_span(self, *_, **__):
         return _NoOpSpan()
