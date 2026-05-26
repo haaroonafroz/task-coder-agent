@@ -19,6 +19,12 @@ from typing import Any
 from src.tools.paths import WORKSPACE_ROOT, resolve_workspace_path
 
 
+_ALLOW_TEST_EDITS = False
+def set_allow_test_edits(allowed: bool) -> None:
+    """Toggle whether tools are permitted to create or modify test files."""
+    global _ALLOW_TEST_EDITS
+    _ALLOW_TEST_EDITS = allowed
+
 def _path_info(abs_path: Path) -> dict[str, str]:
     """Return consistent path metadata for LLM-facing tool results."""
     ws_root = WORKSPACE_ROOT.resolve()
@@ -91,6 +97,19 @@ def write_file(file_path: str, content: str) -> dict[str, Any]:
     except ValueError as exc:
         return {"success": False, "error": str(exc)}
 
+    target_rel = _path_info(target)["workspace_relative_path"]
+    
+    # Programmatic Test Freeze Guardrail
+    if not _ALLOW_TEST_EDITS and ("tests/" in target_rel or "test_" in target_rel):
+        return {
+            "success": False,
+            "error": (
+                f"PROTECTED FILE BREACH: Modifying test files ('{target_rel}') is strictly forbidden "
+                "during implementation milestones. You must correct your source code"
+                " to make existing tests pass, rather than modifying the test cases."
+            )
+        }
+
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
@@ -126,6 +145,18 @@ def patch_file(file_path: str, search_string: str, replace_string: str) -> dict[
         target = resolve_workspace_path(file_path)
     except ValueError as exc:
         return {"success": False, "error": str(exc)}
+
+    target_rel = _path_info(target)["workspace_relative_path"]
+    # Programmatic Test Freeze Guardrail (Patch-level)
+    if not _ALLOW_TEST_EDITS and ("tests/" in target_rel or "test_" in target_rel):
+        return {
+            "success": False,
+            "error": (
+                f"PROTECTED FILE BREACH: Modifying test files ('{target_rel}') is strictly forbidden "
+                "during implementation milestones. You must correct your source code "
+                " to make existing tests pass, rather than modifying the test cases."
+            )
+        }
 
     if not target.exists():
         return {"success": False, "error": f"File not found: {file_path}"}
