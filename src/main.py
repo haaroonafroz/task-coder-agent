@@ -9,7 +9,6 @@ Implements the four-phase serial execution loop described in the blueprint:
   4. VALIDATION     — LLM reads validator.md, runs contract, PASS → commit / FAIL → retry
 
 Hardware note: only ONE LLM inference runs at any moment (serial design)
-so the full 32 GB VRAM budget is available to the single active agent.
 
 Usage:
     python -m src.main "Build a Python REST API with FastAPI that exposes /health and /echo endpoints"
@@ -244,7 +243,7 @@ class MissionsRuntime:
 
     def run(self, user_request: str) -> MissionResult:
         """
-        Execute a full mission for the given user request.
+        Execute a full mission from a user request.
 
         Args:
             user_request: Plain-English description of what to build or fix.
@@ -272,7 +271,9 @@ class MissionsRuntime:
         handoffs: list[MilestoneHandoff] = []
         passed = 0
 
-        for ms in milestones:
+        ms_index = 0
+        while ms_index < len(milestones):
+            ms = milestones[ms_index]
             ms_id = ms.get("id", "?")
             ms_title = ms.get("title", "")
 
@@ -286,6 +287,7 @@ class MissionsRuntime:
                 if resume and resume.get("status") == "completed":
                     print(f"  [Memory] Milestone {ms_id} already completed — skipping.")
                     passed += 1
+                    ms_index += 1
                     continue
 
             handoff = self._execute_milestone(ms, plan)
@@ -296,6 +298,12 @@ class MissionsRuntime:
                 # Save successful state to Cognee
                 if self._memory:
                     self._memory.log_milestone_state(ms_id, asdict(handoff), "completed")
+                ms_index += 1
+            elif handoff.verdict == "REPLAN":
+                # Trigger replan, update the plan in memory
+                plan = self._replan_mission(plan, handoff.error_log[-1])
+                milestones = plan.get("milestones", [])
+                continue
             else:
                 print(f"  [Runtime] Milestone {ms_id} FAILED after {handoff.retry_count} retries — halting mission.")
                 break
@@ -376,6 +384,31 @@ class MissionsRuntime:
         _PLAN_PATH.write_text(json.dumps(plan, indent=2), encoding="utf-8")
         print(f"  [Orchestrator] Plan saved → {_PLAN_PATH}")
         return plan
+    
+    # Define Replan Logic
+    def _replan_mission(self, current_plan: dict, replan_guidance: str) -> dict:
+        """
+        Call the Orchestrator LLM to patch the plan based on Validator feedback.
+        """
+        print(f"\n[Phase 1.5] DYNAMIC RESCOPING — Orchestrator patching plan…")
+        
+        prompt = (
+            f"{_ORCHESTRATOR_MD}\n\n"
+            f"---\n\n"
+            f"## Negotiation Boundary: Plan Flaw Detected\n"
+            f"The Validator has rejected the current plan due to a structural flaw or command mismatch.\n\n"
+            f"### Current Plan\n```json\n{json.dumps(current_plan, indent=2)}\n```\n\n"
+            f"### Validator's Replan Guidance\n{replan_guidance}\n\n"
+            f"Output an UPDATED `plan.json` fixing this issue. Keep completed milestones intact."
+        )
+        with span_llm_call("orchestrator_replan", "REPLAN", self.model):
+            result = call_llm(prompt, model=self.model, max_tokens=MAX_TOKENS_ORCHESTRATOR, json_mode=True, enable_thinking=True)
+        parsed = _parse_json_from_text(result.text)
+        if parsed is None:
+            raise RuntimeError(f"Orchestrator returned non-JSON during replan:\n{result.text[:500]}")
+        _PLAN_PATH.write_text(json.dumps(parsed, indent=2), encoding="utf-8")
+        print("  [Orchestrator] Plan successfully patched and saved.")
+        return parsed
 
     # ------------------------------------------------------------------
     # Phase 2 + 3 + 4 — Skill routing + Worker + Validation
@@ -392,7 +425,15 @@ class MissionsRuntime:
         t_start = time.perf_counter()
         retry_count = 0
         error_log: list[str] = []
-
+        
+        # Programmatic test lock toggle: Check if this is a designated spec or test writing milestone
+        ms_title_lower = ms_title.lower()
+        ms_desc_lower = milestone.get("description", "").lower()
+        is_test_milestone = "test" in ms_title_lower or "spec" in ms_title_lower or "test" in ms_desc_lower or "spec" in ms_desc_lower
+        
+        from src.tools.file_ops import set_allow_test_edits
+        set_allow_test_edits(is_test_milestone)
+        
         while retry_count < MAX_RETRY_CYCLES:
             # Phase 2 — Dynamic skill routing
             intent = f"{ms_title}: {milestone.get('description', '')}"
@@ -442,6 +483,25 @@ class MissionsRuntime:
                     tool_calls_made=worker_result.get("tool_calls", 0),
                     retry_count=retry_count, verdict="PASS",
                     commit_hash=commit_hash, elapsed_ms=round(elapsed_ms, 2),
+                    error_log=error_log,
+                )
+            elif verdict == "REPLAN":
+                replan_guidance = verdict_data.get("replan_guidance")
+                if not _valid_replan_guidance(replan_guidance):
+                    print("\n  [Validator] REPLAN rejected — missing replan_guidance. Treating as FAIL.")
+                    error_log.append("REPLAN rejected: empty replan_guidance.")
+                    retry_count += 1
+                    continue
+                error_log.append(f"REPLAN requested: {replan_guidance}")
+                print(f"\n  [!] Validator requested REPLAN: {replan_guidance}")
+                elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+                return MilestoneHandoff(
+                    milestone_id=ms_id, title=ms_title,
+                    worker_summary="Validator requested plan negotiation.",
+                    files_modified=worker_result.get("files_modified", []),
+                    tool_calls_made=worker_result.get("tool_calls", 0),
+                    retry_count=retry_count, verdict="REPLAN",
+                    commit_hash="", elapsed_ms=round(elapsed_ms, 2),
                     error_log=error_log,
                 )
             else:
@@ -555,12 +615,6 @@ class MissionsRuntime:
                 conversation.append({"role": "assistant", "content": raw})
                 conversation.append({
                     "role": "user",
-                    # "content": (
-                    #     "INVALID OUTPUT. You must emit EXACTLY ONE JSON object — no markdown, no Python, no prose.\n"
-                    #     "Either a tool call: {\"tool\": \"...\", \"args\": {...}, \"reasoning\": \"...\"}\n"
-                    #     "Or when done: {\"status\": \"complete\", \"summary\": \"...\", \"files_modified\": [...]}\n"
-                    #     f"Required deliverables still needed: {target_files}"
-                    # ),
                     "content": _worker_invalid_json_message(raw, target_files),
                 })
                 continue
@@ -677,6 +731,29 @@ class MissionsRuntime:
         ms_id = milestone.get("id", "?")
         contract = milestone.get("validation_contract", {})
         command = contract.get("command", "")
+        target_files = milestone.get("target_files", [])
+        retry_count = worker_result.get("retry_count", 0)
+
+        # 1. Structural Audit: Ensure the worker didn't edit any test file
+        modified_files = worker_result.get("files_modified", [])
+        unauthorized_edits = [
+            f for f in modified_files 
+            if "tests/" in f or "test_" in f
+        ]
+        
+        # If this is not a designated spec/test-writing milestone, reject test edits
+        is_test_milestone = "test" in milestone.get("title", "").lower() or "spec" in milestone.get("title", "").lower()
+        if unauthorized_edits and not is_test_milestone:
+            print(f"    [Validator] REJECTED: Worker illegally modified test files: {unauthorized_edits}")
+            return {
+                "verdict": "FAIL",
+                "milestone_id": ms_id,
+                "errors": [
+                    f"Specification Gaming Detected: Worker altered test scripts {unauthorized_edits} to force a pass."
+                ],
+                "root_cause": "Worker altered the validation test files instead of correcting implementation code.",
+                "fix_guidance": "Revert all modifications to test files. Correct the implementation code in your assigned source files so that it correctly passes the original, unmodified test suite."
+            }
 
         # Execute the contract command if specified
         contract_output = ""
@@ -696,17 +773,33 @@ class MissionsRuntime:
             f"## Milestone Under Review\n"
             f"**ID**: {ms_id}\n"
             f"**Title**: {milestone.get('title', '')}\n"
-            f"**Description**: {milestone.get('description', '')}\n\n"
+            f"**Description**: {milestone.get('description', '')}\n"
+            f"**Target files (worker may ONLY edit these)**: {target_files}\n\n"
             f"## Validation Contract\n```json\n{json.dumps(contract, indent=2)}\n```\n\n"
             f"## Contract Execution Output\n```\n{contract_output or '(no command run)'}\n```\n\n"
             f"## Worker Handoff\n"
             f"Files modified: {worker_result.get('files_modified', [])}\n"
             f"Summary: {worker_result.get('summary', '')}\n\n"
-            f"Emit your PASS or FAIL JSON verdict now:"
+            f"**Retry attempt**: {retry_count + 1} of {MAX_RETRY_CYCLES}\n"
+            f"Emit your PASS, FAIL, or REPLAN JSON verdict now:"
         )
 
+        returncode = tool_result.get("returncode") if command else None
+        replan = _detect_contract_replan(milestone, worker_result, contract_output, returncode)
+        if replan:
+            print(f"    [Validator] Deterministic REPLAN: {replan['replan_guidance']}")
+            return replan
+        
+        if returncode == 0 and not (unauthorized_edits and not is_test_milestone):
+            return {
+                "verdict": "PASS",
+                "milestone_id": ms_id,
+                "validation_details": "Contract command exited 0.",
+            }
+
+        
         with span_llm_call("validator", ms_id, self.model):
-            result = call_llm(prompt, model=self.model, max_tokens=MAX_TOKENS_VALIDATOR, json_mode=True)
+            result = call_llm(prompt, model=self.model, max_tokens=MAX_TOKENS_VALIDATOR, json_mode=True, enable_thinking=True)
 
         parsed = _parse_json_from_text(result.text)
         if parsed is None:
@@ -719,6 +812,16 @@ class MissionsRuntime:
                 "errors": ["Could not parse validator response."],
                 "fix_guidance": result.text[:500],
             }
+        
+        parsed = _normalize_validator_verdict(parsed, returncode=returncode)
+        # Contract success is authoritative — don't allow LLM to REPLAN over a green run
+        if returncode == 0 and parsed.get("verdict") == "REPLAN":
+            print("    [Validator] Overriding REPLAN — contract command returned 0.")
+            parsed["verdict"] = "PASS"
+            parsed.setdefault(
+                "validation_details",
+                "Contract command exited 0.",
+            )
         return parsed
 
     # ------------------------------------------------------------------
@@ -834,6 +937,100 @@ def _load_json_candidate(text: str, *, repair: bool = False) -> Optional[Any]:
         return json.loads(text)
     except json.JSONDecodeError:
         return None
+
+# Define Replan Logic
+def _detect_contract_replan(
+    milestone: dict,
+    worker_result: dict,
+    contract_output: str,
+    returncode: int | None,
+) -> dict | None:
+    import re
+    from src.tools.paths import resolve_workspace_path
+
+    command = milestone.get("validation_contract", {}).get("command", "")
+    target_files = milestone.get("target_files", [])
+    modified = worker_result.get("files_modified", [])
+
+    # Worker only touched allowed source files
+    worker_only_source = modified and all(f not in modified for f in target_files if f.startswith("tests/"))
+    worker_did_not_touch_tests = not any("tests/" in f or "test_" in f for f in modified)
+
+    # pytest exit code 5 = no tests collected
+    if returncode == 5 and "pytest" in command:
+        # If tests exist on disk but none ran, likely command/filter mismatch
+        test_files = list(resolve_workspace_path(".").glob("tests/test_*.py"))
+        if test_files and worker_did_not_touch_tests:
+            kw_match = re.search(r"-k\s+(\S+)", command)
+            keyword = kw_match.group(1) if kw_match else None
+            replan = (
+                "Pytest collected zero tests (exit code 5) but test files exist. "
+                "This is likely an Orchestrator validation command mismatch."
+            )
+            if keyword:
+                replan += f" The -k filter '{keyword}' may not match any test names."
+            return {
+                "verdict": "REPLAN",
+                "milestone_id": milestone.get("id"),
+                "validation_details": replan,
+                "errors": ["pytest exit code 5: no tests collected"],
+                "root_cause": "Validation contract command does not match existing tests.",
+                "fix_guidance": None,
+                "replan_guidance": (
+                    f"Fix validation_contract.command for {milestone.get('id')}. "
+                    f"Current command: {command!r}. "
+                    f"Inspect tests/test_*.py function names and use a matching -k expression "
+                    f"(e.g. -k tokenize instead of -k tokenizer), or run the specific test functions directly."
+                ),
+            }
+
+    return None
+
+def _valid_replan_guidance(value: Any) -> bool:
+    """True only for a non-empty, meaningful replan instruction."""
+    if not isinstance(value, str):
+        return False
+    cleaned = value.strip().lower()
+    return bool(cleaned) and cleaned not in {"null", "none", "n/a", "na"}
+
+
+def _normalize_validator_verdict(
+    parsed: dict,
+    *,
+    returncode: int | None,
+) -> dict:
+    """Coerce/normalize validator output so empty REPLAN cannot trigger replan."""
+    verdict_raw = str(parsed.get("verdict", "FAIL")).strip().upper()
+
+    if verdict_raw.startswith("PASS"):
+        parsed["verdict"] = "PASS"
+    elif verdict_raw.startswith("REPLAN"):
+        parsed["verdict"] = "REPLAN"
+    else:
+        parsed["verdict"] = "FAIL"
+
+    # Only upgrade to REPLAN when guidance is actually present
+    if parsed["verdict"] != "REPLAN" and _valid_replan_guidance(parsed.get("replan_guidance")):
+        parsed["verdict"] = "REPLAN"
+
+    # REPLAN requires actionable guidance
+    if parsed["verdict"] == "REPLAN" and not _valid_replan_guidance(parsed.get("replan_guidance")):
+        if returncode == 0:
+            print("    [Validator] Ignoring REPLAN with empty guidance — contract passed (returncode 0).")
+            parsed["verdict"] = "PASS"
+            parsed.setdefault(
+                "validation_details",
+                "Contract command exited 0; ignored invalid REPLAN verdict.",
+            )
+        else:
+            print("    [Validator] Ignoring REPLAN with empty guidance — treating as FAIL.")
+            parsed["verdict"] = "FAIL"
+            parsed.setdefault(
+                "errors",
+                ["Validator emitted REPLAN without replan_guidance."],
+            )
+
+    return parsed
 
 
 def _parse_json_from_text(text: str) -> Optional[dict]:
