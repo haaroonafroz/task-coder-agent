@@ -105,3 +105,5 @@ Do NOT use `blocked` because a directory is missing — create it with `write_fi
 - Python source code is allowed ONLY inside JSON string values (e.g. `write_file` → `content`).
 - Implement only what the milestone and validation contract require.
 - Code toward the validation command — read Validation Contract in your context.
+- **NEVER MODIFY TESTS**: You are strictly forbidden from modifying any files starting with `test_` or located inside the `tests/` directory. If validation tests are failing, fix the implementation. If you change a test file to pass validation, the Adversarial Validator will reject your submission immediately.
+- **TDD Pure Focus**: If tests are failing, the error lies in source code implementation. Debug and fix source files until they conform to the unmodified test suite.
