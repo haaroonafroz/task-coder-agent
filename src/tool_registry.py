@@ -45,24 +45,23 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Qdrant config (from .env)
 # ---------------------------------------------------------------------------
-QDRANT_URL = os.getenv("QDRANT_URL", "")
+QDRANT_URL  = os.getenv("QDRANT_URL", "")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
-COLLECTION = os.getenv("QDRANT_COLLECTION", "agent_skills")
-DENSE_NAME = os.getenv("QDRANT_DENSE_VECTOR_NAME", "dense")
+COLLECTION  = os.getenv("QDRANT_COLLECTION", "agent_skills")
+DENSE_NAME  = os.getenv("QDRANT_DENSE_VECTOR_NAME", "dense")
 SPARSE_NAME = os.getenv("QDRANT_SPARSE_VECTOR_NAME", "sparse")
-DENSE_DIMS = int(os.getenv("QDRANT_DENSE_VECTOR_DIMS", "768"))
+DENSE_DIMS  = int(os.getenv("QDRANT_DENSE_VECTOR_DIMS", "768"))
 
 # ---------------------------------------------------------------------------
 # Embedding config (from .env)
 # ---------------------------------------------------------------------------
-HF_MODEL = "BAAI/bge-base-en-v1.5"
-# BGE asymmetric retrieval: prefix queries only, NOT documents.
-HF_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
-HF_TOKEN = os.getenv("HF_TOKEN", "")
+HF_MODEL         = "BAAI/bge-base-en-v1.5"
+HF_QUERY_PREFIX  = "Represent this sentence for searching relevant passages: "
+HF_TOKEN         = os.getenv("HF_TOKEN", "")
 
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-OPENAI_EMBEDDING_DIMS = int(os.getenv("OPENAI_EMBEDDING_DIMS", "768"))
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_EMBEDDING_DIMS  = int(os.getenv("OPENAI_EMBEDDING_DIMS", "768"))
+OPENAI_API_KEY         = os.getenv("OPENAI_API_KEY", "")
 
 # Keyword repetition factor for BM25 boost (keywords appear N extra times
 # in the document token stream to increase their term-frequency weight).
@@ -105,6 +104,12 @@ class DynamicToolRouter:
         self._encoder_backend: str = "none"  # "hf" | "openai" | "none"
         self._hf_model = None
         self._oai_client = None
+
+        # BM25 stats cache — populated once after indexing, invalidated on re-index
+        self._vocab:    dict[str, int] = {}
+        self._doc_freq: Counter = Counter()
+        self._avg_len:  float = 0.0
+        self._stats_valid: bool = False
 
         self._init_encoder()
         self._init_qdrant()
@@ -224,6 +229,9 @@ class DynamicToolRouter:
             stream, raising their TF weight so keyword-exact milestone descriptions
             score higher at sparse retrieval time.
 
+        BM25 stats are computed once over ALL skills after parsing, then cached
+        for O(1) access at query time and during vector construction.
+
         Returns:
             Number of skills indexed.
         """
@@ -235,38 +243,39 @@ class DynamicToolRouter:
         )
 
         self._skills = []
-        points = []
 
         for idx, (skill_name, block_text) in enumerate(blocks):
             clean = block_text.strip()
 
-            # Extract the Keywords line: "- **Keywords:** kw1, kw2, kw3, kw4"
             kw_match = re.search(r"\*\*Keywords:\*\*\s*([^\n]+)", clean)
             keywords: list[str] = []
             if kw_match:
                 keywords = [k.strip() for k in kw_match.group(1).split(",") if k.strip()]
 
-            # Base tokens from full text
             base_tokens = self._tokenize(clean)
-            # Enriched token stream: keywords repeated KEYWORD_BOOST extra times
             enriched_tokens = base_tokens + [k.lower() for k in keywords] * KEYWORD_BOOST
 
-            entry = {
+            self._skills.append({
                 "id": idx,
                 "name": skill_name,
                 "raw_markdown": clean,
                 "keywords": keywords,
                 "base_tokens": base_tokens,
                 "enriched_tokens": enriched_tokens,
-            }
-            self._skills.append(entry)
+            })
 
-            if self._client and self._encoder_backend != "none":
-                dense_vec = self._encode_doc(clean)
-                sparse_indices, sparse_values = self._bm25_doc_vector(enriched_tokens, idx)
+        # Build BM25 stats once over the complete skill set
+        self._rebuild_bm25_stats()
+
+        # Upsert into Qdrant using the now-stable cached stats
+        if self._client and self._encoder_backend != "none":
+            points = []
+            for skill in self._skills:
+                dense_vec = self._encode_doc(skill["raw_markdown"])
+                sparse_indices, sparse_values = self._bm25_doc_vector(skill["enriched_tokens"])
                 points.append(
                     PointStruct(
-                        id=idx,
+                        id=skill["id"],
                         vector={
                             DENSE_NAME: dense_vec,
                             SPARSE_NAME: SparseVector(
@@ -275,15 +284,14 @@ class DynamicToolRouter:
                             ),
                         },
                         payload={
-                            "name": skill_name,
-                            "raw_markdown": clean,
-                            "keywords": keywords,
+                            "name": skill["name"],
+                            "raw_markdown": skill["raw_markdown"],
+                            "keywords": skill["keywords"],
                         },
                     )
                 )
-
-        if self._client and points:
-            self._client.upsert(collection_name=COLLECTION, points=points)
+            if points:
+                self._client.upsert(collection_name=COLLECTION, points=points)
 
         print(f"[ToolRegistry] Indexed {len(self._skills)} skills from {file_path}.")
         return len(self._skills)
@@ -302,6 +310,8 @@ class DynamicToolRouter:
         Return the top-k skill blocks as a single markdown string, ranked by
         Reciprocal Rank Fusion (RRF) over dense and sparse Qdrant search results.
 
+        Falls back to keyword-only ranking if Qdrant is unavailable or raises.
+
         Args:
             task_description: The milestone intent string to match against.
             top_k:            Number of skills to return (2 or 3 recommended).
@@ -314,13 +324,21 @@ class DynamicToolRouter:
             return ""
 
         if self._client and self._encoder_backend != "none":
-            return self._hybrid_search(task_description, top_k, rrf_k)
+            try:
+                return self._hybrid_search(task_description, top_k, rrf_k)
+            except Exception as exc:
+                print(
+                    f"[ToolRegistry] Qdrant query failed: {exc} — "
+                    "falling back to keyword search."
+                )
+
         return self._keyword_fallback(task_description, top_k)
 
     def _hybrid_search(self, query: str, top_k: int, rrf_k: int) -> str:
         dense_vec = self._encode_query(query)
         query_tokens = self._tokenize(query)
         sparse_indices, sparse_values = self._bm25_query_vector(query_tokens)
+
         dense_hits = self._client.query_points(
             collection_name=COLLECTION,
             query=dense_vec,
@@ -361,10 +379,8 @@ class DynamicToolRouter:
 
         scored = []
         for skill in self._skills:
-            # Overlap of query tokens with base document tokens
-            overlap = len(query_tokens & set(skill["base_tokens"]))
-            # Extra bonus if any keyword appears literally in the query string
-            kw_bonus = sum(1 for kw in skill["keywords"] if kw in query_lower)
+            overlap   = len(query_tokens & set(skill["base_tokens"]))
+            kw_bonus  = sum(1 for kw in skill["keywords"] if kw in query_lower)
             scored.append((overlap + kw_bonus * 2, skill["raw_markdown"]))
 
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -374,49 +390,55 @@ class DynamicToolRouter:
     # BM25 sparse vector computation
     # ------------------------------------------------------------------
 
-    def _global_vocab_and_stats(self) -> tuple[dict[str, int], Counter, float]:
+    def _rebuild_bm25_stats(self) -> None:
         """
-        Build a vocabulary and document-frequency counter from all indexed skills.
-        Uses `enriched_tokens` so keyword boost is reflected in IDF too.
+        Compute and cache vocabulary, document-frequency, and average document
+        length from the current skill set.
+
+        Called once after all skills are parsed. Uses enriched_tokens so the
+        keyword boost is reflected in IDF weights.
         """
         vocab: dict[str, int] = {}
         doc_freq: Counter = Counter()
+        total_tokens = 0
+
         for skill in self._skills:
             unique_toks = set(skill["enriched_tokens"])
+            total_tokens += len(skill["enriched_tokens"])
             for t in unique_toks:
                 if t not in vocab:
                     vocab[t] = len(vocab)
                 doc_freq[t] += 1
+
         n_docs = max(len(self._skills), 1)
-        avg_len = (
-            sum(len(s["enriched_tokens"]) for s in self._skills) / n_docs
-        )
-        return vocab, doc_freq, avg_len
+        self._vocab     = vocab
+        self._doc_freq  = doc_freq
+        self._avg_len   = total_tokens / n_docs
+        self._stats_valid = True
 
     def _bm25_doc_vector(
         self,
         tokens: list[str],
-        doc_idx: int,
         k1: float = 1.5,
         b: float = 0.75,
     ) -> tuple[list[int], list[float]]:
-        """BM25 sparse vector for a document (uses enriched tokens)."""
-        vocab, doc_freq, avg_len = self._global_vocab_and_stats()
-        n_docs = max(len(self._skills), 1)
+        """BM25 sparse vector for a document using the cached vocabulary stats."""
+        n_docs  = max(len(self._skills), 1)
         doc_len = len(tokens)
         tf_counter = Counter(tokens)
 
         indices, values = [], []
         for token, tf in tf_counter.items():
-            if token not in vocab:
+            if token not in self._vocab:
                 continue
             idf = math.log(
-                (n_docs - doc_freq[token] + 0.5) / (doc_freq[token] + 0.5) + 1
+                (n_docs - self._doc_freq[token] + 0.5)
+                / (self._doc_freq[token] + 0.5) + 1
             )
             tf_norm = (tf * (k1 + 1)) / (
-                tf + k1 * (1 - b + b * doc_len / max(avg_len, 1))
+                tf + k1 * (1 - b + b * doc_len / max(self._avg_len, 1))
             )
-            indices.append(vocab[token])
+            indices.append(self._vocab[token])
             values.append(float(idf * tf_norm))
         return indices, values
 
@@ -427,30 +449,30 @@ class DynamicToolRouter:
         b: float = 0.75,
     ) -> tuple[list[int], list[float]]:
         """
-        BM25 sparse vector for a query.
+        BM25 sparse vector for a query using the cached vocabulary stats.
 
-        Query vectors use plain (non-enriched) tokens; IDF is still computed from
-        the document collection so the two vectors live in the same term space.
+        Query vectors use plain (non-enriched) tokens; IDF is computed from
+        the document collection so the two vectors share the same term space.
         """
-        if not self._skills:
+        if not self._skills or not self._stats_valid:
             return [], []
-        vocab, doc_freq, avg_len = self._global_vocab_and_stats()
-        n_docs = max(len(self._skills), 1)
-        # Queries are typically short; treat query length as its actual length
+
+        n_docs  = max(len(self._skills), 1)
         doc_len = len(tokens)
         tf_counter = Counter(tokens)
 
         indices, values = [], []
         for token, tf in tf_counter.items():
-            if token not in vocab:
+            if token not in self._vocab:
                 continue
             idf = math.log(
-                (n_docs - doc_freq[token] + 0.5) / (doc_freq[token] + 0.5) + 1
+                (n_docs - self._doc_freq[token] + 0.5)
+                / (self._doc_freq[token] + 0.5) + 1
             )
             tf_norm = (tf * (k1 + 1)) / (
-                tf + k1 * (1 - b + b * doc_len / max(avg_len, 1))
+                tf + k1 * (1 - b + b * doc_len / max(self._avg_len, 1))
             )
-            indices.append(vocab[token])
+            indices.append(self._vocab[token])
             values.append(float(idf * tf_norm))
         return indices, values
 
