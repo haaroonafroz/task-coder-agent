@@ -1,5 +1,5 @@
 """
-Cognee Knowledge Graph Memory Layer
+Cognee Knowledge Graph Memory Layer.
 
 Provides three operational capabilities:
 
@@ -24,7 +24,9 @@ continues to function without the dependency.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -42,19 +44,60 @@ except ImportError:
     _COGNEE_AVAILABLE = False
 
 
-def _run_async(coro) -> Any:
-    """Run a coroutine in the current or a new event loop."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(asyncio.run, coro)
-                return future.result(timeout=30)
-        return loop.run_until_complete(coro)
-    except Exception:
-        return asyncio.run(coro)
+# ---------------------------------------------------------------------------
+# Persistent async runner
+#
+# A dedicated background thread owns a single asyncio event loop for the
+# lifetime of the process. Cognee coroutines are submitted to it via
+# run_coroutine_threadsafe, avoiding the per-call ThreadPoolExecutor overhead
+# and the deprecated asyncio.get_event_loop() API.
+# ---------------------------------------------------------------------------
 
+class _AsyncRunner:
+    """
+    Singleton background thread that runs a persistent asyncio event loop.
+
+    Coroutines submitted via run() execute on the background thread, keeping
+    the main (serial) runtime thread free and avoiding repeated loop creation.
+    """
+
+    def __init__(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._loop.run_forever,
+            daemon=True,
+            name="cognee-async-runner",
+        )
+        self._thread.start()
+
+    def run(self, coro, timeout: float = 30) -> Any:
+        """Submit a coroutine and block until it completes or times out."""
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=timeout)
+
+
+_async_runner: Optional[_AsyncRunner] = None
+_runner_lock = threading.Lock()
+
+
+def _get_runner() -> _AsyncRunner:
+    """Return the process-wide async runner, creating it on first call."""
+    global _async_runner
+    if _async_runner is None:
+        with _runner_lock:
+            if _async_runner is None:
+                _async_runner = _AsyncRunner()
+    return _async_runner
+
+
+def _run_async(coro, timeout: float = 30) -> Any:
+    """Run a coroutine on the persistent background event loop."""
+    return _get_runner().run(coro, timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# MissionMemory
+# ---------------------------------------------------------------------------
 
 class MissionMemory:
     """
@@ -80,8 +123,6 @@ class MissionMemory:
     ) -> None:
         """
         Persist the current state of a milestone into the memory backend.
-
-        On crash/reboot, call `locate_resume_point()` to find where to restart.
 
         Args:
             milestone_id:   Milestone identifier (e.g. "M2").
@@ -111,34 +152,6 @@ class MissionMemory:
         store = self._load_store()
         return store.get("milestones", {}).get(milestone_id)
 
-    def locate_resume_point(self) -> Optional[str]:
-        """
-        Find the last milestone that was marked incomplete.
-
-        If Cognee is available, performs a semantic graph search.
-        Falls back to scanning the JSON store.
-
-        Returns:
-            A string description of the resume context, or None.
-        """
-        if _COGNEE_AVAILABLE:
-            try:
-                result = _run_async(self._cognee_search(
-                    "Find the last incomplete milestone and its architectural dependencies"
-                ))
-                if result:
-                    return str(result)
-            except Exception as exc:
-                print(f"[Memory] Cognee resume search failed: {exc}")
-
-        # JSON fallback
-        store = self._load_store()
-        milestones = store.get("milestones", {})
-        for ms_id, data in reversed(list(milestones.items())):
-            if data.get("status") != "completed":
-                return f"Resume at milestone {ms_id}: status={data.get('status')}"
-        return None
-
     # ------------------------------------------------------------------
     # B. Anti-Hallucination Guardrails
     # ------------------------------------------------------------------
@@ -150,7 +163,7 @@ class MissionMemory:
         Injected into the worker's context to prevent hallucinated API paths.
 
         Args:
-            target_class_or_feature: Natural language description of what to look up.
+            target_class_or_feature: Natural-language description of what to look up.
 
         Returns:
             A string with known facts, or empty string if nothing found.
@@ -158,17 +171,21 @@ class MissionMemory:
         if _COGNEE_AVAILABLE:
             try:
                 result = _run_async(self._cognee_search(
-                    f"What are the parameters, file locations, and dependencies related to {target_class_or_feature}?"
+                    f"What are the parameters, file locations, and dependencies "
+                    f"related to {target_class_or_feature}?"
                 ))
                 if result:
                     return str(result)[:2000]
             except Exception as exc:
                 print(f"[Memory] Cognee structural query failed: {exc}")
 
-        # JSON fallback — return any error log that mentions the target
+        # JSON fallback — return any error log mentioning the target
         store = self._load_store()
         errors = store.get("error_log", [])
-        relevant = [e for e in errors if target_class_or_feature.lower() in e.get("payload", "").lower()]
+        relevant = [
+            e for e in errors
+            if target_class_or_feature.lower() in e.get("payload", "").lower()
+        ]
         if relevant:
             facts = "\n".join(e["payload"] for e in relevant[-3:])
             return f"Known constraints from prior runs:\n{facts}"
@@ -197,14 +214,13 @@ class MissionMemory:
             except Exception as exc:
                 print(f"[Memory] Cognee error-log write failed: {exc}")
 
-        # JSON fallback
         store = self._load_store()
         store.setdefault("error_log", []).append({
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "file_path": file_path,
             "payload": payload,
         })
-        # Keep last 50 error entries
+        # Keep last 50 error entries to bound file size
         store["error_log"] = store["error_log"][-50:]
         self._save_store(store)
         print(f"[Memory] Error logged for {file_path}.")
@@ -229,7 +245,12 @@ class MissionMemory:
         return "## Negative Constraints (do NOT repeat these patterns)\n" + "\n".join(lines)
 
     def clear_error_log(self) -> None:
-        """Clear all persisted error logs (useful between missions)."""
+        """
+        Clear all persisted error logs.
+
+        Call at the start of a new mission to prevent stale constraints from a
+        previous run from contaminating the worker's context.
+        """
         store = self._load_store()
         store["error_log"] = []
         self._save_store(store)
@@ -272,6 +293,6 @@ class MissionMemory:
         store.setdefault("milestones", {})[milestone_id] = {
             "status": status,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            **{k: v for k, v in meta.items() if k not in ("error_log",)},
+            **{k: v for k, v in meta.items() if k != "error_log"},
         }
         self._save_store(store)
