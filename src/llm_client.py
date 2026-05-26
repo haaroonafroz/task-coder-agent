@@ -167,9 +167,8 @@ def _call_single(
     """Execute a single streaming call to the given model backend."""
     client, model_name = _build_client(model_key)
 
-    messages = []
-
-    # Qwen3 specific: Disable thinking
+    # Qwen3.6 thinking mode implementation
+    # separate implementation for Gemma4 models
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
