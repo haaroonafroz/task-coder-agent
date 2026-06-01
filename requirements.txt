@@ -1,47 +1,71 @@
-# =============================================================================
-# Requirements for Qwen 3.6 MTP Speculative Decoding on RTX 4090 (24GB)
-# =============================================================================
-# GPU: NVIDIA RTX 4090 - Compute Capability 8.9 (sm89)
-# CUDA: 12.5+ 
-# VRAM: 24GB
-# =============================================================================
+# -----------------------------------------------------------------------
+# Missions Framework — coding-agent
+# -----------------------------------------------------------------------
 
---extra-index-url https://download.pytorch.org/whl/cu124
-torch==2.11.0
-torchvision==0.26.0
-torchaudio==2.11.0
+# -----------------------------------------------------------------------
+# Core LLM / API client
+# -----------------------------------------------------------------------
+openai>=1.30.0
 
-# vLLM 0.19.1 with CUDA 12.4+ support
-vllm==0.19.1
+# -----------------------------------------------------------------------
+# Phase 1 — Telemetry (Arize Phoenix)
+# -----------------------------------------------------------------------
+arize-phoenix>=4.0.0
+opentelemetry-sdk>=1.24.0
+opentelemetry-exporter-otlp-proto-http>=1.24.0
+openinference-instrumentation-openai>=0.1.12
 
-# AWQ quantization support (for pre-quantized models)
-autoawq>=0.2.7
+# -----------------------------------------------------------------------
+# Phase 2 — Dynamic Tool Routing
+#   Primary encoder  : BAAI/bge-base-en-v1.5 (768-dim, local, via sentence-transformers)
+#   Fallback encoder : OpenAI text-embedding-3-small (768-dim, cloud)
+#   Vector store     : Qdrant Cloud (qdrant-client with HTTP API)
+# -----------------------------------------------------------------------
+qdrant-client>=1.9.0
+sentence-transformers>=3.0.0
 
-# FlashAttention 2 - RTX 4090 supports this!
-flash-attn>=2.6.0
+# -----------------------------------------------------------------------
+# Phase 4 — Memory Layer (Cognee knowledge graph)
+# -----------------------------------------------------------------------
+cognee>=0.1.15
 
-# Model Support
-transformers @ git+https://github.com/huggingface/transformers.git
-accelerate==1.2.0
-huggingface_hub>=0.25.0
-safetensors>=0.4.0
-
-# xFormers (optional but good for older GPU compatibility fallback)
-xformers==0.0.29.post1
-
-# Agentic Pipeline
+# -----------------------------------------------------------------------
+# Agentic pipeline (LangGraph — kept for benchmark compatibility)
+# -----------------------------------------------------------------------
 langgraph>=0.2.0
-openai>=2.0.0
 langchain-core>=0.2.0
 
-# Data & Stats
+# -----------------------------------------------------------------------
+# Data & stats (benchmark analysis)
+# -----------------------------------------------------------------------
 pandas>=2.2.0
 numpy>=1.26.0,<2.0.0
 scipy>=1.13.0
 
+# -----------------------------------------------------------------------
+# Visualization (benchmark charts)
+# -----------------------------------------------------------------------
+matplotlib>=3.9.0
+
+# -----------------------------------------------------------------------
+# Code quality (used by run_linter tool)
+# -----------------------------------------------------------------------
+flake8>=7.0.0
+black>=24.0.0
+
+# -----------------------------------------------------------------------
+# Testing (used by run_pytest tool)
+# -----------------------------------------------------------------------
+pytest>=8.0.0
+
+# -----------------------------------------------------------------------
+# Model downloads
+# -----------------------------------------------------------------------
+huggingface_hub>=0.23.0
+
+# -----------------------------------------------------------------------
 # Utilities
+# -----------------------------------------------------------------------
 tqdm>=4.66.0
 python-dotenv>=1.0.0
-matplotlib>=3.9.0
-sentencepiece>=0.1.99
-protobuf>=3.20.0
+json-repair>=0.30.0

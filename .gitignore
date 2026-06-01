@@ -8,10 +8,13 @@ __pycache__/
 .venv/
 venv/
 
-# vLLM PR clone
+# vLLM PR clone (vLLM branch)
 vllm_pr/
 vllm/
 
+# GGUF model files (large binary files, download via scripts/download_models.sh)
+models/*.gguf
+models/*.bin
 # llama.cpp PR clone
 llama.cpp_pr/
 llama.cpp/
@@ -33,8 +36,9 @@ datasets/*.json
 .DS_Store
 *.cache/
 .cursorignore
-
-#models
-models/*.gguf
-
+llama.cpp/
 refactor.md
+workspace/
+
+# handoffs
+active_mission/handoffs/*.json

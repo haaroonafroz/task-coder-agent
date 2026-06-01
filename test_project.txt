@@ -1,0 +1,48 @@
+# Example missions for the Missions Runtime
+#
+# Prerequisites (run once per session):
+#   source .venv/bin/activate
+#   bash scripts/start_server_speculative.sh
+#
+# Optional: reset mission state before a fresh run
+#   rm -f active_mission/plan.json active_mission/memory_store.json
+#   rm -rf active_mission/handoffs/* workspace/*
+#
+# Each example below is a single copy-paste command.
+# Results land in workspace/; telemetry in active_mission/handoffs/.
+
+
+# ---------------------------------------------------------------------------
+# 1. Safe arithmetic expression evaluator
+# ---------------------------------------------------------------------------
+python -m src.main "Build a Python module that safely evaluates basic math expressions (+, -, *, /, parentheses, integers and floats). Split it into tokenizer.py (tokenize expressions into numbers/operators/parens) and evaluator.py (evaluate token stream with correct precedence). Include tests for valid expressions, division by zero, malformed input, whitespace, and nested parentheses."
+
+
+# ---------------------------------------------------------------------------
+# 2. Password strength checker with pluggable rules
+# ---------------------------------------------------------------------------
+python -m src.main "Build a password validation system with password_validator.py (orchestrates checks) and password_rules.py (individual rule functions: min length, uppercase, digit, special char, no spaces). Return a structured result with is_valid and a list of failed rule names. Write comprehensive pytest tests including valid passwords, single-failure cases, and empty/None inputs."
+
+
+# ---------------------------------------------------------------------------
+# 3. Mini inventory tracker (model + service)
+# ---------------------------------------------------------------------------
+python -m src.main "Build a small inventory system: item.py defines an Item dataclass (sku, name, quantity, price) with validation, and inventory.py manages a collection (add, remove, update quantity, get by sku, list low-stock items below a threshold). Use only the standard library. Include thorough tests for add/remove, duplicate sku handling, negative quantity rejection, and low-stock filtering."
+
+
+# ---------------------------------------------------------------------------
+# 4. Text statistics pipeline
+# ---------------------------------------------------------------------------
+python -m src.main "Build a text analysis mini-pipeline: text_normalizer.py (lowercase, strip punctuation, split into words) and text_stats.py (word count, unique words, most common word, average word length). text_stats should depend on text_normalizer. Include tests with empty strings, punctuation-only input, repeated words, and mixed case."
+
+
+# ---------------------------------------------------------------------------
+# 5. Roman numeral ↔ integer converter (bidirectional)
+# ---------------------------------------------------------------------------
+python -m src.main "Build roman numerals conversion with roman_encoder.py (int to roman) and roman_decoder.py (roman to int). Support standard subtractive notation (IV, IX, XL, etc.) and reject invalid strings like IIII or IC. Include comprehensive tests for 1-3999, invalid inputs, case insensitivity, and round-trip encode/decode."
+
+
+# ---------------------------------------------------------------------------
+# Cloud fallback (skip local server; uses Gemini then GPT-4o)
+# ---------------------------------------------------------------------------
+# python -m src.main --model gemini "Build a Python module that validates email addresses with tests"

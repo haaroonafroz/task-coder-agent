@@ -1,0 +1,62 @@
+{
+  "mission_id": "email-val-001",
+  "title": "Email Validator Module",
+  "description": "Create a robust Python module to validate email address formats using regex, including a test suite.",
+  "workspace_root": "workspace/",
+  "milestones": [
+    {
+      "id": "M1",
+      "title": "Define Validator Interface",
+      "description": "Create the core validation function module and a basic test file structure.",
+      "depends_on": [],
+      "target_files": [
+        "email_validator.py",
+        "test_email_validator.py"
+      ],
+      "validation_contract": {
+        "type": "pytest",
+        "command": "pytest test_email_validator.py -v",
+        "pass_criteria": "Tests should exist and the import path must be valid."
+      },
+      "status": "completed"
+    },
+    {
+      "id": "M2",
+      "title": "Implement Regex Validation",
+      "description": "Implement the email validation logic using the re module to check against common email patterns.",
+      "depends_on": [
+        "M1"
+      ],
+      "target_files": [
+        "email_validator.py"
+      ],
+      "validation_contract": {
+        "type": "pytest",
+        "command": "pytest test_email_validator.py -v",
+        "pass_criteria": "All tests must pass for valid and invalid email formats."
+      },
+      "status": "completed"
+    },
+    {
+      "id": "M3",
+      "title": "Linting and Cleanup",
+      "description": "Verify code quality and ensure adherence to PEP 8 standards.",
+      "depends_on": [
+        "M2"
+      ],
+      "target_files": [
+        "email_validator.py"
+      ],
+      "validation_contract": {
+        "type": "lint",
+        "command": "flake8 email_validator.py --max-line-length=120",
+        "pass_criteria": "No linting errors reported."
+      },
+      "status": "pending"
+    }
+  ],
+  "global_constraints": [
+    "All Python files must pass flake8 with max-line-length=120.",
+    "No external network calls during validation."
+  ]
+}

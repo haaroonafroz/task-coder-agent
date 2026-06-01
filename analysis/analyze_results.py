@@ -79,7 +79,7 @@ def load_results(path: Path) -> pd.DataFrame:
 
 def compute_aggregate(df: pd.DataFrame) -> dict:
     agg: dict = {}
-    agents = ["planner", "generator", "refiner"]
+    agents = ["planner", "generator", "refiner", "doc_generator"]
 
     for mode in ["baseline", "speculative"]:
         sub = df[df["mode"] == mode]
@@ -114,12 +114,18 @@ def print_aggregate_table(agg: dict) -> None:
     print("\n" + "=" * 70)
     print("AGGREGATE METRICS")
     print("=" * 70)
-    agents = ["planner", "generator", "refiner"]
+    agents = ["planner", "generator", "refiner", "doc_generator"]
+    agent_display_names = {
+        "planner": "Planner",
+        "generator": "Generator", 
+        "refiner": "Refiner",
+        "doc_generator": "Doc Generator"
+    }
     for agent in agents:
         bst = agg.get(f"{agent}_decode_ms_baseline", {})
         sst = agg.get(f"{agent}_decode_ms_speculative", {})
         sp = agg.get(f"{agent}_decode_speedup", float("nan"))
-        print(f"\n{agent.capitalize()} decode latency:")
+        print(f"\n{agent_display_names.get(agent, agent.capitalize())} decode latency:")
         print(f"  Baseline:     {bst.get('mean', float('nan')):.1f} ± {bst.get('std', 0):.1f} ms  "
               f"(95% CI: [{bst.get('ci_95', (0,0))[0]:.1f}, {bst.get('ci_95', (0,0))[1]:.1f}])")
         print(f"  Speculative:  {sst.get('mean', float('nan')):.1f} ± {sst.get('std', 0):.1f} ms  "
@@ -154,8 +160,8 @@ def _save(fig: plt.Figure, name: str) -> None:
 # ---------------------------------------------------------------------------
 
 def chart1_tps_per_agent(df: pd.DataFrame) -> None:
-    agents = ["planner", "generator", "refiner"]
-    labels = ["Planner", "Generator", "Refiner"]
+    agents = ["planner", "generator", "refiner", "doc_generator"]
+    labels = ["Planner", "Generator", "Refiner", "Doc Generator"]
 
     baseline_means, baseline_stds = [], []
     spec_means, spec_stds = [], []
@@ -200,7 +206,7 @@ def chart1_tps_per_agent(df: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 
 def chart2_speedup_vs_tokens(df: pd.DataFrame) -> None:
-    token_cols = ["planner_tokens_generated", "generator_tokens_generated", "refiner_tokens_generated"]
+    token_cols = ["planner_tokens_generated", "generator_tokens_generated", "refiner_tokens_generated", "doc_generator_tokens_generated"]
 
     b = df[df["mode"] == "baseline"][["task_id", "pipeline_total_ms"] + token_cols].copy()
     s = df[df["mode"] == "speculative"][["task_id", "pipeline_total_ms"]].copy()
@@ -239,9 +245,9 @@ def chart2_speedup_vs_tokens(df: pd.DataFrame) -> None:
 
 def chart3_latency_breakdown(df: pd.DataFrame) -> None:
     modes = ["baseline", "speculative"]
-    agents = ["planner", "generator", "refiner"]
-    agent_labels = ["Planner decode", "Generator decode", "Refiner decode"]
-    colors = ["#93c5fd", "#2563eb", "#1e3a8a"]
+    agents = ["planner", "generator", "refiner", "doc_generator"]
+    agent_labels = ["Planner decode", "Generator decode", "Refiner decode", "Doc Generator decode"]
+    colors = ["#93c5fd", "#2563eb", "#1e3a8a", "#0f172a"]
 
     means = {mode: [] for mode in modes}
     for mode in modes:
@@ -273,44 +279,69 @@ def chart3_latency_breakdown(df: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 
 def chart4_acceptance_rate(df: pd.DataFrame) -> None:
+    """
+    Chart 4: Draft token acceptance rate (global across all agents)
+    
+    Note: llama.cpp logs a single global acceptance rate, not per-agent.
+    The same rate is shown for all agents since they all use the same 
+    speculative decoding backend.
+    """
     spec = df[df["mode"] == "speculative"]
     agents = ["planner", "generator", "refiner"]
     labels = ["Planner", "Generator", "Refiner"]
 
-    rates: list[float] = []
-    for agent in agents:
-        col = f"acceptance_rate_{agent}"
-        if col in spec.columns:
-            val = spec[col].dropna()
-            rates.append(float(val.mean()) if len(val) > 0 else float("nan"))
-        else:
-            rates.append(float("nan"))
-
-    # If acceptance rate column is missing (not parsed from vLLM logs),
-    # show a placeholder chart with a note.
-    has_data = any(not np.isnan(r) for r in rates)
+    # Get the global acceptance rate (same for all agents)
+    global_rate = float("nan")
+    
+    # Try to get global rate first
+    if "acceptance_rate_global" in spec.columns:
+        val = spec["acceptance_rate_global"].dropna()
+        if len(val) > 0:
+            global_rate = float(val.iloc[0])
+    
+    # Fallback to any agent column (they should all be the same)
+    if np.isnan(global_rate):
+        for agent in agents:
+            col = f"acceptance_rate_{agent}"
+            if col in spec.columns:
+                val = spec[col].dropna()
+                if len(val) > 0:
+                    global_rate = float(val.iloc[0])
+                    break
+    
+    # All agents share the same global rate
+    rates = [global_rate] * len(agents)
+    has_data = not np.isnan(global_rate)
 
     fig, ax = plt.subplots(figsize=(6, 4))
     x = np.arange(len(agents))
-    bars = ax.bar(x, rates, color=C_SPECULATIVE, width=0.5)
-
-    for bar, rate in zip(bars, rates):
-        if not np.isnan(rate):
+    
+    if has_data:
+        bars = ax.bar(x, rates, color=C_SPECULATIVE, width=0.5)
+        for bar, rate in zip(bars, rates):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
                     f"{rate:.1%}", ha="center", va="bottom", fontsize=10)
+        
+        # Add note about global rate
+        ax.text(0.5, 0.95, f"Global acceptance rate: {global_rate:.1%}", 
+                transform=ax.transAxes, ha="center", va="top", 
+                fontsize=9, style='italic', color='gray')
+    else:
+        # No data placeholder
+        ax.bar(x, [0] * len(agents), color=C_SPECULATIVE, width=0.5)
+        ax.text(0.5, 0.5, "Not available\n(parse from server logs)", 
+                transform=ax.transAxes, ha="center", va="center", 
+                fontsize=12, color="red",
+                bbox=dict(boxstyle="round", fc="white", ec="red"))
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
     ax.set_ylim(0, 1.05)
     ax.set_ylabel("Draft token acceptance rate")
-    ax.set_title("Chart 4 – Draft Token Acceptance Rate by Agent\n(Speculative mode)")
-    if not has_data:
-        ax.text(0.5, 0.5, "Not available\n(parse from vLLM logs)", transform=ax.transAxes,
-                ha="center", va="center", fontsize=12, color="red",
-                bbox=dict(boxstyle="round", fc="white", ec="red"))
+    ax.set_title("Chart 4 – Draft Token Acceptance Rate by Agent\n(Global rate shared across all agents)")
+    
     fig.tight_layout()
     _save(fig, "chart4_acceptance_rate.png")
-
 
 # ---------------------------------------------------------------------------
 # Chart 5: Pass rate comparison (bar)

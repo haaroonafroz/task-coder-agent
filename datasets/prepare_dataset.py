@@ -25,7 +25,7 @@ MBPP_TASKS = [
         "text": "Write a python function to remove first and last occurrence of a given character from the string.",
         "code": 'def remove_Occ(s,ch):\n    for i in range(len(s)):\n        if (s[i] == ch):\n            s = s[0 : i] + s[i + 1:]\n            break\n    for i in range(len(s) - 1,-1,-1):\n        if (s[i] == ch):\n            s = s[0 : i] + s[i + 1:]\n            break\n    return s',
         "test_list": [
-            "assert remove_Occ(\"hello\",\"l\") == \"helo\"",
+            "assert remove_Occ(\"hello\",\"l\") == \"heo\"",
             "assert remove_Occ(\"abcda\",\"a\") == \"bcd\"",
             "assert remove_Occ(\"PHP\",\"P\") == \"H\""
         ]
@@ -43,7 +43,7 @@ MBPP_TASKS = [
     {
         "task_id": 13,
         "text": "Write a function to count the most common words in a dictionary.",
-        "code": 'from collections import Counter\ndef count_common(words):\n    word_counts = Counter(words)\n    top_five = word_counts.most_common(5)\n    return (top_five)',
+        "code": 'from collections import Counter\ndef count_common(words):\n    word_counts = sorted(word_counts.items(), key=lambda x: (-x[1], x[0]))[:5]\n    top_five = word_counts.most_common(5)\n    return (top_five)',
         "test_list": [
             "assert count_common(['red','green','black','pink','black','white','black','eyes','white','black','orange','pink','pink','red','red','white','orange','white','black','pink','green','red','green','black','pink','white','orange','orange','red']) == [('red', 6), ('pink', 5), ('black', 5), ('white', 5), ('orange', 4)]",
             "assert count_common(['one', 'two', 'three', 'four', 'five', 'one', 'two', 'one', 'three', 'one']) == [('one', 4), ('two', 2), ('three', 2), ('four', 1), ('five', 1)]",
@@ -73,11 +73,12 @@ MBPP_TASKS = [
     {
         "task_id": 16,
         "text": "Write a function to find the second smallest number in a list.",
-        "code": 'def second_smallest(numbers):\n    unique = list(set(numbers))\n    unique.sort()\n    return unique[1]',
+        "code": 'def second_smallest(numbers):\n    unique = sorted(set(numbers))\n    return unique[1] if len(unique) > 1 else None',
         "test_list": [
             "assert second_smallest([1, 2, -8, -2, 0, -2]) == -2",
             "assert second_smallest([1, 1, -0.5, 0, 2, -2, -2]) == -0.5",
-            "assert second_smallest([2,2]) == None or second_smallest([1,2,3]) == 2"
+            "assert second_smallest([2,2]) is None",
+            "assert second_smallest([1,2,3]) == 2"
         ]
     },
     {
@@ -103,7 +104,7 @@ MBPP_TASKS = [
     {
         "task_id": 19,
         "text": "Write a function to find whether all the given tuples have equal length or not.",
-        "code": 'def find_equal_tuple(Input, k):\n    flag = 1\n    for tuple in Input:\n        if len(tuple) != k:\n            flag = 0\n            break\n    return flag',
+        "code": 'def find_equal_tuple(Input, k):\n    flag = 1\n    for tp in Input:\n        if len(tp) != k:\n            flag = 0\n            break\n    return flag',
         "test_list": [
             "assert find_equal_tuple([(11, 22, 33), (44, 55, 66)], 3) == 1",
             "assert find_equal_tuple([(1, 2, 3), (4, 5, 6, 7)], 3) == 0",
