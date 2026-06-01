@@ -15,6 +15,9 @@ vllm/
 # GGUF model files (large binary files, download via scripts/download_models.sh)
 models/*.gguf
 models/*.bin
+# llama.cpp PR clone
+llama.cpp_pr/
+llama.cpp/
 
 # Experiment outputs (large; store separately)
 experiments/outputs/
