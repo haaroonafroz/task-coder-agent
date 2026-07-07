@@ -25,8 +25,8 @@ from src.agents.utils import parse_json_from_text
 # ---------------------------------------------------------------------------
 _ROOT = Path(__file__).parent.parent.parent
 _CONFIG_DIR = _ROOT / "config"
-_MISSION_DIR = _ROOT / "active_mission"
-_PLAN_PATH = _MISSION_DIR / "plan.json"
+_LEGACY_MISSION_DIR = _ROOT / "active_mission"
+_LEGACY_PLAN_PATH = _LEGACY_MISSION_DIR / "plan.json"
 
 _ORCHESTRATOR_MD = (_CONFIG_DIR / "orchestrator.md").read_text()
 
@@ -37,26 +37,33 @@ MAX_TOKENS_ORCHESTRATOR = int(os.getenv("MAX_TOKENS_ORCHESTRATOR", "8192"))
 # Phase 1 — Orchestration
 # ---------------------------------------------------------------------------
 
-def run_orchestration(user_request: str, model: ModelChoice) -> dict:
+def run_orchestration(
+    user_request: str,
+    model: ModelChoice,
+    plan_path: Path = _LEGACY_PLAN_PATH,
+    mission_dir: Path = _LEGACY_MISSION_DIR,
+) -> dict:
     """
     Decompose a user request into a structured milestone plan.
 
     Behaviour:
-      - If active_mission/plan.json exists with pending milestones, resumes it
+      - If ``plan_path`` exists with pending milestones, resumes it
         without calling the LLM (crash-recovery path).
       - Otherwise calls the Orchestrator LLM and persists the new plan.
 
     Args:
         user_request: Plain-English description of what to build or fix.
         model:        LLM backend to use.
+        plan_path:    Where to read/write the plan (session-scoped or legacy).
+        mission_dir:  Parent directory for the plan (created if missing).
 
     Returns:
         The plan dict with a "milestones" list.
     """
     print("\n[Phase 1] ORCHESTRATION — decomposing request…")
 
-    if _PLAN_PATH.exists():
-        raw_plan = _PLAN_PATH.read_text(encoding="utf-8").strip()
+    if plan_path.exists():
+        raw_plan = plan_path.read_text(encoding="utf-8").strip()
         if raw_plan:
             try:
                 existing = json.loads(raw_plan)
@@ -92,9 +99,9 @@ def run_orchestration(user_request: str, model: ModelChoice) -> dict:
     if plan is None:
         raise RuntimeError(f"Orchestrator returned non-JSON output:\n{result.text[:500]}")
 
-    _MISSION_DIR.mkdir(parents=True, exist_ok=True)
-    _PLAN_PATH.write_text(json.dumps(plan, indent=2), encoding="utf-8")
-    print(f"  [Orchestrator] Plan saved → {_PLAN_PATH}")
+    mission_dir.mkdir(parents=True, exist_ok=True)
+    plan_path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
+    print(f"  [Orchestrator] Plan saved → {plan_path}")
     return plan
 
 
@@ -102,7 +109,12 @@ def run_orchestration(user_request: str, model: ModelChoice) -> dict:
 # Phase 1.5 — Dynamic Rescoping / Replan
 # ---------------------------------------------------------------------------
 
-def replan_mission(current_plan: dict, replan_guidance: str, model: ModelChoice) -> dict:
+def replan_mission(
+    current_plan: dict,
+    replan_guidance: str,
+    model: ModelChoice,
+    plan_path: Path = _LEGACY_PLAN_PATH,
+) -> dict:
     """
     Patch the current plan based on Validator feedback.
 
@@ -114,9 +126,10 @@ def replan_mission(current_plan: dict, replan_guidance: str, model: ModelChoice)
         current_plan:    The plan dict to patch.
         replan_guidance: Actionable guidance string from the Validator.
         model:           LLM backend to use.
+        plan_path:       Where to persist the patched plan (session or legacy).
 
     Returns:
-        The updated plan dict (also persisted to plan.json).
+        The updated plan dict (also persisted to plan_path).
     """
     print("\n[Phase 1.5] DYNAMIC RESCOPING — Orchestrator patching plan…")
 
@@ -143,6 +156,6 @@ def replan_mission(current_plan: dict, replan_guidance: str, model: ModelChoice)
             f"Orchestrator returned non-JSON during replan:\n{result.text[:500]}"
         )
 
-    _PLAN_PATH.write_text(json.dumps(parsed, indent=2), encoding="utf-8")
+    plan_path.write_text(json.dumps(parsed, indent=2), encoding="utf-8")
     print("  [Orchestrator] Plan successfully patched and saved.")
     return parsed

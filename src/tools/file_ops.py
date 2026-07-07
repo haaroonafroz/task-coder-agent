@@ -16,7 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from src.tools.paths import WORKSPACE_ROOT, resolve_workspace_path
+from src.tools.paths import get_workspace_root, resolve_workspace_path
 
 
 _ALLOW_TEST_EDITS = False
@@ -27,7 +27,7 @@ def set_allow_test_edits(allowed: bool) -> None:
 
 def _path_info(abs_path: Path) -> dict[str, str]:
     """Return consistent path metadata for LLM-facing tool results."""
-    ws_root = WORKSPACE_ROOT.resolve()
+    ws_root = get_workspace_root().resolve()
     abs_resolved = abs_path.resolve()
     if abs_resolved == ws_root:
         rel = "."
@@ -64,7 +64,7 @@ def read_file(file_path: str) -> dict[str, Any]:
         return {
             "success": False,
             "error": f"File not found: {_path_info(target)['workspace_relative_path']}",
-            **_path_info(WORKSPACE_ROOT),
+            **_path_info(get_workspace_root()),
         }
     if not target.is_file():
         return {"success": False, "error": f"Path is not a file: {file_path}"}
@@ -252,5 +252,5 @@ def list_directory(target_dir: str = ".", max_depth: int = 6) -> dict[str, Any]:
         "tree": "\n".join(lines) if count else f"{display_root}/\n(empty)",
         "count": count,
         "target_dir": rel_root,
-        **_path_info(WORKSPACE_ROOT),
+        **_path_info(get_workspace_root()),
     }

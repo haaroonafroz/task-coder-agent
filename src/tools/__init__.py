@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from src.tools.file_ops import read_file, write_file, patch_file, list_directory
 from src.tools.git_ops import git_commit, git_diff, view_git_log
-from src.tools.system_ops import run_pytest, run_linter, install_dependency, search_grep, run_shellscript
+from src.tools.system_ops import run_pytest, run_linter, install_dependency, search_grep, run_shellscript, uninstall_dependency
 from src.tools.paths import normalize_shell_command, normalize_workspace_path
 
 # ---------------------------------------------------------------------------
@@ -29,6 +29,7 @@ _TOOLS: dict[str, Callable[..., dict[str, Any]]] = {
     "git_diff":           lambda args: git_diff(**args),
     "view_git_log":       lambda args: view_git_log(**args),
     "install_dependency": lambda args: install_dependency(**args),
+    "uninstall_dependency": lambda args: uninstall_dependency(**args),
     "run_shellscript":    lambda args: run_shellscript(**args),
 }
 

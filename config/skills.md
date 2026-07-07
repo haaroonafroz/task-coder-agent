@@ -158,8 +158,6 @@
   ```
 <!-- SKILL_END -->
 
-
-
 <!-- SKILL_START: run_shellscript -->
 ## Skill Name: run_shellscript
 - **Description:** Executes an arbitrary shell script or command inside the workspace directory with a configurable timeout. Useful for build steps, data generation, or environment checks that don't map to a dedicated tool.

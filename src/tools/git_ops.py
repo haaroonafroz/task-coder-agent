@@ -43,15 +43,19 @@ def _git(*args: str, cwd: Path = _REPO_ROOT, timeout: int = 30) -> dict[str, Any
 # git_commit
 # ---------------------------------------------------------------------------
 
-def git_commit(message: str) -> dict[str, Any]:
+def git_commit(message: str, stage_paths: list[str] | None = None) -> dict[str, Any]:
     """
-    Stage all modified workspace/ files and create a git commit.
+    Stage modified files and create a git commit.
 
-    Uses `git add workspace/` so that only workspace changes are committed,
-    keeping the surrounding project state unaffected.
+    Uses ``git add workspace/ active_mission/`` by default (legacy behaviour).
+    When ``stage_paths`` is provided (session-scoped runs), only those
+    repo-relative paths are staged — e.g. ``["sessions/<id>/"]``.
 
     Args:
-        message: Conventional-commit-style message.
+        message:     Conventional-commit-style message.
+        stage_paths: Optional list of repo-relative paths to stage. When
+                     omitted, the legacy ``workspace/ active_mission/`` set
+                     is staged.
 
     Returns:
         {"success": True, "commit_hash": "<sha>", "message": "<msg>"}
@@ -65,8 +69,9 @@ def git_commit(message: str) -> dict[str, Any]:
         _git("config", "user.email", "agent@missions.local")
         _git("config", "user.name", "Missions Agent")
 
-    # 2. Stage workspace/ changes
-    stage = _git("add", "workspace/", "active_mission/")
+    # 2. Stage changes
+    paths_to_stage = stage_paths if stage_paths is not None else ["workspace/", "active_mission/"]
+    stage = _git("add", *paths_to_stage)
     if not stage["success"] and "pathspec" not in stage["stderr"]:
         return {"success": False, "error": f"git add failed: {stage['stderr']}"}
 

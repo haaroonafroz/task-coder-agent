@@ -16,17 +16,21 @@ from pathlib import Path
 from typing import Any
 
 from src.tools.paths import (
-    WORKSPACE_ROOT,
+    get_workspace_root,
     normalize_shell_command,
     normalize_workspace_path,
     resolve_workspace_path,
 )
-_REPO_ROOT = WORKSPACE_ROOT.parent
+
+
+def _repo_root() -> Path:
+    """Return the parent of the active workspace root (session root or repo root)."""
+    return get_workspace_root().parent
 
 
 def _workspace_env() -> dict[str, str]:
     env = os.environ.copy()
-    root = str(WORKSPACE_ROOT.resolve())
+    root = str(get_workspace_root().resolve())
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = root if not existing else f"{root}{os.pathsep}{existing}"
     return env
@@ -95,12 +99,12 @@ def run_pytest(test_path: str, extra_args: str = "-v --tb=short") -> dict[str, A
     except ValueError as exc:
         return {"passed": False, "returncode": -1, "stdout": "", "stderr": str(exc)}
 
-    rel = target.relative_to(WORKSPACE_ROOT.resolve())
+    rel = target.relative_to(get_workspace_root().resolve())
     extra = extra_args.split() if extra_args else []
     cmd = [sys.executable, "-m", "pytest", str(rel)] + extra
-    result = _run(cmd, cwd=WORKSPACE_ROOT, timeout=120, env=_workspace_env())
+    result = _run(cmd, cwd=get_workspace_root(), timeout=120, env=_workspace_env())
     result["passed"] = result["returncode"] == 0
-    result["cwd"] = str(WORKSPACE_ROOT)
+    result["cwd"] = str(get_workspace_root())
     result["test_path"] = str(rel)
     return result
 
@@ -130,7 +134,7 @@ def run_linter(
     except ValueError as exc:
         return {"clean": False, "returncode": -1, "stdout": "", "stderr": str(exc)}
 
-    rel = target.relative_to(WORKSPACE_ROOT.resolve())
+    rel = target.relative_to(get_workspace_root().resolve())
     extra = extra_args.split() if extra_args else []
 
     if tool == "black":
@@ -138,9 +142,9 @@ def run_linter(
     else:
         cmd = [sys.executable, "-m", "flake8", str(rel)] + extra
 
-    result = _run(cmd, cwd=WORKSPACE_ROOT, timeout=60, env=_workspace_env())
+    result = _run(cmd, cwd=get_workspace_root(), timeout=60, env=_workspace_env())
     result["clean"] = result["returncode"] == 0
-    result["cwd"] = str(WORKSPACE_ROOT)
+    result["cwd"] = str(get_workspace_root())
     result["target_path"] = str(rel)
     return result
 
@@ -160,10 +164,10 @@ def install_dependency(package_name: str) -> dict[str, Any]:
         {"success": bool, "stdout": str, "stderr": str}
     """
     cmd = [sys.executable, "-m", "pip", "install", package_name, "--quiet"]
-    result = _run(cmd, cwd=_REPO_ROOT, timeout=180)
+    result = _run(cmd, cwd=_repo_root(), timeout=180)
 
     # Append to workspace/requirements.txt if it exists
-    req_file = WORKSPACE_ROOT / "requirements.txt"
+    req_file = get_workspace_root() / "requirements.txt"
     if result["success"] and req_file.exists():
         existing = req_file.read_text(encoding="utf-8")
         base_name = re.split(r"[><=!]", package_name)[0].strip()
@@ -188,10 +192,10 @@ def uninstall_dependency(package_name: str) -> dict[str, Any]:
         {"success": bool, "stdout": str, "stderr": str}
     """
     cmd = [sys.executable, "-m", "pip", "uninstall", package_name, "--quiet", "-y"]
-    result = _run(cmd, cwd=_REPO_ROOT, timeout=180)
+    result = _run(cmd, cwd=_repo_root(), timeout=180)
 
     # Remove from workspace/requirements.txt if it exists
-    req_file = WORKSPACE_ROOT / "requirements.txt"
+    req_file = get_workspace_root() / "requirements.txt"
     if result["success"] and req_file.exists():
         existing = req_file.read_text(encoding="utf-8")
         # Extract base package name (e.g. httpx from httpx>=0.27.0)
@@ -246,12 +250,12 @@ def search_grep(query: str, target_dir: str = ".") -> dict[str, Any]:
             "error": f"Directory not found: {normalize_workspace_path(target_dir)}",
         }
 
-    ws_root = WORKSPACE_ROOT.resolve()
+    ws_root = get_workspace_root().resolve()
 
     # Try ripgrep first for speed
     rg_result = _run(
         ["rg", "--line-number", "--no-heading", query, str(target)],
-        cwd=WORKSPACE_ROOT,
+        cwd=get_workspace_root(),
         timeout=30,
     )
     if rg_result["returncode"] in (0, 1):  # 0=matches, 1=no matches
@@ -271,7 +275,7 @@ def search_grep(query: str, target_dir: str = ".") -> dict[str, Any]:
             "success": True,
             "matches": matches,
             "match_count": len(matches),
-            "cwd": str(WORKSPACE_ROOT),
+            "cwd": str(get_workspace_root()),
         }
 
     # Pure-Python fallback
@@ -301,7 +305,7 @@ def search_grep(query: str, target_dir: str = ".") -> dict[str, Any]:
         "success": True,
         "matches": matches,
         "match_count": len(matches),
-        "cwd": str(WORKSPACE_ROOT),
+        "cwd": str(get_workspace_root()),
     }
 
 # ---------------------------------------------------------------------------
@@ -327,7 +331,7 @@ def run_shellscript(script: str, timeout: int = 30) -> dict[str, Any]:
         result = subprocess.run(
             script,
             shell=True,
-            cwd=WORKSPACE_ROOT,
+            cwd=get_workspace_root(),
             env=_workspace_env(),
             capture_output=True,
             text=True,
@@ -340,7 +344,7 @@ def run_shellscript(script: str, timeout: int = 30) -> dict[str, Any]:
             "stderr": result.stderr.strip(),
             "success": result.returncode == 0,
             "timed_out": False,
-            "cwd": str(WORKSPACE_ROOT),
+            "cwd": str(get_workspace_root()),
         }
     except subprocess.TimeoutExpired:
         return {

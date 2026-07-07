@@ -18,7 +18,7 @@ from typing import Any, Optional
 from src.llm_client import call_llm, ModelChoice
 from src.telemetry import span_llm_call, span_tool_call
 from src.tools import dispatch
-from src.tools.paths import normalize_workspace_path, normalize_shell_command
+from src.tools.paths import normalize_workspace_path, normalize_shell_command, get_workspace_root
 from src.agents.utils import (
     parse_json_from_text,
     flatten_conversation,
@@ -32,7 +32,6 @@ from src.agents.utils import (
 # ---------------------------------------------------------------------------
 _ROOT = Path(__file__).parent.parent.parent
 _CONFIG_DIR = _ROOT / "config"
-_WORKSPACE_DIR = _ROOT / "workspace"
 
 _WORKER_MD = (_CONFIG_DIR / "worker.md").read_text()
 
@@ -280,7 +279,7 @@ def _workspace_context_block(target_files: list[str] | None = None) -> str:
         )
     return (
         "## Workspace Context\n"
-        f"- Project root (your cwd): `{_WORKSPACE_DIR}`\n"
+        f"- Project root (your cwd): `{get_workspace_root()}`\n"
         "- All tool paths are relative to this directory.\n"
         "- Do NOT prefix paths with `workspace/`.\n"
         f"{targets_note}\n"

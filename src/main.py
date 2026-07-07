@@ -10,13 +10,25 @@ Implements the four-phase serial execution loop:
 
 Hardware note: only ONE LLM inference runs at any moment (serial design).
 
+Session scoping
+---------------
+Every run now executes inside an isolated session directory tree under
+``sessions/<session_id>/``. The runtime points the global workspace root
+(``src.tools.paths.set_workspace_root``) at the session's workspace before
+any tool call, so all file/shell tools operate inside the session sandbox.
+Legacy ``active_mission/`` + root ``workspace/`` remain untouched.
+
 Usage:
+    # Create a new session and run
     python -m src.main "Build a Python REST API with FastAPI"
 
-    Or programmatically:
+    # Resume an existing session
+    python -m src.main --session <session_id> "Continue the API"
+
+    # Programmatic
         from src.main import MissionsRuntime
         runtime = MissionsRuntime()
-        runtime.run("Add unit tests for the utils module")
+        result = runtime.run("Add unit tests for the utils module")
 """
 
 from __future__ import annotations
@@ -28,7 +40,7 @@ import time
 import uuid
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
 # Internal imports
@@ -41,13 +53,11 @@ from src.tool_registry import DynamicToolRouter
 from src.telemetry import initialize_observability
 from src.tools import dispatch
 from src.tools.file_ops import set_allow_test_edits
+from src.tools.paths import set_workspace_root, get_workspace_root
+from src.session import SessionContext, SessionManager
 from src.agents import run_orchestration, replan_mission, run_worker, run_validator
 
 _CONFIG_DIR   = _ROOT / "config"
-_MISSION_DIR  = _ROOT / "active_mission"
-_PLAN_PATH    = _MISSION_DIR / "plan.json"
-_HANDOFFS_DIR = _MISSION_DIR / "handoffs"
-_WORKSPACE_DIR = _ROOT / "workspace"
 _SKILLS_PATH  = _CONFIG_DIR / "skills.md"
 
 MAX_RETRY_CYCLES = 3
@@ -63,19 +73,19 @@ testpaths = tests
 # Workspace bootstrap
 # ---------------------------------------------------------------------------
 
-def _ensure_workspace() -> None:
-    """Create workspace/ and pytest import bootstrap before any tool calls."""
-    _WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
-
-    gitkeep = _WORKSPACE_DIR / ".gitkeep"
+def _ensure_session_workspace(ctx: SessionContext) -> None:
+    """Create the session workspace and pytest import bootstrap before any tool calls."""
+    ctx.ensure_dirs()
+    gitkeep = ctx.workspace_root / ".gitkeep"
     if not gitkeep.exists():
         gitkeep.touch()
 
-    pytest_ini = _WORKSPACE_DIR / "pytest.ini"
+    pytest_ini = ctx.workspace_root / "pytest.ini"
     if not pytest_ini.exists():
         pytest_ini.write_text(_PYTEST_INI, encoding="utf-8")
 
-    (_WORKSPACE_DIR / "tests").mkdir(parents=True, exist_ok=True)
+    (ctx.workspace_root / "tests").mkdir(parents=True, exist_ok=True)
+    set_workspace_root(ctx.workspace_root)
 
 
 def _is_test_milestone(milestone: dict) -> bool:
@@ -113,6 +123,7 @@ class MissionResult:
     handoffs: list[MilestoneHandoff]
     total_elapsed_ms: float
     model_used: str
+    session_id: str
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +135,8 @@ class MissionsRuntime:
     Serial Missions execution engine.
 
     One agent role runs at a time; each phase completes before the next begins.
+    Every run is scoped to a :class:`SessionContext` whose workspace is
+    activated globally before tool execution.
     """
 
     def __init__(
@@ -134,43 +147,62 @@ class MissionsRuntime:
     ) -> None:
         self.model = model
         self._router = DynamicToolRouter(_SKILLS_PATH)
+        self._session_manager = SessionManager()
 
         if telemetry:
             initialize_observability()
 
+        self._memory_enabled = memory
         self._memory = None
-        if memory:
-            try:
-                from src.memory_layer import MissionMemory
-                self._memory = MissionMemory()
-            except Exception as exc:
-                print(f"[Runtime] Memory layer unavailable: {exc}")
+        self._session: Optional[SessionContext] = None
 
     # ------------------------------------------------------------------
-    # Public entry point
+    # Public entry points
     # ------------------------------------------------------------------
 
-    def run(self, user_request: str) -> MissionResult:
+    def run(self, user_request: str, session: Optional[SessionContext] = None) -> MissionResult:
         """
-        Execute a full mission from a user request.
+        Execute a full mission from a user request inside a session.
+
+        If ``session`` is None a new session is created automatically. If a
+        session is provided with an existing pending plan, the mission
+        resumes from the first incomplete milestone.
 
         Args:
             user_request: Plain-English description of what to build or fix.
+            session:      Optional pre-existing session to run inside.
 
         Returns:
             MissionResult with per-milestone handoff telemetry.
         """
         t_mission_start = time.perf_counter()
+
+        # Resolve or create the session
+        if session is None:
+            title = user_request[:60] + ("..." if len(user_request) > 60 else "")
+            session = self._session_manager.create_session(
+                title=title, model=self.model
+            )
+        self._session = session
+
+        _ensure_session_workspace(session)
+        self._session_manager.update_status(session, "running")
+
         print(f"\n{'='*70}")
-        print(f"  MISSIONS RUNTIME — starting")
+        print(f"  MISSIONS RUNTIME — session {session.session_id}")
         print(f"  Request: {user_request[:80]}{'...' if len(user_request) > 80 else ''}")
+        print(f"  Workspace: {session.workspace_root}")
         print(f"{'='*70}\n")
 
-        _ensure_workspace()
-        print(f"[Runtime] Workspace ready: {_WORKSPACE_DIR}")
+        # Initialise memory for this session
+        self._init_memory(session)
 
         # Phase 1 — Orchestration
-        plan = run_orchestration(user_request, self.model)
+        plan = run_orchestration(
+            user_request, self.model,
+            plan_path=session.plan_path,
+            mission_dir=session.root,
+        )
         milestones = plan.get("milestones", [])
         mission_id = plan.get("mission_id", str(uuid.uuid4())[:8])
         title = plan.get("title", "Untitled Mission")
@@ -199,7 +231,7 @@ class MissionsRuntime:
                     ms_index += 1
                     continue
 
-            handoff = self._execute_milestone(ms, plan)
+            handoff = self._execute_milestone(ms, plan, session)
             handoffs.append(handoff)
 
             if handoff.verdict == "PASS":
@@ -208,7 +240,10 @@ class MissionsRuntime:
                     self._memory.log_milestone_state(ms_id, asdict(handoff), "completed")
                 ms_index += 1
             elif handoff.verdict == "REPLAN":
-                plan = replan_mission(plan, handoff.error_log[-1], self.model)
+                plan = replan_mission(
+                    plan, handoff.error_log[-1], self.model,
+                    plan_path=session.plan_path,
+                )
                 milestones = plan.get("milestones", [])
             else:
                 print(
@@ -223,6 +258,8 @@ class MissionsRuntime:
             else ("partial" if passed > 0 else "failed")
         )
 
+        self._session_manager.update_status(session, status)
+
         result = MissionResult(
             mission_id=mission_id,
             title=title,
@@ -232,6 +269,7 @@ class MissionsRuntime:
             handoffs=handoffs,
             total_elapsed_ms=round(total_ms, 2),
             model_used=self.model,
+            session_id=session.session_id,
         )
         self._print_summary(result)
         return result
@@ -240,7 +278,9 @@ class MissionsRuntime:
     # Milestone execution loop (glue: Phase 2 → 3 → 4)
     # ------------------------------------------------------------------
 
-    def _execute_milestone(self, milestone: dict, plan: dict) -> MilestoneHandoff:
+    def _execute_milestone(
+        self, milestone: dict, plan: dict, session: SessionContext
+    ) -> MilestoneHandoff:
         """
         Run the full Phase 2 → 3 → 4 loop for a single milestone.
         Retries the worker up to MAX_RETRY_CYCLES times on validator FAIL.
@@ -298,10 +338,17 @@ class MissionsRuntime:
 
             if verdict == "PASS":
                 commit_msg    = f"feat({ms_id}): {ms_title}"
-                commit_result = dispatch("git_commit", {"message": commit_msg})
+                stage_paths = [str(session.root.relative_to(_ROOT)) + "/"]
+                commit_result = dispatch("git_commit", {
+                    "message": commit_msg,
+                    "stage_paths": stage_paths,
+                })
                 commit_hash   = commit_result.get("commit_hash", "")
                 elapsed_ms    = (time.perf_counter() - t_start) * 1000.0
-                self._save_handoff(ms_id, ms_title, worker_result, verdict_data, commit_hash, retry_count)
+                self._save_handoff(
+                    ms_id, ms_title, worker_result, verdict_data,
+                    commit_hash, retry_count, session,
+                )
                 print(f"\n  [✓] Milestone {ms_id} PASSED — commit {commit_hash}")
                 return MilestoneHandoff(
                     milestone_id=ms_id, title=ms_title,
@@ -360,6 +407,21 @@ class MissionsRuntime:
         )
 
     # ------------------------------------------------------------------
+    # Memory
+    # ------------------------------------------------------------------
+
+    def _init_memory(self, session: SessionContext) -> None:
+        """Initialise the memory layer for this session (if enabled)."""
+        self._memory = None
+        if not self._memory_enabled:
+            return
+        try:
+            from src.memory_layer import MissionMemory
+            self._memory = MissionMemory(memory_file_path=session.memory_store_path)
+        except Exception as exc:
+            print(f"[Runtime] Memory layer unavailable: {exc}")
+
+    # ------------------------------------------------------------------
     # Persistence helpers
     # ------------------------------------------------------------------
 
@@ -371,9 +433,10 @@ class MissionsRuntime:
         verdict_data: dict,
         commit_hash: str,
         retry_count: int,
+        session: SessionContext,
     ) -> None:
-        """Persist milestone handoff metadata to active_mission/handoffs/."""
-        _HANDOFFS_DIR.mkdir(parents=True, exist_ok=True)
+        """Persist milestone handoff metadata to the session's handoffs/ dir."""
+        session.handoffs_dir.mkdir(parents=True, exist_ok=True)
         handoff = {
             "milestone_id":       ms_id,
             "title":              ms_title,
@@ -385,19 +448,20 @@ class MissionsRuntime:
             "retry_count":        retry_count,
             "commit_hash":        commit_hash,
             "timestamp":          time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "session_id":         session.session_id,
         }
-        path = _HANDOFFS_DIR / f"{ms_id}_{int(time.time())}.json"
+        path = session.handoffs_dir / f"{ms_id}_{int(time.time())}.json"
         path.write_text(json.dumps(handoff, indent=2), encoding="utf-8")
 
         # Mark milestone as completed in plan.json
-        if _PLAN_PATH.exists():
+        if session.plan_path.exists():
             try:
-                plan = json.loads(_PLAN_PATH.read_text(encoding="utf-8"))
+                plan = json.loads(session.plan_path.read_text(encoding="utf-8"))
                 for m in plan.get("milestones", []):
                     if m.get("id") == ms_id:
                         m["status"] = "completed"
                         break
-                _PLAN_PATH.write_text(json.dumps(plan, indent=2), encoding="utf-8")
+                session.plan_path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
             except (json.JSONDecodeError, OSError) as exc:
                 print(f"  [Runtime] Could not update plan.json: {exc}")
 
@@ -405,6 +469,7 @@ class MissionsRuntime:
     def _print_summary(result: MissionResult) -> None:
         print(f"\n{'='*70}")
         print(f"  MISSION COMPLETE — {result.status.upper()}")
+        print(f"  Session     : {result.session_id}")
         print(f"  Title       : {result.title}")
         print(f"  Milestones  : {result.milestones_passed}/{result.milestones_total} passed")
         print(f"  Total time  : {result.total_elapsed_ms / 1000:.1f}s")
@@ -416,6 +481,19 @@ class MissionsRuntime:
                 f"{h.verdict} ({h.elapsed_ms / 1000:.1f}s, {h.retry_count} retries)"
             )
         print()
+
+    # ------------------------------------------------------------------
+    # Session access
+    # ------------------------------------------------------------------
+
+    @property
+    def session(self) -> Optional[SessionContext]:
+        """Return the session for the current (or most recent) run."""
+        return self._session
+
+    @property
+    def session_manager(self) -> SessionManager:
+        return self._session_manager
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +514,39 @@ def main() -> None:
     )
     parser.add_argument("--no-telemetry", action="store_true", help="Disable Arize Phoenix telemetry")
     parser.add_argument("--no-memory",    action="store_true", help="Disable Cognee memory layer")
+    parser.add_argument(
+        "--session",
+        default=None,
+        help="Resume an existing session by id (under sessions/<id>/)",
+    )
+    parser.add_argument(
+        "--list-sessions",
+        action="store_true",
+        help="List existing sessions and exit",
+    )
     args = parser.parse_args()
+
+    runtime = MissionsRuntime(
+        model=args.model,
+        telemetry=not args.no_telemetry,
+        memory=not args.no_memory,
+    )
+
+    if args.list_sessions:
+        sessions = runtime.session_manager.list_sessions()
+        if not sessions:
+            print("No sessions found.")
+            return
+        print(f"{'SESSION ID':<14} {'STATUS':<10} {'MODEL':<8} {'TITLE'}")
+        print("-" * 70)
+        for s in sessions:
+            print(
+                f"{s.get('session_id', '?'):<14} "
+                f"{s.get('status', '?'):<10} "
+                f"{s.get('selected_model', '?'):<8} "
+                f"{s.get('title', '?')}"
+            )
+        return
 
     request = args.request
     if not request:
@@ -445,12 +555,15 @@ def main() -> None:
         print("No request provided. Exiting.")
         sys.exit(1)
 
-    runtime = MissionsRuntime(
-        model=args.model,
-        telemetry=not args.no_telemetry,
-        memory=not args.no_memory,
-    )
-    result = runtime.run(request)
+    session = None
+    if args.session:
+        session = runtime.session_manager.load_session(args.session)
+        if session is None:
+            print(f"Session '{args.session}' not found under sessions/. Exiting.")
+            sys.exit(1)
+        print(f"[Runtime] Resuming session {session.session_id} ({session.title}).")
+
+    result = runtime.run(request, session=session)
     sys.exit(0 if result.status == "completed" else 1)
 
 

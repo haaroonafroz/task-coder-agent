@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-_MEMORY_FILE = Path(__file__).parent.parent / "active_mission" / "memory_store.json"
+_LEGACY_MEMORY_FILE = Path(__file__).parent.parent / "active_mission" / "memory_store.json"
 
 # ---------------------------------------------------------------------------
 # Optional Cognee import
@@ -105,7 +105,8 @@ class MissionMemory:
     a local JSON file store otherwise.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, memory_file_path: Optional[Path] = None) -> None:
+        self._memory_file = memory_file_path if memory_file_path is not None else _LEGACY_MEMORY_FILE
         if _COGNEE_AVAILABLE:
             self._backend = "cognee"
             print("[Memory] Cognee knowledge graph backend active.")
@@ -275,18 +276,18 @@ class MissionMemory:
     # ------------------------------------------------------------------
 
     def _ensure_store(self) -> None:
-        _MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        if not _MEMORY_FILE.exists():
+        self._memory_file.parent.mkdir(parents=True, exist_ok=True)
+        if not self._memory_file.exists():
             self._save_store({"milestones": {}, "error_log": []})
 
     def _load_store(self) -> dict:
         try:
-            return json.loads(_MEMORY_FILE.read_text(encoding="utf-8"))
+            return json.loads(self._memory_file.read_text(encoding="utf-8"))
         except Exception:
             return {"milestones": {}, "error_log": []}
 
     def _save_store(self, data: dict) -> None:
-        _MEMORY_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        self._memory_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def _json_write(self, milestone_id: str, status: str, meta: dict) -> None:
         store = self._load_store()
