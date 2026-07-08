@@ -15,8 +15,8 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
-from src.llm_client import call_llm, ModelChoice
-from src.telemetry import span_llm_call, span_tool_call
+from src.llm_client import call_llm, ModelChoice, resolve_model_config
+from src.telemetry import span_llm_call, span_tool_call, TelemetryContext
 from src.tools import dispatch
 from src.tools.paths import normalize_workspace_path, normalize_shell_command, get_workspace_root
 from src.events import EventEmitter
@@ -54,6 +54,7 @@ def run_worker(
     model: ModelChoice,
     memory: Any,
     emitter: Optional[EventEmitter] = None,
+    session: Optional[TelemetryContext] = None,
 ) -> dict[str, Any]:
     """
     Execute the worker agent loop for a single milestone.
@@ -71,6 +72,8 @@ def run_worker(
         model:            LLM backend to use.
         memory:           MissionMemory instance, or None if disabled.
         emitter:          Optional EventEmitter for streaming tool/worker events.
+        session:          Optional telemetry context used to bind LLM/tool spans
+                          to a Phoenix session (Phase 5).
 
     Returns:
         dict with keys: status, summary, files_modified, tool_calls.
@@ -120,12 +123,17 @@ def run_worker(
             else flatten_conversation(trimmed)
         )
 
-        with span_llm_call("worker", ms_id, model):
+        span_model = (
+            resolve_model_config(model, "worker").model_name
+            if model != "auto" else model
+        )
+        with span_llm_call("worker", ms_id, span_model, session=session):
             llm_result = call_llm(
                 prompt=prompt,
                 model=model,
                 max_tokens=MAX_TOKENS_WORKER,
                 system_prompt=_WORKER_MD,
+                role="worker",
             )
 
         raw = llm_result.text.strip()
@@ -239,7 +247,7 @@ def run_worker(
                 call_index=tool_call_count + 1,
             )
 
-        with span_tool_call(tool_name, ms_id):
+        with span_tool_call(tool_name, ms_id, session=session):
             tool_result = dispatch(tool_name, tool_args)
 
         tool_call_count += 1

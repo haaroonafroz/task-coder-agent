@@ -19,10 +19,10 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
-from src.llm_client import call_llm, ModelChoice
-from src.telemetry import span_llm_call
+from src.llm_client import call_llm, ModelChoice, resolve_model_config
+from src.telemetry import span_llm_call, TelemetryContext
 from src.tools import dispatch
 from src.tools.paths import resolve_workspace_path
 from src.events import EventEmitter
@@ -51,6 +51,7 @@ def run_validator(
     is_test_milestone: bool,
     model: ModelChoice,
     emitter: "EventEmitter | None" = None,
+    session: Optional[TelemetryContext] = None,
 ) -> dict[str, Any]:
     """
     Execute the validation contract and render a verdict.
@@ -63,6 +64,8 @@ def run_validator(
                            phase; permits test file edits by the worker.
         model:             LLM backend to use.
         emitter:           Optional EventEmitter for streaming validation events.
+        session:           Optional telemetry context used to bind LLM spans to a
+                           Phoenix session (Phase 5).
 
     Returns:
         A verdict dict with key "verdict": "PASS" | "FAIL" | "REPLAN".
@@ -178,10 +181,14 @@ def run_validator(
         f"Emit your PASS, FAIL, or REPLAN JSON verdict now:"
     )
 
-    with span_llm_call("validator", ms_id, model):
+    span_model = (
+        resolve_model_config(model, "validator").model_name
+        if model != "auto" else model
+    )
+    with span_llm_call("validator", ms_id, span_model, session=session):
         result = call_llm(
             prompt, model=model, max_tokens=MAX_TOKENS_VALIDATOR,
-            json_mode=True, enable_thinking=True,
+            json_mode=True, role="validator",
         )
 
     parsed = parse_json_from_text(result.text)

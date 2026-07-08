@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -72,6 +73,52 @@ except ImportError:
     _OPENINFERENCE_AVAILABLE = False
 
 _tracer_provider: Optional[object] = None
+
+
+# ---------------------------------------------------------------------------
+# Session telemetry context (Phase 5)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TelemetryContext:
+    """
+    Per-session telemetry context propagated to every span.
+
+    Built from :class:`src.session.SessionContext` and threaded through the
+    agent phases so every LLM/tool span carries ``session.id`` (and optionally
+    ``session.title`` / ``session.project``), making traces filterable per
+    session in the Phoenix UI.
+    """
+
+    session_id: str
+    title: Optional[str] = None
+    project: Optional[str] = None
+
+    def span_attributes(self) -> dict[str, str]:
+        """Return the OpenTelemetry attributes that bind a span to this session."""
+        attrs: dict[str, str] = {"session.id": self.session_id}
+        if self.title:
+            attrs["session.title"] = self.title
+        if self.project:
+            attrs["session.project"] = self.project
+        return attrs
+
+
+def telemetry_context_from_session(session) -> Optional[TelemetryContext]:
+    """
+    Build a :class:`TelemetryContext` from a :class:`SessionContext`.
+
+    Returns None when the session has no ``phoenix_session_id`` (defensive —
+    should not happen in normal flows since ``SessionManager`` defaults it).
+    """
+    phoenix_session_id = getattr(session, "phoenix_session_id", None)
+    if not phoenix_session_id:
+        return None
+    return TelemetryContext(
+        session_id=phoenix_session_id,
+        title=getattr(session, "title", None),
+        project=getattr(session, "phoenix_project", None),
+    )
 
 
 def initialize_observability(
@@ -159,32 +206,77 @@ def get_tracer():
     return trace.get_tracer(_TRACER_NAME)
 
 
-def span_llm_call(agent_role: str, milestone_id: str, model: str):
+def span_llm_call(
+    agent_role: str,
+    milestone_id: str,
+    model: str,
+    session: Optional[TelemetryContext] = None,
+):
     """
     Context manager wrapping an LLM call with a labelled span.
 
     Usage:
-        with span_llm_call("worker", "M2", "local/qwen3-27b"):
+        with span_llm_call("worker", "M2", "local/qwen3-27b", session=tcx):
             result = call_llm(...)
+
+    When ``session`` is provided, the span is tagged with ``session.id`` (and
+    optionally ``session.title`` / ``session.project``) so traces are
+    filterable per session in the Phoenix UI (Phase 5).
     """
+    attributes = {
+        "agent.role": agent_role,
+        "mission.milestone_id": milestone_id,
+        "llm.model": model,
+    }
+    if session is not None:
+        attributes.update(session.span_attributes())
     return get_tracer().start_as_current_span(
         f"llm.{agent_role}",
-        attributes={
-            "agent.role": agent_role,
-            "mission.milestone_id": milestone_id,
-            "llm.model": model,
-        },
+        attributes=attributes,
     )
 
 
-def span_tool_call(tool_name: str, milestone_id: str):
+def span_tool_call(
+    tool_name: str,
+    milestone_id: str,
+    session: Optional[TelemetryContext] = None,
+):
     """Context manager wrapping a tool execution with a labelled span."""
+    attributes = {
+        "tool.name": tool_name,
+        "mission.milestone_id": milestone_id,
+    }
+    if session is not None:
+        attributes.update(session.span_attributes())
     return get_tracer().start_as_current_span(
         f"tool.{tool_name}",
-        attributes={
-            "tool.name": tool_name,
-            "mission.milestone_id": milestone_id,
-        },
+        attributes=attributes,
+    )
+
+
+def span_mission_run(
+    session_id: str,
+    title: Optional[str] = None,
+    project: Optional[str] = None,
+    model: Optional[str] = None,
+):
+    """
+    Context manager wrapping an entire ``MissionsRuntime.run()`` call.
+
+    Creates a root ``mission.run`` span that parents all child LLM/tool spans
+    for the session. Carries ``session.id`` so every descendant trace is
+    filterable per session in Phoenix (Phase 5).
+    """
+    attributes: dict[str, str] = {"session.id": session_id}
+    if title:
+        attributes["session.title"] = title
+    if project:
+        attributes["session.project"] = project
+    if model:
+        attributes["mission.model"] = model
+    return get_tracer().start_as_current_span(
+        "mission.run",
+        attributes=attributes,
     )
 
 

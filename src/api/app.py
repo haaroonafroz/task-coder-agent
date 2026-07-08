@@ -13,6 +13,7 @@ Run with::
 
 from __future__ import annotations
 
+import os
 import pathlib
 from contextlib import asynccontextmanager
 
@@ -38,11 +39,27 @@ _CORS_ORIGINS = [
 ]
 
 
+def _api_telemetry_enabled() -> bool:
+    """
+    Whether API-launched runs should emit Phoenix telemetry.
+
+    Default is True (Phase 5) so API/frontend runs are traceable per session.
+    Set ``MISSIONS_API_TELEMETRY=false`` in .env to opt out (e.g. for tests
+    or to avoid an accidental local Phoenix launch). Honours PHOENIX_EXTERNAL
+    inside the telemetry module so an already-running Phoenix is reused.
+    """
+    return os.getenv("MISSIONS_API_TELEMETRY", "true").strip().lower() == "true"
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     """Construct heavy singletons once at startup; tear down on shutdown."""
     # Single shared runtime — Qdrant + sentence-transformers load happens once.
-    runtime = MissionsRuntime(model="auto", telemetry=False, memory=True)
+    # Telemetry is opt-out via MISSIONS_API_TELEMETRY (default true) so that
+    # API/frontend runs emit per-session Phoenix spans (Phase 5).
+    runtime = MissionsRuntime(
+        model="auto", telemetry=_api_telemetry_enabled(), memory=True
+    )
     router = DynamicToolRouter(_SKILLS_PATH)
     session_manager = SessionManager(sessions_root=_SESSIONS_ROOT)
     message_store = MessageStore(sessions_root=_SESSIONS_ROOT)
@@ -98,6 +115,7 @@ def _register_routers(app: FastAPI) -> None:
         skills,
         health,
         uploads,
+        evals,
     )
 
     prefix = "/api/v1"
@@ -111,3 +129,4 @@ def _register_routers(app: FastAPI) -> None:
     app.include_router(tools.router, prefix=prefix)
     app.include_router(skills.router, prefix=prefix)
     app.include_router(uploads.router, prefix=prefix)
+    app.include_router(evals.router, prefix=prefix)

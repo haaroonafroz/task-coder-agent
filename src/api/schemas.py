@@ -150,6 +150,8 @@ class ModelInfo(BaseModel):
     base_url: str
     available: bool
     error: Optional[str] = None
+    models_by_role: dict[str, str] = Field(default_factory=dict)
+    thinking_by_role: dict[str, str] = Field(default_factory=dict)
 
 
 class ToolParamSchema(BaseModel):
@@ -195,3 +197,29 @@ class HealthResponse(BaseModel):
 class ReadyResponse(BaseModel):
     ready: bool
     checks: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Evals (Phase 6)
+# ---------------------------------------------------------------------------
+
+class EvalScoreResponse(BaseModel):
+    name: str
+    score: float
+    passed: bool
+    summary: str
+    details: dict[str, Any] = Field(default_factory=dict)
+    evidence: list[str] = Field(default_factory=list)
+    kind: str = "deterministic"
+
+
+class SessionEvalReportResponse(BaseModel):
+    session_id: str
+    evaluated_at: str
+    mission_status: Optional[str] = None
+    overall_score: float
+    overall_passed: bool
+    scores: list[EvalScoreResponse] = Field(default_factory=list)
+    event_count: int
+    deterministic_only: bool = True
+    weights: dict[str, float] = Field(default_factory=dict)

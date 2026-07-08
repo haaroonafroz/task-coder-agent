@@ -15,9 +15,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Optional
 
-from src.llm_client import call_llm, ModelChoice
-from src.telemetry import span_llm_call
+from src.llm_client import call_llm, ModelChoice, resolve_model_config
+from src.telemetry import span_llm_call, TelemetryContext
 from src.agents.utils import parse_json_from_text
 
 # ---------------------------------------------------------------------------
@@ -42,6 +43,7 @@ def run_orchestration(
     model: ModelChoice,
     plan_path: Path = _LEGACY_PLAN_PATH,
     mission_dir: Path = _LEGACY_MISSION_DIR,
+    session: Optional[TelemetryContext] = None,
 ) -> dict:
     """
     Decompose a user request into a structured milestone plan.
@@ -56,6 +58,8 @@ def run_orchestration(
         model:        LLM backend to use.
         plan_path:    Where to read/write the plan (session-scoped or legacy).
         mission_dir:  Parent directory for the plan (created if missing).
+        session:      Optional telemetry context used to bind LLM spans to a
+                      Phoenix session (Phase 5).
 
     Returns:
         The plan dict with a "milestones" list.
@@ -89,10 +93,14 @@ def run_orchestration(
         f"Output the JSON plan now:"
     )
 
-    with span_llm_call("orchestrator", "init", model):
+    span_model = (
+        resolve_model_config(model, "orchestrator").model_name
+        if model != "auto" else model
+    )
+    with span_llm_call("orchestrator", "init", span_model, session=session):
         result = call_llm(
             prompt, model=model, max_tokens=MAX_TOKENS_ORCHESTRATOR,
-            json_mode=True, enable_thinking=True,
+            json_mode=True, role="orchestrator",
         )
 
     plan = parse_json_from_text(result.text)
@@ -114,6 +122,7 @@ def replan_mission(
     replan_guidance: str,
     model: ModelChoice,
     plan_path: Path = _LEGACY_PLAN_PATH,
+    session: Optional[TelemetryContext] = None,
 ) -> dict:
     """
     Patch the current plan based on Validator feedback.
@@ -127,6 +136,8 @@ def replan_mission(
         replan_guidance: Actionable guidance string from the Validator.
         model:           LLM backend to use.
         plan_path:       Where to persist the patched plan (session or legacy).
+        session:         Optional telemetry context used to bind LLM spans to a
+                         Phoenix session (Phase 5).
 
     Returns:
         The updated plan dict (also persisted to plan_path).
@@ -144,10 +155,14 @@ def replan_mission(
         f"Output an UPDATED `plan.json` fixing this issue. Keep completed milestones intact."
     )
 
-    with span_llm_call("orchestrator_replan", "REPLAN", model):
+    span_model = (
+        resolve_model_config(model, "orchestrator").model_name
+        if model != "auto" else model
+    )
+    with span_llm_call("orchestrator_replan", "REPLAN", span_model, session=session):
         result = call_llm(
             prompt, model=model, max_tokens=MAX_TOKENS_ORCHESTRATOR,
-            json_mode=True, enable_thinking=True,
+            json_mode=True, role="orchestrator",
         )
 
     parsed = parse_json_from_text(result.text)

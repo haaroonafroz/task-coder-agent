@@ -50,7 +50,11 @@ sys.path.insert(0, str(_ROOT))
 
 from src.llm_client import call_llm, ModelChoice
 from src.tool_registry import DynamicToolRouter
-from src.telemetry import initialize_observability
+from src.telemetry import (
+    initialize_observability,
+    span_mission_run,
+    telemetry_context_from_session,
+)
 from src.tools import dispatch
 from src.tools.file_ops import set_allow_test_edits
 from src.tools.paths import set_workspace_root, get_workspace_root
@@ -157,6 +161,7 @@ class MissionsRuntime:
         self._memory = None
         self._session: Optional[SessionContext] = None
         self._emitter: Optional[EventEmitter] = None
+        self._telemetry_ctx = None  # set per-run in run() (Phase 5)
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -209,11 +214,40 @@ class MissionsRuntime:
         # Initialise memory for this session
         self._init_memory(session)
 
+        # Phase 5 — bind this run to a Phoenix session span. The root span
+        # parents every child LLM/tool span for the session and carries
+        # session.id so traces are filterable per session in the Phoenix UI.
+        telemetry_ctx = telemetry_context_from_session(session)
+        self._telemetry_ctx = telemetry_ctx
+
+        with span_mission_run(
+            session_id=session.phoenix_session_id or session.session_id,
+            title=session.title,
+            project=session.phoenix_project,
+            model=self.model,
+        ):
+            return self._run_mission_body(
+                user_request, session, telemetry_ctx, t_mission_start
+            )
+
+    # ------------------------------------------------------------------
+    # Mission body (orchestration → milestone loop → summary)
+    # ------------------------------------------------------------------
+
+    def _run_mission_body(
+        self,
+        user_request: str,
+        session: SessionContext,
+        telemetry_ctx,
+        t_mission_start: float,
+    ) -> MissionResult:
+        """Run orchestration + the milestone loop + summary inside a span."""
         # Phase 1 — Orchestration
         plan = run_orchestration(
             user_request, self.model,
             plan_path=session.plan_path,
             mission_dir=session.root,
+            session=telemetry_ctx,
         )
         milestones = plan.get("milestones", [])
         mission_id = plan.get("mission_id", str(uuid.uuid4())[:8])
@@ -270,6 +304,7 @@ class MissionsRuntime:
                 plan = replan_mission(
                     plan, handoff.error_log[-1], self.model,
                     plan_path=session.plan_path,
+                    session=telemetry_ctx,
                 )
                 milestones = plan.get("milestones", [])
                 self._emitter.emit(
@@ -318,7 +353,24 @@ class MissionsRuntime:
                 milestones_total=len(milestones),
                 total_elapsed_ms=result.total_elapsed_ms,
             )
+
+            # Phase 6 — optional auto-eval (default off via MISSIONS_AUTO_EVAL).
+            try:
+                from src.evals.runner import auto_eval_enabled, run_session_evals
+                if auto_eval_enabled():
+                    run_session_evals(
+                        session,
+                        persist=True,
+                        model=self.model,
+                        emitter=self._emitter,
+                    )
+            except Exception as exc:
+                print(f"[Evals] Auto-eval skipped or failed: {exc}")
+
             unregister_emitter(session.session_id)
+
+        # Clear the per-run telemetry context now that the mission is done.
+        self._telemetry_ctx = None
 
         self._print_summary(result)
         return result
@@ -359,6 +411,7 @@ class MissionsRuntime:
                 model=self.model,
                 memory=self._memory,
                 emitter=self._emitter,
+                session=self._telemetry_ctx,
             )
 
             if worker_result.get("status") == "blocked":
@@ -392,6 +445,7 @@ class MissionsRuntime:
                 is_test_milestone=is_test,
                 model=self.model,
                 emitter=self._emitter,
+                session=self._telemetry_ctx,
             )
             verdict = verdict_data.get("verdict", "FAIL")
 
