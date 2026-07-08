@@ -25,6 +25,7 @@ from src.llm_client import call_llm, ModelChoice
 from src.telemetry import span_llm_call
 from src.tools import dispatch
 from src.tools.paths import resolve_workspace_path
+from src.events import EventEmitter
 from src.agents.utils import parse_json_from_text
 
 # ---------------------------------------------------------------------------
@@ -49,6 +50,7 @@ def run_validator(
     retry_count: int,
     is_test_milestone: bool,
     model: ModelChoice,
+    emitter: "EventEmitter | None" = None,
 ) -> dict[str, Any]:
     """
     Execute the validation contract and render a verdict.
@@ -60,6 +62,7 @@ def run_validator(
         is_test_milestone: True when this milestone is explicitly a test-writing
                            phase; permits test file edits by the worker.
         model:             LLM backend to use.
+        emitter:           Optional EventEmitter for streaming validation events.
 
     Returns:
         A verdict dict with key "verdict": "PASS" | "FAIL" | "REPLAN".
@@ -80,6 +83,13 @@ def run_validator(
             f"    [Validator] REJECTED: Worker illegally modified test files: "
             f"{unauthorized_edits}"
         )
+        if emitter:
+            emitter.emit(
+                "validation.spec_gaming",
+                milestone_id=ms_id,
+                unauthorized_edits=unauthorized_edits,
+            )
+            emitter.emit("validation.finished", milestone_id=ms_id, verdict="FAIL")
         return {
             "verdict": "FAIL",
             "milestone_id": ms_id,
@@ -98,6 +108,9 @@ def run_validator(
             ),
         }
 
+    if emitter:
+        emitter.emit("validation.started", milestone_id=ms_id, command=command)
+
     # --- Run the validation contract command ---------------------------------
     contract_output = ""
     tool_result: dict = {}
@@ -110,6 +123,12 @@ def run_validator(
             f"returncode: {tool_result.get('returncode', -1)}"
         )
         print(f"    [Validator] returncode={tool_result.get('returncode')}")
+        if emitter:
+            emitter.emit(
+                "validation.contract_run",
+                milestone_id=ms_id,
+                returncode=tool_result.get("returncode", -1),
+            )
 
     returncode = tool_result.get("returncode") if command else None
 
@@ -117,10 +136,24 @@ def run_validator(
     replan = _detect_contract_replan(milestone, worker_result, contract_output, returncode)
     if replan:
         print(f"    [Validator] Deterministic REPLAN: {replan['replan_guidance']}")
+        if emitter:
+            emitter.emit(
+                "validation.finished",
+                milestone_id=ms_id,
+                verdict="REPLAN",
+                reason="deterministic",
+            )
         return replan
 
     # --- Fast-path PASS (contract exited 0) ----------------------------------
     if returncode == 0:
+        if emitter:
+            emitter.emit(
+                "validation.finished",
+                milestone_id=ms_id,
+                verdict="PASS",
+                path="fast_path",
+            )
         return {
             "verdict": "PASS",
             "milestone_id": ms_id,
@@ -154,11 +187,25 @@ def run_validator(
     parsed = parse_json_from_text(result.text)
     if parsed is None:
         if command and "returncode: 0" in contract_output:
+            if emitter:
+                emitter.emit(
+                    "validation.finished",
+                    milestone_id=ms_id,
+                    verdict="PASS",
+                    path="unparseable_contract_ok",
+                )
             return {
                 "verdict": "PASS",
                 "milestone_id": ms_id,
                 "validation_details": "Contract command exited 0.",
             }
+        if emitter:
+            emitter.emit(
+                "validation.finished",
+                milestone_id=ms_id,
+                verdict="FAIL",
+                path="unparseable",
+            )
         return {
             "verdict": "FAIL",
             "milestone_id": ms_id,
@@ -173,6 +220,14 @@ def run_validator(
         print("    [Validator] Overriding REPLAN — contract command returned 0.")
         parsed["verdict"] = "PASS"
         parsed.setdefault("validation_details", "Contract command exited 0.")
+
+    if emitter:
+        emitter.emit(
+            "validation.finished",
+            milestone_id=ms_id,
+            verdict=parsed.get("verdict", "FAIL"),
+            path="llm",
+        )
 
     return parsed
 

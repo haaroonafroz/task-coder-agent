@@ -200,9 +200,24 @@ class SessionManager:
 
     def _save_meta(self, ctx: SessionContext) -> None:
         ctx.meta_path.parent.mkdir(parents=True, exist_ok=True)
-        ctx.meta_path.write_text(
-            json.dumps(ctx.to_meta_dict(), indent=2), encoding="utf-8"
+        # Atomic write: write to a temp file then os.replace so concurrent
+        # readers (e.g. the API server thread) never see a partial file.
+        import os
+        import tempfile
+        data = json.dumps(ctx.to_meta_dict(), indent=2)
+        fd, tmp = tempfile.mkstemp(
+            dir=str(ctx.meta_path.parent), suffix=".tmp", prefix="session_"
         )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(data)
+            os.replace(tmp, ctx.meta_path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     # ------------------------------------------------------------------
     # Internal

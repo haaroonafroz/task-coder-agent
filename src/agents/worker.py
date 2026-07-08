@@ -19,6 +19,7 @@ from src.llm_client import call_llm, ModelChoice
 from src.telemetry import span_llm_call, span_tool_call
 from src.tools import dispatch
 from src.tools.paths import normalize_workspace_path, normalize_shell_command, get_workspace_root
+from src.events import EventEmitter
 from src.agents.utils import (
     parse_json_from_text,
     flatten_conversation,
@@ -52,6 +53,7 @@ def run_worker(
     retry_count: int,
     model: ModelChoice,
     memory: Any,
+    emitter: Optional[EventEmitter] = None,
 ) -> dict[str, Any]:
     """
     Execute the worker agent loop for a single milestone.
@@ -68,12 +70,16 @@ def run_worker(
         retry_count:      Current retry attempt (0-indexed).
         model:            LLM backend to use.
         memory:           MissionMemory instance, or None if disabled.
+        emitter:          Optional EventEmitter for streaming tool/worker events.
 
     Returns:
         dict with keys: status, summary, files_modified, tool_calls.
     """
     ms_id = milestone.get("id", "?")
     print(f"\n  [Phase 3] WORKER — milestone {ms_id} (attempt {retry_count + 1})")
+
+    if emitter:
+        emitter.emit("worker.started", milestone_id=ms_id, retry=retry_count)
 
     ms = _normalize_milestone_for_worker(milestone)
     target_files = ms.get("target_files", [])
@@ -128,7 +134,16 @@ def run_worker(
         if parsed is None:
             non_json_retries += 1
             print(f"    [Worker] Non-JSON response ({non_json_retries}/{_NON_JSON_RETRIES}).")
+            if emitter:
+                emitter.emit(
+                    "worker.invalid_json",
+                    milestone_id=ms_id,
+                    attempt=non_json_retries,
+                    max_attempts=_NON_JSON_RETRIES,
+                )
             if non_json_retries >= _NON_JSON_RETRIES:
+                if emitter:
+                    emitter.emit("worker.blocked", milestone_id=ms_id, reason="invalid_json")
                 return {
                     "status": "blocked",
                     "reason": f"Worker failed to emit valid JSON after {_NON_JSON_RETRIES} attempts.",
@@ -150,6 +165,12 @@ def run_worker(
             ok, missing = target_files_exist(target_files)
             if target_files and not ok:
                 print(f"    [Worker] Rejected premature COMPLETE — missing: {missing}")
+                if emitter:
+                    emitter.emit(
+                        "worker.complete_rejected",
+                        milestone_id=ms_id,
+                        missing=missing,
+                    )
                 conversation.append({"role": "assistant", "content": raw})
                 conversation.append({
                     "role": "user",
@@ -159,6 +180,13 @@ def run_worker(
                     ),
                 })
                 continue
+            if emitter:
+                emitter.emit(
+                    "worker.complete",
+                    milestone_id=ms_id,
+                    tool_calls=tool_call_count,
+                    files_modified=list(set(files_modified)),
+                )
             return {
                 "status": "complete",
                 "summary": parsed.get("summary", ""),
@@ -173,6 +201,14 @@ def run_worker(
             print(f"    [Worker] Reason: {reason}")
             if clarification:
                 print(f"    [Worker] Needs clarification: {clarification}")
+            if emitter:
+                emitter.emit(
+                    "worker.blocked",
+                    milestone_id=ms_id,
+                    reason=reason,
+                    clarification=clarification,
+                    tool_calls=tool_call_count,
+                )
             return {"status": "blocked", "reason": reason, "tool_calls": tool_call_count}
 
         # Tool call
@@ -193,10 +229,29 @@ def run_worker(
             f"{tool_name}({list(tool_args.keys())}) — {reasoning}"
         )
 
+        if emitter:
+            emitter.emit(
+                "tool.called",
+                milestone_id=ms_id,
+                tool=tool_name,
+                args_keys=list(tool_args.keys()),
+                reasoning=reasoning,
+                call_index=tool_call_count + 1,
+            )
+
         with span_tool_call(tool_name, ms_id):
             tool_result = dispatch(tool_name, tool_args)
 
         tool_call_count += 1
+
+        if emitter:
+            emitter.emit(
+                "tool.result",
+                milestone_id=ms_id,
+                tool=tool_name,
+                success=tool_result.get("success", False),
+                call_index=tool_call_count,
+            )
 
         if tool_name in ("write_file", "patch_file") and tool_result.get("success"):
             fpath = normalize_workspace_path(tool_args.get("file_path", ""))
@@ -231,12 +286,26 @@ def run_worker(
     # Budget exhausted
     ok, missing = target_files_exist(target_files)
     if target_files and not ok:
+        if emitter:
+            emitter.emit(
+                "worker.blocked",
+                milestone_id=ms_id,
+                reason=f"Tool budget exhausted. Missing deliverables: {missing}",
+                tool_calls=tool_call_count,
+            )
         return {
             "status": "blocked",
             "reason": f"Tool budget exhausted. Missing deliverables: {missing}",
             "files_modified": list(set(files_modified)),
             "tool_calls": tool_call_count,
         }
+    if emitter:
+        emitter.emit(
+            "worker.complete",
+            milestone_id=ms_id,
+            tool_calls=tool_call_count,
+            files_modified=list(set(files_modified)),
+        )
     return {
         "status": "complete",
         "summary": f"Tool call budget exhausted after {MAX_WORKER_TOOL_CALLS} calls.",

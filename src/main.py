@@ -55,6 +55,7 @@ from src.tools import dispatch
 from src.tools.file_ops import set_allow_test_edits
 from src.tools.paths import set_workspace_root, get_workspace_root
 from src.session import SessionContext, SessionManager
+from src.events import EventEmitter, register_emitter, unregister_emitter
 from src.agents import run_orchestration, replan_mission, run_worker, run_validator
 
 _CONFIG_DIR   = _ROOT / "config"
@@ -155,6 +156,7 @@ class MissionsRuntime:
         self._memory_enabled = memory
         self._memory = None
         self._session: Optional[SessionContext] = None
+        self._emitter: Optional[EventEmitter] = None
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -188,6 +190,16 @@ class MissionsRuntime:
         _ensure_session_workspace(session)
         self._session_manager.update_status(session, "running")
 
+        # Event stream for this session
+        self._emitter = EventEmitter(session.events_path, session.session_id)
+        register_emitter(self._emitter)
+        self._emitter.emit(
+            "session.started",
+            request=user_request,
+            model=self.model,
+            workspace=str(session.workspace_root),
+        )
+
         print(f"\n{'='*70}")
         print(f"  MISSIONS RUNTIME — session {session.session_id}")
         print(f"  Request: {user_request[:80]}{'...' if len(user_request) > 80 else ''}")
@@ -206,6 +218,14 @@ class MissionsRuntime:
         milestones = plan.get("milestones", [])
         mission_id = plan.get("mission_id", str(uuid.uuid4())[:8])
         title = plan.get("title", "Untitled Mission")
+
+        self._emitter.emit(
+            "plan.created",
+            mission_id=mission_id,
+            title=title,
+            milestones_total=len(milestones),
+            milestone_ids=[m.get("id", "?") for m in milestones],
+        )
 
         print(f"[Orchestrator] Mission '{title}' decomposed into {len(milestones)} milestones.")
 
@@ -227,10 +247,12 @@ class MissionsRuntime:
                 resume = self._memory.check_resume_point(ms_id)
                 if resume and resume.get("status") == "completed":
                     print(f"  [Memory] Milestone {ms_id} already completed — skipping.")
+                    self._emitter.emit("milestone.skipped", milestone_id=ms_id, title=ms_title)
                     passed += 1
                     ms_index += 1
                     continue
 
+            self._emitter.emit("milestone.started", milestone_id=ms_id, title=ms_title)
             handoff = self._execute_milestone(ms, plan, session)
             handoffs.append(handoff)
 
@@ -240,15 +262,31 @@ class MissionsRuntime:
                     self._memory.log_milestone_state(ms_id, asdict(handoff), "completed")
                 ms_index += 1
             elif handoff.verdict == "REPLAN":
+                self._emitter.emit(
+                    "milestone.replan",
+                    milestone_id=ms_id,
+                    guidance=handoff.error_log[-1] if handoff.error_log else "",
+                )
                 plan = replan_mission(
                     plan, handoff.error_log[-1], self.model,
                     plan_path=session.plan_path,
                 )
                 milestones = plan.get("milestones", [])
+                self._emitter.emit(
+                    "plan.updated",
+                    milestones_total=len(milestones),
+                    milestone_ids=[m.get("id", "?") for m in milestones],
+                )
             else:
                 print(
                     f"  [Runtime] Milestone {ms_id} FAILED after "
                     f"{handoff.retry_count} retries — halting mission."
+                )
+                self._emitter.emit(
+                    "milestone.failed",
+                    milestone_id=ms_id,
+                    retry_count=handoff.retry_count,
+                    errors=handoff.error_log[-3:] if handoff.error_log else [],
                 )
                 break
 
@@ -271,6 +309,17 @@ class MissionsRuntime:
             model_used=self.model,
             session_id=session.session_id,
         )
+
+        if self._emitter:
+            self._emitter.emit(
+                "mission.complete",
+                status=status,
+                milestones_passed=passed,
+                milestones_total=len(milestones),
+                total_elapsed_ms=result.total_elapsed_ms,
+            )
+            unregister_emitter(session.session_id)
+
         self._print_summary(result)
         return result
 
@@ -309,6 +358,7 @@ class MissionsRuntime:
                 retry_count=retry_count,
                 model=self.model,
                 memory=self._memory,
+                emitter=self._emitter,
             )
 
             if worker_result.get("status") == "blocked":
@@ -316,6 +366,14 @@ class MissionsRuntime:
                 error_log.append(f"Worker blocked: {reason}")
                 print(f"  [Runtime] Worker BLOCKED: {reason}")
                 elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+                if self._emitter:
+                    self._emitter.emit(
+                        "milestone.blocked",
+                        milestone_id=ms_id,
+                        reason=reason,
+                        tool_calls=worker_result.get("tool_calls", 0),
+                        elapsed_ms=round(elapsed_ms, 2),
+                    )
                 return MilestoneHandoff(
                     milestone_id=ms_id, title=ms_title,
                     worker_summary=reason, files_modified=[],
@@ -333,6 +391,7 @@ class MissionsRuntime:
                 retry_count=retry_count,
                 is_test_milestone=is_test,
                 model=self.model,
+                emitter=self._emitter,
             )
             verdict = verdict_data.get("verdict", "FAIL")
 
@@ -349,6 +408,20 @@ class MissionsRuntime:
                     ms_id, ms_title, worker_result, verdict_data,
                     commit_hash, retry_count, session,
                 )
+                if self._emitter:
+                    self._emitter.emit(
+                        "milestone.passed",
+                        milestone_id=ms_id,
+                        commit_hash=commit_hash,
+                        tool_calls=worker_result.get("tool_calls", 0),
+                        files_modified=worker_result.get("files_modified", []),
+                        elapsed_ms=round(elapsed_ms, 2),
+                    )
+                    self._emitter.emit(
+                        "handoff.saved",
+                        milestone_id=ms_id,
+                        commit_hash=commit_hash,
+                    )
                 print(f"\n  [✓] Milestone {ms_id} PASSED — commit {commit_hash}")
                 return MilestoneHandoff(
                     milestone_id=ms_id, title=ms_title,
@@ -389,6 +462,16 @@ class MissionsRuntime:
             print(f"\n  [✗] Milestone {ms_id} FAILED (retry {retry_count + 1}/{MAX_RETRY_CYCLES})")
             print(f"      Errors: {'; '.join(errors[:3])}")
 
+            if self._emitter:
+                self._emitter.emit(
+                    "milestone.retry",
+                    milestone_id=ms_id,
+                    retry=retry_count + 1,
+                    max_retries=MAX_RETRY_CYCLES,
+                    errors=errors[:3],
+                    fix_guidance=fix_guidance,
+                )
+
             if self._memory:
                 for fpath in worker_result.get("files_modified", []):
                     self._memory.log_compilation_failure(fpath, "\n".join(errors))
@@ -397,6 +480,13 @@ class MissionsRuntime:
 
         # Retries exhausted
         elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+        if self._emitter:
+            self._emitter.emit(
+                "milestone.retries_exhausted",
+                milestone_id=ms_id,
+                retry_count=retry_count,
+                elapsed_ms=round(elapsed_ms, 2),
+            )
         return MilestoneHandoff(
             milestone_id=ms_id, title=ms_title,
             worker_summary="Exhausted retries",
@@ -495,6 +585,11 @@ class MissionsRuntime:
     def session_manager(self) -> SessionManager:
         return self._session_manager
 
+    @property
+    def emitter(self) -> Optional[EventEmitter]:
+        """Return the event emitter for the current (or most recent) run."""
+        return self._emitter
+
 
 # ---------------------------------------------------------------------------
 # CLI entry point
@@ -524,7 +619,31 @@ def main() -> None:
         action="store_true",
         help="List existing sessions and exit",
     )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="Start the FastAPI Control API server instead of running a mission",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="API server bind host (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8088,
+        help="API server bind port (default: 8088)",
+    )
     args = parser.parse_args()
+
+    # --serve: launch the Control API and return (does not run a mission).
+    if args.serve:
+        import uvicorn
+        from src.api import create_app
+        app = create_app()
+        uvicorn.run(app, host=args.host, port=args.port)
+        return
 
     runtime = MissionsRuntime(
         model=args.model,
