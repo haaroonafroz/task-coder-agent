@@ -49,6 +49,7 @@ export function openEventStream(
     "worker.complete",
     "worker.complete_rejected",
     "worker.blocked",
+    "worker.cancelled",
     "tool.called",
     "tool.result",
     "validation.started",
@@ -57,6 +58,7 @@ export function openEventStream(
     "validation.finished",
     "handoff.saved",
     "mission.complete",
+    "mission.cancelled",
   ];
   eventTypes.forEach((t) => source.addEventListener(t, handler));
 

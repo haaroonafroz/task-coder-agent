@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import type { Message } from "./api/types";
 import { api } from "./api/client";
 import {
@@ -12,26 +20,47 @@ import {
 } from "./hooks";
 import { SessionSidebar } from "./components/SessionSidebar";
 import { ChatPanel } from "./components/ChatPanel";
-import { ProgressPanel } from "./components/ProgressPanel";
-import { WorkspaceExplorer } from "./components/WorkspaceExplorer";
-import { EventDrawer } from "./components/EventDrawer";
+import { RunInspector } from "./components/RunInspector";
 
-type RightTab = "progress" | "workspace" | "events";
+const RIGHT_PANEL_MIN = 360;
+const RIGHT_PANEL_MAX = 820;
+const RIGHT_PANEL_DEFAULT = 520;
 
 export default function App() {
   const [activeSid, setActiveSid] = useState<string | null>(null);
-  const [rightTab, setRightTab] = useState<RightTab>("progress");
+  const [rightPanelWidth, setRightPanelWidth] = useState(() => {
+    const saved = window.localStorage.getItem("rightPanelWidth");
+    const parsed = saved ? Number(saved) : RIGHT_PANEL_DEFAULT;
+    return Number.isFinite(parsed) ? parsed : RIGHT_PANEL_DEFAULT;
+  });
+  const resizingRef = useRef(false);
 
-  const { sessions, loading: sessionsLoading, refresh: refreshSessions } = useSessions();
+  const { sessions, refresh: refreshSessions } = useSessions();
   const { session, setSession } = useSession(activeSid);
   const { messages, sending, sendMessage, appendMessage } = useMessages(activeSid);
   const { runs, refresh: refreshRuns } = useRuns(activeSid);
   const { plan, refresh: refreshPlan } = usePlan(activeSid);
-  const { tree, file, fileLoading, refreshTree, openFile } = useWorkspace(activeSid);
+  const { tree, file, fileLoading, refreshTree, openFile } = useWorkspace(activeSid, "session");
   const { events, connected, clearEvents } = useSessionEvents(activeSid);
 
   // Track files modified in the current run to highlight them.
   const modifiedFilesRef = useRef<Set<string>>(new Set());
+
+  const activeRun = useMemo(
+    () => runs.find((r) => r.status === "queued" || r.status === "running") ?? null,
+    [runs]
+  );
+
+  const handleCancelRun = useCallback(async () => {
+    if (!activeSid || !activeRun) return;
+    await api.cancelRun(activeSid, activeRun.run_id);
+    refreshRuns();
+    refreshPlan();
+    refreshSessions();
+    if (activeSid) {
+      api.getSession(activeSid).then(setSession).catch(() => {});
+    }
+  }, [activeSid, activeRun, refreshRuns, refreshPlan, refreshSessions, setSession]);
 
   // When events arrive, react to them.
   useEffect(() => {
@@ -39,6 +68,9 @@ export default function App() {
     const lastEv = events[events.length - 1];
 
     switch (lastEv.type) {
+      case "session.started":
+        refreshSessions();
+        break;
       case "plan.created":
       case "plan.updated":
         refreshPlan();
@@ -62,46 +94,47 @@ export default function App() {
         refreshPlan();
         refreshSessions();
         refreshRuns();
-        // Append assistant summary from the run result
-        if (lastEv.data) {
-          const status = lastEv.data.status as string;
-          const passed = lastEv.data.milestones_passed as number;
-          const total = lastEv.data.milestones_total as number;
-          const summary = `Mission complete — status: ${status}, milestones ${passed}/${total} passed.`;
-          // The run queue already appends a message, but we also add it locally
-          // in case the SSE arrives before the message store write.
-        }
+        break;
+      case "mission.cancelled":
+        refreshTree();
+        refreshPlan();
+        refreshSessions();
+        refreshRuns();
         break;
     }
   }, [events, refreshPlan, refreshTree, refreshSessions, refreshRuns]);
 
   // Refresh run status periodically when a run is active.
   useEffect(() => {
-    if (!activeSid || runs.length === 0) return;
-    const latestRun = runs[0];
-    if (latestRun.status === "queued" || latestRun.status === "running") {
-      const interval = setInterval(() => {
-        refreshRuns();
-        api.listMessages(activeSid).then((msgs) => {
-          // Check for new assistant messages
-          const latest = msgs[msgs.length - 1];
-          if (latest && latest.role === "assistant") {
-            appendMessage(latest as Message);
-          }
-        });
-      }, 3000);
-      return () => clearInterval(interval);
-    }
-  }, [activeSid, runs, refreshRuns, appendMessage]);
+    if (!activeSid || !activeRun) return;
+    const interval = setInterval(() => {
+      refreshRuns();
+      refreshPlan();
+      refreshSessions();
+      api.getSession(activeSid).then(setSession).catch(() => {});
+      api.listMessages(activeSid).then((msgs) => {
+        const latest = msgs[msgs.length - 1];
+        if (latest && latest.role === "assistant") {
+          appendMessage(latest as Message);
+        }
+      });
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [activeSid, activeRun, refreshRuns, refreshPlan, refreshSessions, setSession, appendMessage]);
 
   const handleSend = useCallback(
     async (content: string, triggerRun: boolean, model?: string) => {
       const msg = await sendMessage(content, triggerRun, model);
       if (msg && triggerRun) {
         refreshRuns();
+        refreshSessions();
+        setTimeout(() => {
+          refreshPlan();
+          refreshRuns();
+        }, 2000);
       }
     },
-    [sendMessage, refreshRuns]
+    [sendMessage, refreshRuns, refreshPlan, refreshSessions]
   );
 
   const handleSelectSession = useCallback((sid: string) => {
@@ -110,8 +143,47 @@ export default function App() {
     modifiedFilesRef.current.clear();
   }, [clearEvents]);
 
+  const handleResizeStart = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    resizingRef.current = true;
+    document.body.classList.add("is-resizing");
+  }, []);
+
+  useEffect(() => {
+    const handleMouseMove = (event: MouseEvent) => {
+      if (!resizingRef.current) return;
+      const nextWidth = Math.min(
+        RIGHT_PANEL_MAX,
+        Math.max(RIGHT_PANEL_MIN, window.innerWidth - event.clientX)
+      );
+      setRightPanelWidth(nextWidth);
+    };
+
+    const handleMouseUp = () => {
+      if (!resizingRef.current) return;
+      resizingRef.current = false;
+      document.body.classList.remove("is-resizing");
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+      document.body.classList.remove("is-resizing");
+    };
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem("rightPanelWidth", String(rightPanelWidth));
+  }, [rightPanelWidth]);
+
+  const layoutStyle = {
+    "--right-panel-width": `${rightPanelWidth}px`,
+  } as CSSProperties;
+
   return (
-    <div className="app-layout">
+    <div className="app-layout" style={layoutStyle}>
       {/* Left: Sessions */}
       <SessionSidebar
         sessions={sessions}
@@ -126,52 +198,24 @@ export default function App() {
         messages={messages}
         sending={sending}
         connected={connected}
+        events={events}
         onSend={handleSend}
       />
 
-      {/* Right: Tabbed panel (Progress / Workspace / Events) */}
-      <div className="panel" style={{ overflow: "hidden" }}>
-        <div className="tabs">
-          <div
-            className={`tab ${rightTab === "progress" ? "active" : ""}`}
-            onClick={() => setRightTab("progress")}
-          >
-            Progress
-          </div>
-          <div
-            className={`tab ${rightTab === "workspace" ? "active" : ""}`}
-            onClick={() => setRightTab("workspace")}
-          >
-            Workspace
-          </div>
-          <div
-            className={`tab ${rightTab === "events" ? "active" : ""}`}
-            onClick={() => setRightTab("events")}
-          >
-            Events
-          </div>
-        </div>
+      <div className="right-resizer" onMouseDown={handleResizeStart} />
 
-        <div style={{ flex: 1, overflow: "hidden" }}>
-          {rightTab === "progress" && (
-            <ProgressPanel
-              plan={plan}
-              events={events}
-              sessionStatus={session?.status || "idle"}
-            />
-          )}
-          {rightTab === "workspace" && (
-            <WorkspaceExplorer
-              tree={tree}
-              file={file}
-              fileLoading={fileLoading}
-              onOpenFile={openFile}
-              onRefresh={refreshTree}
-            />
-          )}
-          {rightTab === "events" && <EventDrawer events={events} />}
-        </div>
-      </div>
+      <RunInspector
+        plan={plan}
+        events={events}
+        sessionStatus={session?.status || "idle"}
+        activeRun={activeRun}
+        tree={tree}
+        file={file}
+        fileLoading={fileLoading}
+        onOpenFile={openFile}
+        onRefreshWorkspace={refreshTree}
+        onCancelRun={handleCancelRun}
+      />
     </div>
   );
 }

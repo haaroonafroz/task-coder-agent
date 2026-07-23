@@ -15,6 +15,7 @@ import type {
   WorkspaceFile,
   Upload,
   ModelChoice,
+  WorkspaceScope,
 } from "./types";
 
 const BASE = "/api/v1";
@@ -92,6 +93,10 @@ export const api = {
     return req(`/sessions/${sid}/runs/${rid}`);
   },
 
+  cancelRun(sid: string, rid: string): Promise<Run> {
+    return req(`/sessions/${sid}/runs/${rid}/cancel`, { method: "POST" });
+  },
+
   // ---- Plan ----
 
   getPlan(sid: string): Promise<Plan> {
@@ -106,16 +111,28 @@ export const api = {
 
   // ---- Workspace ----
 
-  listWorkspace(sid: string, path?: string, depth?: number): Promise<WorkspaceEntry> {
+  listWorkspace(
+    sid: string,
+    path?: string,
+    depth?: number,
+    scope: WorkspaceScope = "workspace"
+  ): Promise<WorkspaceEntry> {
     const params = new URLSearchParams();
     if (path) params.set("path", path);
     if (depth) params.set("depth", String(depth));
+    if (scope !== "workspace") params.set("scope", scope);
     const q = params.toString() ? `?${params}` : "";
     return req(`/sessions/${sid}/workspace${q}`);
   },
 
-  readWorkspaceFile(sid: string, path: string): Promise<WorkspaceFile> {
-    return req(`/sessions/${sid}/workspace/file?path=${encodeURIComponent(path)}`);
+  readWorkspaceFile(
+    sid: string,
+    path: string,
+    scope: WorkspaceScope = "workspace"
+  ): Promise<WorkspaceFile> {
+    const params = new URLSearchParams({ path });
+    if (scope !== "workspace") params.set("scope", scope);
+    return req(`/sessions/${sid}/workspace/file?${params}`);
   },
 
   // ---- Models ----

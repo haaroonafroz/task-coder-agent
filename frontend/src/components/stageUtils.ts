@@ -22,6 +22,7 @@ export function stageFromEventType(eventType: string): string {
     "milestone.retries_exhausted": "Retries Exhausted",
     "handoff.saved": "Handoff Saved",
     "mission.complete": "Mission Complete",
+    "mission.cancelled": "Cancelled",
   };
   return map[eventType] || eventType;
 }
@@ -35,8 +36,14 @@ export function statusColor(status: string): string {
     failed: "status-failed",
     queued: "status-queued",
     error: "status-error",
+    cancelled: "status-failed",
     planning: "status-planning",
     paused: "status-created",
+    pending: "status-created",
+    passed: "status-completed",
+    blocked: "status-failed",
+    replan: "status-planning",
+    skipped: "status-partial",
   };
   return colors[status] || "status-created";
 }

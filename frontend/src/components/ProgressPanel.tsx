@@ -1,14 +1,17 @@
-import { useMemo } from "react";
-import type { Plan, SSEEvent } from "../api/types";
+import { useMemo, useState } from "react";
+import type { Plan, Run, SSEEvent } from "../api/types";
 import { stageFromEventType, milestoneStatusFromEvents, statusColor } from "./stageUtils";
 
 interface Props {
   plan: Plan | null;
   events: SSEEvent[];
   sessionStatus: string;
+  activeRun: Run | null;
+  onCancelRun: () => Promise<void>;
 }
 
-export function ProgressPanel({ plan, events, sessionStatus }: Props) {
+export function ProgressPanel({ plan, events, sessionStatus, activeRun, onCancelRun }: Props) {
+  const [cancelling, setCancelling] = useState(false);
   const currentStage = useMemo(() => {
     if (events.length === 0) return "Idle";
     const lastEv = events[events.length - 1];
@@ -31,7 +34,25 @@ export function ProgressPanel({ plan, events, sessionStatus }: Props) {
     <div className="panel" style={{ overflow: "hidden" }}>
       <div className="panel-header">
         <span>Progress</span>
-        <span className={`status-badge ${statusColor(sessionStatus)}`}>{sessionStatus}</span>
+        <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {activeRun && (
+            <button
+              className="danger"
+              disabled={cancelling}
+              onClick={async () => {
+                setCancelling(true);
+                try {
+                  await onCancelRun();
+                } finally {
+                  setCancelling(false);
+                }
+              }}
+            >
+              {cancelling ? "Stopping..." : "Stop Run"}
+            </button>
+          )}
+          <span className={`status-badge ${statusColor(sessionStatus)}`}>{sessionStatus}</span>
+        </span>
       </div>
 
       <div className="stage-indicator">

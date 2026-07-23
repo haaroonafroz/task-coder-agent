@@ -28,7 +28,7 @@ export interface Run {
   run_id: string;
   session_id: string;
   request: string;
-  status: "queued" | "running" | "completed" | "partial" | "failed" | "error";
+  status: "queued" | "running" | "completed" | "partial" | "failed" | "error" | "cancelled";
   model: string;
   queued_at: string;
   started_at: string | null;
@@ -104,6 +104,18 @@ export interface WorkspaceEntry {
   path: string;
   tree: string;
   entries: string[];
+  root?: string;
+  nodes?: WorkspaceNode[];
+}
+
+export type WorkspaceScope = "workspace" | "session";
+
+export interface WorkspaceNode {
+  name: string;
+  path: string;
+  type: "file" | "directory";
+  size?: number | null;
+  children?: WorkspaceNode[];
 }
 
 export interface WorkspaceFile {
@@ -125,4 +137,5 @@ export interface SSEEvent {
   type: string;
   session_id: string;
   data: Record<string, unknown>;
+  index?: number;
 }

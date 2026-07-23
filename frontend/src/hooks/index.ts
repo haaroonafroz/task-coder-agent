@@ -11,6 +11,7 @@ import type {
   WorkspaceEntry,
   WorkspaceFile,
   SSEEvent,
+  WorkspaceScope,
 } from "../api/types";
 
 // ---- Sessions ----
@@ -165,7 +166,7 @@ export function usePlan(sid: string | null) {
 
 // ---- Workspace ----
 
-export function useWorkspace(sid: string | null) {
+export function useWorkspace(sid: string | null, scope: WorkspaceScope = "workspace") {
   const [tree, setTree] = useState<WorkspaceEntry | null>(null);
   const [file, setFile] = useState<WorkspaceFile | null>(null);
   const [fileLoading, setFileLoading] = useState(false);
@@ -173,19 +174,19 @@ export function useWorkspace(sid: string | null) {
   const refreshTree = useCallback(async () => {
     if (!sid) return;
     try {
-      const t = await api.listWorkspace(sid);
+      const t = await api.listWorkspace(sid, "", 4, scope);
       setTree(t);
     } catch {
       // ignore
     }
-  }, [sid]);
+  }, [sid, scope]);
 
   const openFile = useCallback(
     async (path: string) => {
       if (!sid) return;
       setFileLoading(true);
       try {
-        const f = await api.readWorkspaceFile(sid, path);
+        const f = await api.readWorkspaceFile(sid, path, scope);
         setFile(f);
       } catch {
         setFile(null);
@@ -193,7 +194,7 @@ export function useWorkspace(sid: string | null) {
         setFileLoading(false);
       }
     },
-    [sid]
+    [sid, scope]
   );
 
   useEffect(() => {
