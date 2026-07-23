@@ -36,8 +36,8 @@ datasets/*.json
 llama.cpp/
 refactor.md
 workspace/
-*node_modules/
-*dist/
+frontend/node_modules/
+frontend/dist/
 
 # handoffs
 active_mission/handoffs/*.json
