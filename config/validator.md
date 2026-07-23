@@ -58,6 +58,36 @@ MUST REPLAN examples:
 - contract references a file/path not in the milestone or not yet assigned
 - contract tests the wrong API/function/module name
 - same contract error repeats across retries more than one time and worker already modified or emitted source code
+- validation contract uses `pip install` (forbidden — pytest/flake8 are preinstalled; use `python -m pytest --version` if you must verify)
+- **`returncode: -1` with `policy_denied: True`** — sandbox blocked the contract before it ran; REPLAN with an allowed command from the policy reference below
+
+### Policy Denial (returncode -1)
+
+When contract output contains `policy_denied: True`, the command **never executed**. This is NOT a test failure or missing pytest.
+
+- **Verdict**: REPLAN
+- **Root cause**: validation_contract.command uses disallowed commands/patterns
+- **Action**: Rewrite the contract using only allowed validation-profile commands
+
+You will receive a **Sandbox Policy Reference** listing:
+- Allowed shell commands (`python`, `pytest`, `flake8`, …)
+- Allowed `python -m` modules (`pytest`, `py_compile`, `flake8`, …)
+- Recommended contract examples
+
+**Do not** REPLAN for python vs python3 interpreter issues — the harness rewrites both to the session venv.
+**Do not** suggest grep/bash workarounds to detect `eval(` in test files — use `python -m pytest --collect-only` instead.
+
+### Example Output JSON (Policy Denial REPLAN)
+```json
+{
+  "verdict": "REPLAN",
+  "validation_details": "Contract blocked by sandbox policy; command never ran.",
+  "errors": ["Policy denied: Blocked pattern matched: \\beval\\b"],
+  "root_cause": "Contract uses grep with eval pattern, blocked by worker shell policy.",
+  "fix_guidance": null,
+  "replan_guidance": "Update M1 validation_contract.command to: python -m pytest tests/test_math_eval.py --collect-only -q"
+}
+```
 
 ### Example Output JSON(REPLAN)
 ```json
@@ -71,6 +101,25 @@ MUST REPLAN examples:
 }
 ```
 
+### Harness Toolchain & TDD Rules
+
+The environment pre-installs `pytest`, `flake8`, and `black`. **Never REPLAN for environment setup or tool installation** if logs show pytest collected or ran tests.
+
+#### Milestone Verdict Matrix
+
+| Log Symptom | Verdict | Action / Context |
+| :--- | :--- | :--- |
+| `No module named pytest` / `command not found` | **REPLAN** | Rare infrastructure failure. |
+| `Policy denied` on any `pip install` attempt | **REPLAN** | Fix contract to remove `pip` calls. |
+| `policy_denied: True` / `returncode: -1` | **REPLAN** | Contract blocked by sandbox; use allowed commands from policy reference. |
+| `ModuleNotFoundError: <target_module>` during **Test-scaffolding** | **PASS** | Expected TDD Red Phase (oracle passes, target missing). |
+| Tests fail due to incorrect implementation code | **FAIL** | Worker must fix the source code. |
+
+#### Test-Scaffolding Milestone (`true`)
+During test-scaffolding, the worker writes **only** test files; the implementation module does not yet exist. 
+
+If running `python -m pytest tests/test_x.py -v` exits with code **1** solely due to a `ModuleNotFoundError` for the missing target module, you **must emit PASS**. Do not REPLAN or FAIL.
+
 
 ## Core Principles
 
@@ -83,3 +132,5 @@ MUST REPLAN examples:
 - **Replan Guidance must be actionable**: the orchestrator should be able to analyse and update the plan precisely and without ambiguity.
 
 - **One retry threshold**: if the same error appears in two consecutive retry cycles, escalate with `verdict: "REPLAN"` and appropriate `root_cause`.
+
+- **Infrastructure vs implementation**: missing `pytest` is infrastructure; missing `email_validator` on a test milestone is TDD red — not infrastructure.

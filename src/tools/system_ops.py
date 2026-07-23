@@ -2,19 +2,22 @@
 System operation tools — run_pytest, run_linter, install_dependency,
 search_grep, run_shellscript.
 
-All subprocess invocations use a configurable timeout and capture both stdout
-and stderr for clean result reporting.
+All subprocess invocations route through the sandbox executor (Phase 9):
+command policy, session jail, scrubbed env, process groups, optional bwrap.
 """
 
 from __future__ import annotations
 
 import re
-import subprocess
 import sys
-import os
 from pathlib import Path
 from typing import Any
 
+from src.sandbox.commands import canonicalize_shell_script
+from src.sandbox.context import get_sandbox_context
+from src.sandbox.env import resolve_python
+from src.sandbox.executor import get_executor
+from src.sandbox.policy import NetworkMode, ShellProfile
 from src.tools.paths import (
     get_workspace_root,
     normalize_shell_command,
@@ -23,60 +26,29 @@ from src.tools.paths import (
 )
 
 
-def _repo_root() -> Path:
-    """Return the parent of the active workspace root (session root or repo root)."""
-    return get_workspace_root().parent
+def _executor():
+    return get_executor()
 
 
-def _workspace_env() -> dict[str, str]:
-    env = os.environ.copy()
-    root = str(get_workspace_root().resolve())
-    existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = root if not existing else f"{root}{os.pathsep}{existing}"
-    return env
-
-def _run(cmd: list[str], cwd: Path, timeout: int, env: dict[str, str] | None = None) -> dict[str, Any]:
-    """Execute a subprocess and return structured result."""
-    try:
-        result = subprocess.run(
-            cmd,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=_workspace_env(),
-        )
-        return {
-            "returncode": result.returncode,
-            "stdout": result.stdout.strip(),
-            "stderr": result.stderr.strip(),
-            "success": result.returncode == 0,
-            "timed_out": False,
-        }
-    except subprocess.TimeoutExpired:
-        return {
-            "returncode": -1,
-            "stdout": "",
-            "stderr": f"Process timed out after {timeout}s",
-            "success": False,
-            "timed_out": True,
-        }
-    except FileNotFoundError as exc:
-        return {
-            "returncode": -1,
-            "stdout": "",
-            "stderr": str(exc),
-            "success": False,
-            "timed_out": False,
-        }
-    except Exception as exc:
-        return {
-            "returncode": -1,
-            "stdout": "",
-            "stderr": str(exc),
-            "success": False,
-            "timed_out": False,
-        }
+def _run_argv(
+    cmd: list[str],
+    cwd: Path,
+    timeout: int,
+    *,
+    profile: ShellProfile = "worker",
+    network: NetworkMode = NetworkMode.NONE,
+    use_venv: bool = True,
+) -> dict[str, Any]:
+    """Execute argv via sandbox executor."""
+    result = _executor().run_argv(
+        cmd,
+        timeout=timeout,
+        network=network,
+        profile=profile,
+        cwd=cwd,
+        use_venv=use_venv,
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -101,10 +73,11 @@ def run_pytest(test_path: str, extra_args: str = "-v --tb=short") -> dict[str, A
 
     rel = target.relative_to(get_workspace_root().resolve())
     extra = extra_args.split() if extra_args else []
-    cmd = [sys.executable, "-m", "pytest", str(rel)] + extra
-    result = _run(cmd, cwd=get_workspace_root(), timeout=120, env=_workspace_env())
+    ctx = get_sandbox_context()
+    python = resolve_python(ctx) if ctx else sys.executable
+    cmd = [python, "-m", "pytest", str(rel)] + extra
+    result = _run_argv(cmd, cwd=get_workspace_root(), timeout=120)
     result["passed"] = result["returncode"] == 0
-    result["cwd"] = str(get_workspace_root())
     result["test_path"] = str(rel)
     return result
 
@@ -136,15 +109,16 @@ def run_linter(
 
     rel = target.relative_to(get_workspace_root().resolve())
     extra = extra_args.split() if extra_args else []
+    ctx = get_sandbox_context()
+    python = resolve_python(ctx) if ctx else sys.executable
 
     if tool == "black":
-        cmd = [sys.executable, "-m", "black", "--check", str(rel)] + extra
+        cmd = [python, "-m", "black", "--check", str(rel)] + extra
     else:
-        cmd = [sys.executable, "-m", "flake8", str(rel)] + extra
+        cmd = [python, "-m", "flake8", str(rel)] + extra
 
-    result = _run(cmd, cwd=get_workspace_root(), timeout=60, env=_workspace_env())
+    result = _run_argv(cmd, cwd=get_workspace_root(), timeout=60)
     result["clean"] = result["returncode"] == 0
-    result["cwd"] = str(get_workspace_root())
     result["target_path"] = str(rel)
     return result
 
@@ -155,7 +129,7 @@ def run_linter(
 
 def install_dependency(package_name: str) -> dict[str, Any]:
     """
-    Install a Python package via pip and optionally record it in workspace/requirements.txt.
+    Install a Python package into the session-local .venv via pip.
 
     Args:
         package_name: Package name with optional version specifier (e.g. "httpx>=0.27.0").
@@ -163,10 +137,26 @@ def install_dependency(package_name: str) -> dict[str, Any]:
     Returns:
         {"success": bool, "stdout": str, "stderr": str}
     """
-    cmd = [sys.executable, "-m", "pip", "install", package_name, "--quiet"]
-    result = _run(cmd, cwd=_repo_root(), timeout=180)
+    ctx = get_sandbox_context()
+    if ctx is None:
+        return {"success": False, "stdout": "", "stderr": "No active sandbox context"}
 
-    # Append to workspace/requirements.txt if it exists
+    try:
+        python = str(ctx.ensure_venv())
+    except Exception as exc:
+        return {"success": False, "stdout": "", "stderr": f"venv creation failed: {exc}"}
+
+    cmd = [python, "-m", "pip", "install", package_name, "--quiet"]
+    result = _executor().run_argv(
+        cmd,
+        ctx=ctx,
+        timeout=180,
+        network=NetworkMode.PIP_EGRESS,
+        profile="pip",
+        cwd=ctx.workspace_root,
+        use_venv=True,
+    )
+
     req_file = get_workspace_root() / "requirements.txt"
     if result["success"] and req_file.exists():
         existing = req_file.read_text(encoding="utf-8")
@@ -183,43 +173,51 @@ def install_dependency(package_name: str) -> dict[str, Any]:
 
 def uninstall_dependency(package_name: str) -> dict[str, Any]:
     """
-    Uninstall a Python package via pip and optionally remove it from workspace/requirements.txt.
+    Uninstall a Python package from the session-local .venv.
 
     Args:
-        package_name: Package name with optional version specifier (e.g. "httpx>=0.27.0").
+        package_name: Package name with optional version specifier.
 
     Returns:
         {"success": bool, "stdout": str, "stderr": str}
     """
-    cmd = [sys.executable, "-m", "pip", "uninstall", package_name, "--quiet", "-y"]
-    result = _run(cmd, cwd=_repo_root(), timeout=180)
+    ctx = get_sandbox_context()
+    if ctx is None:
+        return {"success": False, "stdout": "", "stderr": "No active sandbox context"}
 
-    # Remove from workspace/requirements.txt if it exists
+    if not ctx.venv_python.exists():
+        return {"success": False, "stdout": "", "stderr": "Session venv not initialized"}
+
+    python = str(ctx.venv_python)
+    cmd = [python, "-m", "pip", "uninstall", package_name, "-y", "--quiet"]
+    result = _executor().run_argv(
+        cmd,
+        ctx=ctx,
+        timeout=180,
+        network=NetworkMode.PIP_EGRESS,
+        profile="pip",
+        cwd=ctx.workspace_root,
+    )
+
     req_file = get_workspace_root() / "requirements.txt"
     if result["success"] and req_file.exists():
         existing = req_file.read_text(encoding="utf-8")
-        # Extract base package name (e.g. httpx from httpx>=0.27.0)
         base_name = re.split(r"[><=!]", package_name)[0].strip()
-
-        # Remove all lines matching the (potentially version-pinned) package name or base name
         lines = existing.splitlines()
         new_lines = []
         for line in lines:
             clean_line = line.strip()
-            # skip empty/comment lines
             if not clean_line or clean_line.startswith("#"):
                 new_lines.append(line)
                 continue
-            # Remove line if it matches the package (via base name match)
-            # This matches e.g. "httpx", "httpx==...", "httpx>=...", etc.
             if re.split(r"[><=!]", clean_line)[0].strip() == base_name:
                 continue
             new_lines.append(line)
-        new_content = "\n".join(new_lines).rstrip() + "\n"
-        req_file.write_text(new_content, encoding="utf-8")
+        req_file.write_text("\n".join(new_lines).rstrip() + "\n", encoding="utf-8")
 
     return result
-        
+
+
 # ---------------------------------------------------------------------------
 # search_grep
 # ---------------------------------------------------------------------------
@@ -228,7 +226,7 @@ def search_grep(query: str, target_dir: str = ".") -> dict[str, Any]:
     """
     Regex search across all files in target_dir using Python's re module.
 
-    Falls back to ripgrep (rg) if available for speed.
+    Falls back to ripgrep (rg) via sandbox executor if available.
 
     Args:
         query:      Python regex pattern.
@@ -252,18 +250,17 @@ def search_grep(query: str, target_dir: str = ".") -> dict[str, Any]:
 
     ws_root = get_workspace_root().resolve()
 
-    # Try ripgrep first for speed
-    rg_result = _run(
-        ["rg", "--line-number", "--no-heading", query, str(target)],
-        cwd=get_workspace_root(),
+    rg_result = _run_argv(
+        ["rg", "--line-number", "--no-heading", query, str(target.relative_to(ws_root))],
+        cwd=ws_root,
         timeout=30,
     )
-    if rg_result["returncode"] in (0, 1):  # 0=matches, 1=no matches
+    if rg_result["returncode"] in (0, 1):
         matches = []
         for line in rg_result["stdout"].splitlines():
             parts = line.split(":", 2)
             if len(parts) >= 3:
-                abs_file = Path(parts[0])
+                abs_file = ws_root / parts[0]
                 try:
                     rel_file = str(abs_file.resolve().relative_to(ws_root))
                 except ValueError:
@@ -275,10 +272,9 @@ def search_grep(query: str, target_dir: str = ".") -> dict[str, Any]:
             "success": True,
             "matches": matches,
             "match_count": len(matches),
-            "cwd": str(get_workspace_root()),
+            "cwd": str(ws_root),
         }
 
-    # Pure-Python fallback
     try:
         pattern = re.compile(query)
     except re.error as exc:
@@ -305,60 +301,35 @@ def search_grep(query: str, target_dir: str = ".") -> dict[str, Any]:
         "success": True,
         "matches": matches,
         "match_count": len(matches),
-        "cwd": str(get_workspace_root()),
+        "cwd": str(ws_root),
     }
+
 
 # ---------------------------------------------------------------------------
 # run_shellscript
 # ---------------------------------------------------------------------------
 
-def run_shellscript(script: str, timeout: int = 30) -> dict[str, Any]:
+def run_shellscript(
+    script: str,
+    timeout: int = 30,
+    profile: ShellProfile = "worker",
+) -> dict[str, Any]:
     """
-    Execute an arbitrary shell script inside the workspace directory.
+    Execute a shell script inside the session sandbox.
 
-    The script runs with cwd=workspace/ for convenience; use absolute paths
-    or `cd` for operations outside workspace/.
+    The script is validated against the command policy for the given profile
+    before execution.  ``validation`` profile is stricter (validator contracts).
 
     Args:
-        script:  Shell command or multi-line bash script.
-        timeout: Wall-clock timeout in seconds.
+        script:   Shell command or multi-line bash script.
+        timeout:  Wall-clock timeout in seconds.
+        profile:  Policy profile — ``worker`` | ``validation`` | ``pip``.
 
     Returns:
         {"success": bool, "stdout": str, "stderr": str, "returncode": int, "timed_out": bool}
     """
     script = normalize_shell_command(script)
-    try:
-        result = subprocess.run(
-            script,
-            shell=True,
-            cwd=get_workspace_root(),
-            env=_workspace_env(),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            executable="/bin/bash",
-        )
-        return {
-            "returncode": result.returncode,
-            "stdout": result.stdout.strip(),
-            "stderr": result.stderr.strip(),
-            "success": result.returncode == 0,
-            "timed_out": False,
-            "cwd": str(get_workspace_root()),
-        }
-    except subprocess.TimeoutExpired:
-        return {
-            "returncode": -1,
-            "stdout": "",
-            "stderr": f"Script timed out after {timeout}s",
-            "success": False,
-            "timed_out": True,
-        }
-    except Exception as exc:
-        return {
-            "returncode": -1,
-            "stdout": "",
-            "stderr": str(exc),
-            "success": False,
-            "timed_out": False,
-        }
+    ctx = get_sandbox_context()
+    if ctx is not None:
+        script = canonicalize_shell_script(script, ctx=ctx)
+    return _executor().run_shell(script, timeout=timeout, profile=profile)

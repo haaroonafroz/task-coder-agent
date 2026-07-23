@@ -32,7 +32,7 @@ You MUST output a single valid JSON object — no markdown fences, no explanatio
       "target_files": ["<relative paths inside workspace/>"],
       "validation_contract": {
         "type": "pytest | lint | structural | shell",
-        "command": "<exact shell command to run from inside workspace/, e.g. python -m pytest tests/test_m1.py -v>",
+        "command": "<exact shell command to run from inside workspace/, e.g. python -m pytest tests/test_m1.py -v -k oracle>",
         "pass_criteria": "<human-readable description of what PASS means>"
       },
       "status": "pending"
@@ -53,7 +53,7 @@ You MUST output a single valid JSON object — no markdown fences, no explanatio
 - **Dependency hygiene**: `depends_on` must reference real predecessor milestone IDs.
 - **Workspace isolation**: all generated code lives under `workspace/`; never modify files outside it.
 - **Workspace-relative paths only**: `target_files` and validation commands must NOT include a `workspace/` prefix.
-  - Good: `validator/email.py`, `python -m pytest tests/test_email.py -v`
+  - Good: `validator/email.py`, `python -m pytest tests/test_email.py -v -k oracle`
   - Bad: `workspace/validator/email.py`, `pytest workspace/tests/...`
 - **Shell commands run from inside workspace/**: write commands as if you are already `cd workspace`.
 - **One layout per mission**: pick either a flat module (`email_validator.py`) OR a package (`validator/email.py`) — do not mix both in one mission.
@@ -63,6 +63,18 @@ You MUST output a single valid JSON object — no markdown fences, no explanatio
   - If a milestone requires writing both code and tests, decompose it into two sequential milestones:
     1. **Test-Scaffolding / Spec Milestone**: Write the tests first. The worker's `target_files` includes ONLY the test scripts.
     2. **Implementation Milestone**: Implement the feature. The worker's `target_files` includes ONLY the implementation code. The existing test scripts are read-only references.
+
+## Validation Contract Rules
+
+- **Test-scaffolding milestones** must use pytest collection, not custom shell pipelines:
+  - Good: `python -m pytest tests/test_feature.py --collect-only -q`
+  - Bad: `python -m py_compile ... && grep ... eval`, `python -c "assert 'eval(' in ..."`
+- **Implementation milestones** use full pytest runs:
+  - `python -m pytest tests/test_feature.py -v`
+  - Scoped: `python -m pytest tests/test_feature.py -v -k tokenizer`
+- **Never plan**: Environment Setup milestones, `pip install`, `grep`, `curl`, or bash `eval`/`exec`
+- **Allowed validation commands**: `python`, `python3`, `pytest`, `flake8`, `black` and `python -m` for `pytest`, `py_compile`, `flake8`
+- pytest, flake8, and black are **pre-installed** in the session venv — never replan for tooling setup
 
 ## Test Engineering & Spec-Gaming Guardrails
 
