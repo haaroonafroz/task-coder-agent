@@ -317,7 +317,7 @@ Parallel multi-agent inference doubles KV-cache pressure and OOMs on 2×16 GB ca
 | Model | MTP draft | Notes |
 |---|---|---|
 | **Qwen3.6** | In-file (`--spec-type draft-mtp`) | Single GGUF from `unsloth/Qwen3.6-27B-MTP-GGUF` |
-| **Qwopus3.6** | In-file | Single GGUF from `Jackrong/Qwopus3.6-27B-v2-MTP-GGUF` |
+| **Qwopus3.6** | In-file (`--spec-type draft-mtp`)| Single GGUF from `Jackrong/Qwopus3.6-27B-v2-MTP-GGUF` |
 | **Gemma 4** | Separate assistant GGUF | Target + `*-assistant*` draft; enable draft flags in server script |
 
 Higher throughput from MTP means faster milestone retries and shorter end-to-end missions on the same GPU — important when a 27B local model needs several Validator cycles per feature.

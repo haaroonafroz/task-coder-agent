@@ -63,7 +63,7 @@ ENDPOINTS: dict[str, str] = {
 }
 
 # Model IDs (overridable via .env)
-TARGET_MODEL: str = os.getenv("TARGET_MODEL", "google/gemma-4-E4B-it")
+TARGET_MODEL: str = os.getenv("TARGET_MODEL", "Qwen/Qwen3.6-35B-A3B")
 
 # Frozen sampling parameters (identical across both modes, per Section 7.3)
 TEMPERATURE = 0.0
