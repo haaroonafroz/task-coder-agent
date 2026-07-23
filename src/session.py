@@ -15,6 +15,8 @@ Layout created for each session::
         uploads/                  # Raw user-uploaded requirements documents
         parsed_requirements/      # LlamaParse output (Phase 8)
         workspace/                # Sandboxed code generation area
+        .venv/                    # Session-local Python environment (Phase 9)
+        .tmp/ .home/ .cache/      # Sandbox tmp/home/pip cache (Phase 9)
 
 The runtime is serial, so only one session's workspace is "active" at a time.
 ``set_workspace_root()`` (in ``src.tools.paths``) is called before each session

@@ -148,10 +148,13 @@ def replan_mission(
         f"{_ORCHESTRATOR_MD}\n\n"
         f"---\n\n"
         f"## Negotiation Boundary: Plan Flaw Detected\n"
-        f"The Validator has rejected the current plan due to a structural flaw "
-        f"or command mismatch.\n\n"
+        f"The Validator has rejected the current plan due to a structural flaw or command mismatch.\n\n"
         f"### Current Plan\n```json\n{json.dumps(current_plan, indent=2)}\n```\n\n"
         f"### Validator's Replan Guidance\n{replan_guidance}\n\n"
+        f"### Harness Constraints (non-negotiable)\n"
+        f"- pytest, flake8, and black are pre-installed in the session venv at activation.\n"
+        f"- NEVER add Environment Setup, pip install, or tooling verification milestones.\n"
+        f"- Fix validation_contract commands/paths only; do not replan for missing pytest.\n\n"
         f"Output an UPDATED `plan.json` fixing this issue. Keep completed milestones intact."
     )
 

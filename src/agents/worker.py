@@ -13,13 +13,14 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from src.llm_client import call_llm, ModelChoice, resolve_model_config
 from src.telemetry import span_llm_call, span_tool_call, TelemetryContext
 from src.tools import dispatch
 from src.tools.paths import normalize_workspace_path, normalize_shell_command, get_workspace_root
 from src.events import EventEmitter
+from src.run_control import RunCancelledError, ensure_not_cancelled
 from src.agents.utils import (
     parse_json_from_text,
     flatten_conversation,
@@ -55,6 +56,7 @@ def run_worker(
     memory: Any,
     emitter: Optional[EventEmitter] = None,
     session: Optional[TelemetryContext] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> dict[str, Any]:
     """
     Execute the worker agent loop for a single milestone.
@@ -116,6 +118,13 @@ def run_worker(
     files_modified: list[str] = []
 
     while tool_call_count < MAX_WORKER_TOOL_CALLS:
+        try:
+            ensure_not_cancelled(cancel_check)
+        except RunCancelledError:
+            if emitter:
+                emitter.emit("worker.cancelled", milestone_id=ms_id)
+            return {"status": "cancelled", "summary": "Run cancelled", "tool_calls": tool_call_count}
+
         trimmed = trim_conversation(conversation, max_turns=12)
         prompt = (
             trimmed[-1]["content"]

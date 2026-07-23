@@ -38,12 +38,24 @@ from typing import Any, Callable, Optional
 # ---------------------------------------------------------------------------
 
 _EMITTERS: dict[str, "EventEmitter"] = {}
+_SESSION_EMITTERS: dict[str, "EventEmitter"] = {}
 _REGISTRY_LOCK = threading.Lock()
+
+
+def get_or_create_emitter(session_id: str, events_path: Path) -> "EventEmitter":
+    """Return the singleton EventEmitter for a session (shared by API + runtime)."""
+    with _REGISTRY_LOCK:
+        emitter = _SESSION_EMITTERS.get(session_id)
+        if emitter is None:
+            emitter = EventEmitter(events_path=events_path, session_id=session_id)
+            _SESSION_EMITTERS[session_id] = emitter
+        return emitter
 
 
 def register_emitter(emitter: "EventEmitter") -> None:
     """Track an emitter as the active one for its session."""
     with _REGISTRY_LOCK:
+        _SESSION_EMITTERS[emitter.session_id] = emitter
         _EMITTERS[emitter.session_id] = emitter
 
 
@@ -61,16 +73,15 @@ def get_emitter(session_id: str) -> Optional["EventEmitter"]:
 
 def emitter_for_session(session_id: str, events_path: Path) -> "EventEmitter":
     """
-    Get or create an emitter for a session.
+    Get or create the singleton emitter for a session.
 
-    If a run is active, returns the live emitter (so subscribers see real-time
-    events). Otherwise creates a read-only emitter bound to the existing
-    events file (so the API can replay history for a completed session).
+    SSE subscribers and the runtime share this instance so live events reach
+    clients that connected before the run started.
     """
     live = get_emitter(session_id)
     if live is not None:
         return live
-    return EventEmitter(events_path=events_path, session_id=session_id)
+    return get_or_create_emitter(session_id, events_path)
 
 
 # ---------------------------------------------------------------------------

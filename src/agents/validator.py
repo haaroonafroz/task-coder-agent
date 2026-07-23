@@ -23,7 +23,8 @@ from typing import Any, Optional
 
 from src.llm_client import call_llm, ModelChoice, resolve_model_config
 from src.telemetry import span_llm_call, TelemetryContext
-from src.tools import dispatch
+from src.sandbox.commands import execute_contract
+from src.sandbox.policy import describe_policy_for_profile, format_policy_reference
 from src.tools.paths import resolve_workspace_path
 from src.events import EventEmitter
 from src.agents.utils import parse_json_from_text
@@ -119,21 +120,51 @@ def run_validator(
     tool_result: dict = {}
     if command:
         print(f"    [Validator] Running: {command}")
-        tool_result = dispatch("run_shellscript", {"script": command, "timeout": 120})
+        tool_result = execute_contract(
+            contract,
+            timeout=120,
+            profile="validation",
+        )
+        exec_mode = tool_result.get("execution_mode", "unknown")
+        exec_python = tool_result.get("python", "")
+        print(
+            f"    [Validator] mode={exec_mode} python={exec_python} "
+            f"returncode={tool_result.get('returncode')}"
+        )
         contract_output = (
             f"stdout:\n{tool_result.get('stdout', '')}\n"
             f"stderr:\n{tool_result.get('stderr', '')}\n"
-            f"returncode: {tool_result.get('returncode', -1)}"
+            f"returncode: {tool_result.get('returncode', -1)}\n"
+            f"python: {exec_python}\n"
+            f"execution_mode: {exec_mode}\n"
+            f"policy_denied: {tool_result.get('policy_denied', False)}"
         )
-        print(f"    [Validator] returncode={tool_result.get('returncode')}")
         if emitter:
             emitter.emit(
                 "validation.contract_run",
                 milestone_id=ms_id,
                 returncode=tool_result.get("returncode", -1),
+                python=exec_python,
+                execution_mode=exec_mode,
+                policy_denied=tool_result.get("policy_denied", False),
             )
 
     returncode = tool_result.get("returncode") if command else None
+
+    # --- Policy denial (contract never ran) ----------------------------------
+    policy_replan = _detect_policy_denial_replan(
+        milestone, contract, tool_result, contract_output
+    )
+    if policy_replan:
+        print(f"    [Validator] Policy denial REPLAN: {policy_replan['replan_guidance'][:120]}…")
+        if emitter:
+            emitter.emit(
+                "validation.finished",
+                milestone_id=ms_id,
+                verdict="REPLAN",
+                path="policy_denied",
+            )
+        return policy_replan
 
     # --- Deterministic REPLAN check ------------------------------------------
     replan = _detect_contract_replan(milestone, worker_result, contract_output, returncode)
@@ -147,6 +178,51 @@ def run_validator(
                 reason="deterministic",
             )
         return replan
+    
+    # --- TDD red-phase PASS (test-scaffolding milestone) ---------------------
+    tdd_pass = _detect_tdd_red_pass(
+        milestone, worker_result, contract_output, returncode, is_test_milestone
+    )
+    if tdd_pass:
+        print(f"    [Validator] TDD red-phase PASS: {tdd_pass['validation_details']}")
+        if emitter:
+            emitter.emit(
+                "validation.finished",
+                milestone_id=ms_id,
+                verdict="PASS",
+                path="tdd_red",
+            )
+        return tdd_pass
+
+    # --- Spec-gaming: all tests skipped on scaffolding milestone -------------
+    skip_fail = _detect_all_skipped_spec_gaming(
+        milestone, worker_result, contract_output, is_test_milestone
+    )
+    if skip_fail:
+        print(f"    [Validator] Spec-gaming FAIL: all tests skipped")
+        if emitter:
+            emitter.emit(
+                "validation.finished",
+                milestone_id=ms_id,
+                verdict="FAIL",
+                path="all_skipped",
+            )
+        return skip_fail
+
+    # --- Collect-only PASS (test-scaffolding milestone) ----------------------
+    collect_pass = _detect_collect_only_pass(
+        milestone, contract, contract_output, returncode, is_test_milestone
+    )
+    if collect_pass:
+        print(f"    [Validator] Collect-only PASS: {collect_pass['validation_details']}")
+        if emitter:
+            emitter.emit(
+                "validation.finished",
+                milestone_id=ms_id,
+                verdict="PASS",
+                path="collect_only",
+            )
+        return collect_pass
 
     # --- Fast-path PASS (contract exited 0) ----------------------------------
     if returncode == 0:
@@ -172,13 +248,23 @@ def run_validator(
         f"**Title**: {milestone.get('title', '')}\n"
         f"**Description**: {milestone.get('description', '')}\n"
         f"**Target files (worker may ONLY edit these)**: {target_files}\n\n"
+        f"**Test-scaffolding milestone**: {is_test_milestone}\n\n"
         f"## Validation Contract\n```json\n{json.dumps(contract, indent=2)}\n```\n\n"
         f"## Contract Execution Output\n```\n{contract_output or '(no command run)'}\n```\n\n"
         f"## Worker Handoff\n"
         f"Files modified: {worker_result.get('files_modified', [])}\n"
         f"Summary: {worker_result.get('summary', '')}\n\n"
         f"**Retry attempt**: {retry_count + 1} of {MAX_RETRY_CYCLES}\n"
-        f"Emit your PASS, FAIL, or REPLAN JSON verdict now:"
+    )
+
+    if "policy_denied: True" in (contract_output or ""):
+        prompt += (
+            f"\n## Sandbox Policy Reference (validation profile)\n"
+            f"{format_policy_reference('validation')}\n"
+        )
+
+    prompt += (
+        f"\nEmit your PASS, FAIL, or REPLAN JSON verdict now:"
     )
 
     span_model = (
@@ -221,6 +307,7 @@ def run_validator(
         }
 
     parsed = _normalize_validator_verdict(parsed, returncode=returncode)
+    parsed = _block_infrastructure_replan(parsed, contract_output, returncode)
 
     # Contract success is authoritative — don't let the LLM REPLAN over a green run
     if returncode == 0 and parsed.get("verdict") == "REPLAN":
@@ -290,6 +377,286 @@ def _detect_contract_replan(
 
     return None
 
+
+def _detect_policy_denial_replan(
+    milestone: dict,
+    contract: dict,
+    tool_result: dict,
+    contract_output: str,
+) -> dict | None:
+    """
+    Deterministic REPLAN when the sandbox policy blocked contract execution.
+
+    Surfaces the denial reason and the validation allowlist so the orchestrator
+    can rewrite the contract using permitted commands.
+    """
+    if not tool_result.get("policy_denied"):
+        return None
+
+    reason = tool_result.get("stderr", "Policy denied (no reason provided)")
+    policy_ref = describe_policy_for_profile("validation")
+    command = contract.get("command", "")
+    ms_id = milestone.get("id", "?")
+
+    suggested = "python -m pytest <test_file> --collect-only -q"
+    if contract.get("type") == "pytest" or "pytest" in command:
+        suggested = command
+    elif "tests/" in command:
+        import re as _re
+        match = _re.search(r"tests/\S+\.py", command)
+        if match:
+            suggested = f"python -m pytest {match.group(0)} --collect-only -q"
+
+    replan_guidance = (
+        f"Sandbox policy denied the validation contract — the command never executed.\n"
+        f"Denial reason: {reason}\n\n"
+        f"Allowed shell commands: {', '.join(policy_ref['shell_commands'])}\n"
+        f"Allowed python -m modules: {', '.join(policy_ref['python_modules'])}\n"
+        f"Recommended replacements:\n"
+        + "\n".join(f"  - {ex}" for ex in policy_ref["recommended_contracts"])
+        + f"\n\nUpdate {ms_id} validation_contract.command to a permitted form. "
+        f"For test-scaffolding milestones prefer: `{suggested}`. "
+        f"Do not use grep, pip install, curl, or bash eval/exec. "
+        f"Do not try to bypass policy with string obfuscation."
+    )
+
+    return {
+        "verdict": "REPLAN",
+        "milestone_id": ms_id,
+        "validation_details": (
+            "Validation contract was blocked by sandbox policy before execution."
+        ),
+        "errors": [reason],
+        "root_cause": (
+            "The orchestrator-authored validation_contract.command uses commands "
+            "or patterns not permitted in the validation sandbox profile."
+        ),
+        "fix_guidance": None,
+        "replan_guidance": replan_guidance,
+        "policy_reference": policy_ref,
+    }
+
+
+def _pytest_ran_in_output(contract_output: str, returncode: int | None) -> bool:
+    """True when contract output shows pytest actually executed."""
+    out = contract_output.lower()
+    if "test session starts" in out:
+        return True
+    if "tests collected" in out or "test collected" in out:
+        return True
+    if "error collecting" in out:
+        return True
+    if "short test summary" in out:
+        return True
+    if "collected" in out and "error" in out:
+        return True
+    if returncode in (0, 1, 2, 5) and "pytest" in out:
+        return True
+    if " passed" in out and "failed" in out:
+        return True
+    if returncode in (0, 1, 2, 5) and "execution_mode: argv" in out:
+        # argv-compiled pytest contracts always invoke pytest
+        return True
+    return False
+
+
+def _detect_tdd_red_pass(
+    milestone: dict,
+    worker_result: dict,
+    contract_output: str,
+    returncode: int | None,
+    is_test_milestone: bool,
+) -> dict | None:
+    """
+    PASS test-scaffolding milestones in TDD red phase.
+
+    Fires when pytest ran, some tests passed (oracle/baseline), and remaining
+    failures are only because the implementation module does not exist yet.
+    """
+    if not is_test_milestone:
+        return None
+    if returncode != 1:
+        return None
+    if not _pytest_ran_in_output(contract_output, returncode):
+        return None
+
+    out_lower = contract_output.lower()
+
+    # Real infrastructure failures — do not PASS
+    if "no module named pytest" in out_lower:
+        return None
+    if "policy denied" in out_lower:
+        return None
+
+    # Expect missing implementation import, not broken test logic
+    if "modulenotfounderror" not in out_lower and "no module named" not in out_lower:
+        return None
+
+    target_files = milestone.get("target_files", [])
+    modified = worker_result.get("files_modified", [])
+    touched_tests = any("tests/" in f for f in modified) or any(
+        "tests/" in f for f in target_files
+    )
+    if not touched_tests:
+        return None
+
+    return {
+        "verdict": "PASS",
+        "milestone_id": milestone.get("id"),
+        "validation_details": (
+            "TDD red phase: pytest ran successfully; oracle/baseline tests passed; "
+            "target tests fail only because the implementation module is not present yet."
+        ),
+    }
+
+
+def _detect_collect_only_pass(
+    milestone: dict,
+    contract: dict,
+    contract_output: str,
+    returncode: int | None,
+    is_test_milestone: bool,
+) -> dict | None:
+    """
+    PASS test-scaffolding milestones when --collect-only discovers tests.
+
+    Fires on exit 0 or when output reports N tests collected.
+    """
+    if not is_test_milestone:
+        return None
+
+    command = contract.get("command", "")
+    if "--collect-only" not in command and contract.get("mode") != "collect-only":
+        return None
+
+    if returncode not in (0, 5) and not _pytest_ran_in_output(contract_output, returncode):
+        return None
+
+    collected_match = re.search(r"(\d+)\s+tests?\s+collected", contract_output, re.IGNORECASE)
+    if not collected_match and returncode != 0:
+        return None
+
+    count = int(collected_match.group(1)) if collected_match else 0
+    min_tests = 1
+    pass_criteria = contract.get("pass_criteria", "")
+    criteria_match = re.search(r"at least\s+(\d+)", pass_criteria, re.IGNORECASE)
+    if criteria_match:
+        min_tests = int(criteria_match.group(1))
+
+    if count < min_tests and returncode != 0:
+        return None
+
+    return {
+        "verdict": "PASS",
+        "milestone_id": milestone.get("id"),
+        "validation_details": (
+            f"Test scaffolding: pytest collected {count or 'tests'} successfully "
+            f"(collect-only contract)."
+        ),
+    }
+
+
+def _detect_all_skipped_spec_gaming(
+    milestone: dict,
+    worker_result: dict,
+    contract_output: str,
+    is_test_milestone: bool,
+) -> dict | None:
+    """FAIL when a test-scaffolding milestone marks every test as skipped."""
+    if not is_test_milestone:
+        return None
+
+    modified = worker_result.get("files_modified", [])
+    target_files = milestone.get("target_files", [])
+    touched_tests = any("tests/" in f for f in modified) or any(
+        "tests/" in f for f in target_files
+    )
+    if not touched_tests:
+        return None
+
+    for rel_path in set(modified) | set(target_files):
+        if "tests/" not in rel_path:
+            continue
+        try:
+            content = resolve_workspace_path(rel_path).read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            continue
+        if "@pytest.mark.skip" not in content:
+            return None
+        test_defs = re.findall(r"^\s*def\s+test_\w+", content, re.MULTILINE)
+        skip_marks = content.count("@pytest.mark.skip")
+        if test_defs and skip_marks >= len(test_defs):
+            return {
+                "verdict": "FAIL",
+                "milestone_id": milestone.get("id"),
+                "errors": [
+                    "Specification gaming: all tests are marked @pytest.mark.skip; "
+                    "tests must exercise the target API, not be deferred."
+                ],
+                "root_cause": (
+                    "Worker skipped every test instead of writing real assertions "
+                    "for the TDD red phase."
+                ),
+                "fix_guidance": (
+                    "Remove @pytest.mark.skip decorators. Write real tests that import "
+                    "the target module and assert expected behavior. Missing "
+                    "implementation should fail with import errors, not skipped tests."
+                ),
+            }
+
+    return None
+
+
+def _block_infrastructure_replan(
+    parsed: dict,
+    contract_output: str,
+    returncode: int | None,
+) -> dict:
+    """
+    Downgrade LLM REPLANs that ask for pytest/pip/env setup when pytest already ran.
+    """
+    if parsed.get("verdict") != "REPLAN":
+        return parsed
+
+    guidance = str(parsed.get("replan_guidance", "")).lower()
+    infra_markers = (
+        "pip install",
+        "install pytest",
+        "environment setup",
+        "testing framework",
+        "not installed",
+        "correctly installed",
+        "virtual environment",
+        "virtual environments",
+        "path is configured",
+        "interpreter",
+        "pytest is available",
+        "requirements.txt installation",
+        "container/ci environment",
+    )
+    if not any(m in guidance for m in infra_markers):
+        return parsed
+
+    if not _pytest_ran_in_output(contract_output, returncode):
+        # Still block if output proves pytest ran via execution metadata
+        if "execution_mode: argv" not in contract_output.lower():
+            return parsed
+
+    print(
+        "    [Validator] Blocking infrastructure REPLAN — pytest already ran in "
+        "contract output."
+    )
+    parsed["verdict"] = "FAIL"
+    parsed["replan_guidance"] = None
+    parsed.setdefault("errors", []).append(
+        "Rejected infrastructure REPLAN: pytest is available; failure is not "
+        "missing tooling."
+    )
+    parsed["root_cause"] = (
+        parsed.get("root_cause")
+        or "Validator misclassified a normal pytest failure as missing infrastructure."
+    )
+    return parsed
 
 def _valid_replan_guidance(value: Any) -> bool:
     """True only for a non-empty, meaningful replan instruction string."""

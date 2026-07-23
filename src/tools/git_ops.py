@@ -1,42 +1,54 @@
 """
 Git operation tools — git_commit, git_diff, view_git_log.
 
-All git commands run in the repository root (task-coder-agent-v2/).
-git_commit stages all changes under workspace/ to keep the commit scope clean.
+Git repos are session-scoped: each session jail (``sessions/<id>/``) has its
+own ``.git`` directory.  Commits only capture changes under ``workspace/``.
 """
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 from typing import Any
 
-_REPO_ROOT = Path(__file__).parent.parent.parent  # task-coder-agent-v2/
+from src.sandbox.context import get_sandbox_context
+from src.sandbox.executor import get_executor
+from src.sandbox.policy import NetworkMode
+
+_REPO_ROOT = Path(__file__).parent.parent.parent  # legacy fallback
 
 
-def _git(*args: str, cwd: Path = _REPO_ROOT, timeout: int = 30) -> dict[str, Any]:
-    """Run a git sub-command and return structured output."""
+def _git_root() -> Path:
+    """Return session jail root when sandbox is active, else legacy repo root."""
+    ctx = get_sandbox_context()
+    if ctx is not None:
+        return ctx.jail_root
+    return _REPO_ROOT
+
+
+def _git(*args: str, cwd: Path | None = None, timeout: int = 30) -> dict[str, Any]:
+    """Run a git sub-command via sandbox executor."""
+    root = cwd or _git_root()
     cmd = ["git", *args]
-    try:
-        result = subprocess.run(
-            cmd,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        return {
-            "returncode": result.returncode,
-            "stdout": result.stdout.strip(),
-            "stderr": result.stderr.strip(),
-            "success": result.returncode == 0,
-        }
-    except subprocess.TimeoutExpired:
-        return {"returncode": -1, "stdout": "", "stderr": "git command timed out", "success": False}
-    except FileNotFoundError:
-        return {"returncode": -1, "stdout": "", "stderr": "git not found in PATH", "success": False}
-    except Exception as exc:
-        return {"returncode": -1, "stdout": "", "stderr": str(exc), "success": False}
+    return get_executor().run_argv(
+        cmd,
+        cwd=root,
+        timeout=timeout,
+        network=NetworkMode.NONE,
+        profile="worker",
+        use_venv=False,
+    )
+
+
+def _ensure_git_repo(root: Path) -> dict[str, Any] | None:
+    """Initialise git in the session jail if needed. Returns error dict or None."""
+    if (root / ".git").exists():
+        return None
+    init = _git("init", cwd=root)
+    if not init["success"]:
+        return {"success": False, "error": f"git init failed: {init['stderr']}"}
+    _git("config", "user.email", "agent@missions.local", cwd=root)
+    _git("config", "user.name", "Missions Agent", cwd=root)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -45,48 +57,42 @@ def _git(*args: str, cwd: Path = _REPO_ROOT, timeout: int = 30) -> dict[str, Any
 
 def git_commit(message: str, stage_paths: list[str] | None = None) -> dict[str, Any]:
     """
-    Stage modified files and create a git commit.
+    Stage modified files and create a git commit in the session jail.
 
-    Uses ``git add workspace/ active_mission/`` by default (legacy behaviour).
-    When ``stage_paths`` is provided (session-scoped runs), only those
-    repo-relative paths are staged — e.g. ``["sessions/<id>/"]``.
+    By default stages ``workspace/`` inside the session jail.  Legacy
+    ``stage_paths`` is ignored — session git only tracks workspace content.
 
     Args:
         message:     Conventional-commit-style message.
-        stage_paths: Optional list of repo-relative paths to stage. When
-                     omitted, the legacy ``workspace/ active_mission/`` set
-                     is staged.
+        stage_paths: Deprecated — ignored for session-scoped git.
 
     Returns:
         {"success": True, "commit_hash": "<sha>", "message": "<msg>"}
         {"success": False, "error": "<message>"}
     """
-    # 1. Initialise repo if needed
-    if not (_REPO_ROOT / ".git").exists():
-        init = _git("init")
-        if not init["success"]:
-            return {"success": False, "error": f"git init failed: {init['stderr']}"}
-        _git("config", "user.email", "agent@missions.local")
-        _git("config", "user.name", "Missions Agent")
+    root = _git_root()
+    err = _ensure_git_repo(root)
+    if err:
+        return err
 
-    # 2. Stage changes
-    paths_to_stage = stage_paths if stage_paths is not None else ["workspace/", "active_mission/"]
-    stage = _git("add", *paths_to_stage)
-    if not stage["success"] and "pathspec" not in stage["stderr"]:
+    # Stage workspace/ inside session jail
+    stage = _git("add", "workspace/", cwd=root)
+    if not stage["success"] and "pathspec" not in stage.get("stderr", ""):
         return {"success": False, "error": f"git add failed: {stage['stderr']}"}
 
-    # 3. Check if there's anything to commit
-    status = _git("status", "--porcelain")
+    status = _git("status", "--porcelain", cwd=root)
     if not status["stdout"]:
-        return {"success": True, "commit_hash": "none", "message": "Nothing to commit — workspace already clean."}
+        return {
+            "success": True,
+            "commit_hash": "none",
+            "message": "Nothing to commit — workspace already clean.",
+        }
 
-    # 4. Commit
-    commit = _git("commit", "-m", message)
+    commit = _git("commit", "-m", message, cwd=root)
     if not commit["success"]:
         return {"success": False, "error": f"git commit failed: {commit['stderr']}"}
 
-    # 5. Extract commit hash
-    rev = _git("rev-parse", "--short", "HEAD")
+    rev = _git("rev-parse", "--short", "HEAD", cwd=root)
     commit_hash = rev["stdout"] if rev["success"] else "unknown"
     return {
         "success": True,
@@ -107,14 +113,13 @@ def git_diff() -> dict[str, Any]:
         {"success": True, "diff": "<unified diff text>", "has_changes": <bool>}
         {"success": False, "error": "<message>"}
     """
-    # If no git repo yet, diff makes no sense
-    if not (_REPO_ROOT / ".git").exists():
+    root = _git_root()
+    if not (root / ".git").exists():
         return {"success": True, "diff": "(no git repository — workspace is untracked)", "has_changes": False}
 
-    result = _git("diff", "HEAD")
+    result = _git("diff", "HEAD", cwd=root)
     if not result["success"] and result["stderr"]:
-        # HEAD may not exist on a brand-new repo; diff against empty tree
-        result = _git("diff", "--cached")
+        result = _git("diff", "--cached", cwd=root)
 
     diff_text = result["stdout"] or "(no changes)"
     return {
@@ -130,7 +135,7 @@ def git_diff() -> dict[str, Any]:
 
 def view_git_log(limit: int = 10) -> dict[str, Any]:
     """
-    Show recent git commit history.
+    Show recent git commit history for the session jail.
 
     Args:
         limit: Maximum number of commits to show (default 10).
@@ -139,7 +144,8 @@ def view_git_log(limit: int = 10) -> dict[str, Any]:
         {"success": True, "log": "<formatted log>", "count": <int>}
         {"success": False, "error": "<message>"}
     """
-    if not (_REPO_ROOT / ".git").exists():
+    root = _git_root()
+    if not (root / ".git").exists():
         return {"success": True, "log": "(no git repository)", "count": 0}
 
     result = _git(
@@ -147,11 +153,12 @@ def view_git_log(limit: int = 10) -> dict[str, Any]:
         f"--max-count={limit}",
         "--pretty=format:%h  %ad  %s",
         "--date=short",
+        cwd=root,
     )
     if not result["success"]:
         return {"success": False, "error": result["stderr"]}
 
-    lines = [l for l in result["stdout"].splitlines() if l.strip()]
+    lines = [line for line in result["stdout"].splitlines() if line.strip()]
     return {
         "success": True,
         "log": result["stdout"] or "(no commits yet)",

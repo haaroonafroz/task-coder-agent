@@ -40,7 +40,7 @@ import time
 import uuid
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 # ---------------------------------------------------------------------------
 # Internal imports
@@ -59,7 +59,9 @@ from src.tools import dispatch
 from src.tools.file_ops import set_allow_test_edits
 from src.tools.paths import set_workspace_root, get_workspace_root
 from src.session import SessionContext, SessionManager
-from src.events import EventEmitter, register_emitter, unregister_emitter
+from src.sandbox import activate_sandbox, deactivate_sandbox
+from src.run_control import RunCancelledError, ensure_not_cancelled
+from src.events import EventEmitter, emitter_for_session, register_emitter, unregister_emitter
 from src.agents import run_orchestration, replan_mission, run_worker, run_validator
 
 _CONFIG_DIR   = _ROOT / "config"
@@ -79,8 +81,9 @@ testpaths = tests
 # ---------------------------------------------------------------------------
 
 def _ensure_session_workspace(ctx: SessionContext) -> None:
-    """Create the session workspace and pytest import bootstrap before any tool calls."""
+    """Create the session workspace, sandbox jail, and pytest bootstrap before any tool calls."""
     ctx.ensure_dirs()
+    activate_sandbox(ctx)
     gitkeep = ctx.workspace_root / ".gitkeep"
     if not gitkeep.exists():
         gitkeep.touch()
@@ -97,7 +100,18 @@ def _is_test_milestone(milestone: dict) -> bool:
     """True when a milestone is explicitly a test/spec writing phase."""
     title = milestone.get("title", "").lower()
     desc  = milestone.get("description", "").lower()
-    return "test" in title or "spec" in title or "test" in desc or "spec" in desc
+    target_files = milestone.get("target_files", [])
+    only_test_targets = bool(target_files) and all(
+        "tests/" in f or f.startswith("test_") for f in target_files
+    )
+    return (
+        only_test_targets
+        or "test" in title
+        or "spec" in title
+        or "scaffold" in title
+        or "test" in desc
+        or "spec" in desc
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +136,7 @@ class MilestoneHandoff:
 class MissionResult:
     mission_id: str
     title: str
-    status: str            # "completed" | "partial" | "failed"
+    status: str            # "completed" | "partial" | "failed" | "cancelled"
     milestones_passed: int
     milestones_total: int
     handoffs: list[MilestoneHandoff]
@@ -162,12 +176,22 @@ class MissionsRuntime:
         self._session: Optional[SessionContext] = None
         self._emitter: Optional[EventEmitter] = None
         self._telemetry_ctx = None  # set per-run in run() (Phase 5)
+        self._cancel_check: Optional[Callable[[], bool]] = None
+
+    def _check_cancelled(self) -> None:
+        """Raise if the active run received a cancel request."""
+        ensure_not_cancelled(self._cancel_check)
 
     # ------------------------------------------------------------------
     # Public entry points
     # ------------------------------------------------------------------
 
-    def run(self, user_request: str, session: Optional[SessionContext] = None) -> MissionResult:
+    def run(
+        self,
+        user_request: str,
+        session: Optional[SessionContext] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> MissionResult:
         """
         Execute a full mission from a user request inside a session.
 
@@ -178,11 +202,13 @@ class MissionsRuntime:
         Args:
             user_request: Plain-English description of what to build or fix.
             session:      Optional pre-existing session to run inside.
+            cancel_check: Optional callable returning True when the run should stop.
 
         Returns:
             MissionResult with per-milestone handoff telemetry.
         """
         t_mission_start = time.perf_counter()
+        self._cancel_check = cancel_check
 
         # Resolve or create the session
         if session is None:
@@ -195,8 +221,8 @@ class MissionsRuntime:
         _ensure_session_workspace(session)
         self._session_manager.update_status(session, "running")
 
-        # Event stream for this session
-        self._emitter = EventEmitter(session.events_path, session.session_id)
+        # Event stream for this session (singleton — same instance SSE subscribes to)
+        self._emitter = emitter_for_session(session.session_id, session.events_path)
         register_emitter(self._emitter)
         self._emitter.emit(
             "session.started",
@@ -226,9 +252,58 @@ class MissionsRuntime:
             project=session.phoenix_project,
             model=self.model,
         ):
-            return self._run_mission_body(
-                user_request, session, telemetry_ctx, t_mission_start
+            try:
+                return self._run_mission_body(
+                    user_request, session, telemetry_ctx, t_mission_start
+                )
+            except RunCancelledError:
+                return self._finish_cancelled(session, t_mission_start)
+            finally:
+                deactivate_sandbox()
+                self._cancel_check = None
+
+    def _finish_cancelled(
+        self,
+        session: SessionContext,
+        t_mission_start: float,
+    ) -> MissionResult:
+        """Emit cancellation events and return a partial mission result."""
+        total_ms = (time.perf_counter() - t_mission_start) * 1000.0
+        self._session_manager.update_status(session, "paused")
+
+        plan: dict = {}
+        if session.plan_path.exists():
+            try:
+                plan = json.loads(session.plan_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                pass
+
+        milestones = plan.get("milestones", [])
+        passed = sum(1 for m in milestones if m.get("status") == "completed")
+
+        if self._emitter:
+            self._emitter.emit(
+                "mission.cancelled",
+                milestones_passed=passed,
+                milestones_total=len(milestones),
+                total_elapsed_ms=round(total_ms, 2),
             )
+            unregister_emitter(session.session_id)
+
+        self._telemetry_ctx = None
+        print("\n  [Runtime] Run cancelled by user.")
+
+        return MissionResult(
+            mission_id=plan.get("mission_id", ""),
+            title=plan.get("title", session.title),
+            status="cancelled",
+            milestones_passed=passed,
+            milestones_total=len(milestones),
+            handoffs=[],
+            total_elapsed_ms=round(total_ms, 2),
+            model_used=self.model,
+            session_id=session.session_id,
+        )
 
     # ------------------------------------------------------------------
     # Mission body (orchestration → milestone loop → summary)
@@ -242,6 +317,8 @@ class MissionsRuntime:
         t_mission_start: float,
     ) -> MissionResult:
         """Run orchestration + the milestone loop + summary inside a span."""
+        self._check_cancelled()
+
         # Phase 1 — Orchestration
         plan = run_orchestration(
             user_request, self.model,
@@ -268,6 +345,7 @@ class MissionsRuntime:
         ms_index = 0
 
         while ms_index < len(milestones):
+            self._check_cancelled()
             ms = milestones[ms_index]
             ms_id    = ms.get("id", "?")
             ms_title = ms.get("title", "")
@@ -396,6 +474,8 @@ class MissionsRuntime:
         set_allow_test_edits(is_test)
 
         while retry_count < MAX_RETRY_CYCLES:
+            self._check_cancelled()
+
             # Phase 2 — Dynamic skill routing
             intent = f"{ms_title}: {milestone.get('description', '')}"
             curated_tools_md = self._router.fetch_curated_skills(intent, top_k=3)
@@ -412,7 +492,11 @@ class MissionsRuntime:
                 memory=self._memory,
                 emitter=self._emitter,
                 session=self._telemetry_ctx,
+                cancel_check=self._cancel_check,
             )
+
+            if worker_result.get("status") == "cancelled":
+                raise RunCancelledError("Run cancelled by user")
 
             if worker_result.get("status") == "blocked":
                 reason = worker_result.get("reason", "Unknown block")
@@ -451,11 +535,7 @@ class MissionsRuntime:
 
             if verdict == "PASS":
                 commit_msg    = f"feat({ms_id}): {ms_title}"
-                stage_paths = [str(session.root.relative_to(_ROOT)) + "/"]
-                commit_result = dispatch("git_commit", {
-                    "message": commit_msg,
-                    "stage_paths": stage_paths,
-                })
+                commit_result = dispatch("git_commit", {"message": commit_msg})
                 commit_hash   = commit_result.get("commit_hash", "")
                 elapsed_ms    = (time.perf_counter() - t_start) * 1000.0
                 self._save_handoff(
@@ -658,7 +738,7 @@ def main() -> None:
     parser.add_argument(
         "--model",
         choices=["auto", "local", "gemini", "gpt4o"],
-        default="auto",
+        default="local",
         help="LLM backend to use (default: auto — tries local → gemini → gpt4o)",
     )
     parser.add_argument("--no-telemetry", action="store_true", help="Disable Arize Phoenix telemetry")
