@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 from fastapi import APIRouter, Depends, HTTPException
 
 from src.api.deps import (
@@ -11,7 +9,7 @@ from src.api.deps import (
     get_session_manager,
     require_session,
 )
-from src.api.run_queue import RunQueue
+from src.api.run_queue import CancelNotAllowedError, RunQueue
 from src.api.schemas import RunCreate, RunResponse
 from src.session import SessionManager
 
@@ -53,3 +51,21 @@ async def get_run(
     if rec is None or rec.session_id != sid:
         raise HTTPException(status_code=404, detail=f"Run '{rid}' not found in session '{sid}'")
     return RunResponse(**rec.to_dict())
+
+
+@router.post("/{rid}/cancel", response_model=RunResponse)
+async def cancel_run(
+    sid: str,
+    rid: str,
+    manager: SessionManager = Depends(get_session_manager),
+    run_queue: RunQueue = Depends(get_run_queue),
+) -> RunResponse:
+    require_session(sid, manager)
+    rec = run_queue._registry.get(rid)
+    if rec is None or rec.session_id != sid:
+        raise HTTPException(status_code=404, detail=f"Run '{rid}' not found in session '{sid}'")
+    try:
+        updated = run_queue.cancel(rid)
+    except CancelNotAllowedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return RunResponse(**updated.to_dict())

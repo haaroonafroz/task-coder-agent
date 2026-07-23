@@ -11,6 +11,7 @@ from src.api.schemas import (
     HandoffResponse,
     PlanResponse,
     WorkspaceFileResponse,
+    WorkspaceNodeResponse,
     WorkspaceTreeResponse,
 )
 from src.session import SessionContext, SessionManager
@@ -132,22 +133,36 @@ async def get_memory(
 # Workspace tree + file read
 # ---------------------------------------------------------------------------
 
-def _safe_resolve(workspace_root: Path, rel: str) -> Path:
-    """Resolve a path under the session workspace with escape guard."""
+def _safe_resolve(root: Path, rel: str) -> Path:
+    """Resolve a path under an allowed session root with escape guard."""
     rel = rel.strip().lstrip("/")
     if rel in ("", "."):
-        return workspace_root
-    candidate = (workspace_root / rel).resolve()
-    root_resolved = workspace_root.resolve()
+        return root.resolve()
+    candidate = (root / rel).resolve()
+    root_resolved = root.resolve()
     if root_resolved not in candidate.parents and candidate != root_resolved:
         raise HTTPException(
             status_code=400,
-            detail=f"Path escapes workspace: {rel}",
+            detail=f"Path escapes allowed root: {rel}",
         )
     return candidate
 
 
-def _build_tree(path: Path, depth: int, max_depth: int, prefix: str = "") -> tuple[str, list[str]]:
+def _browse_root(ctx: SessionContext, scope: str) -> Path:
+    if scope == "workspace":
+        return ctx.workspace_root
+    if scope == "session":
+        return ctx.root
+    raise HTTPException(status_code=400, detail=f"Unknown workspace scope: {scope}")
+
+
+def _build_tree(
+    path: Path,
+    base_root: Path,
+    depth: int,
+    max_depth: int,
+    prefix: str = "",
+) -> tuple[str, list[str]]:
     """Return (tree_string, flat_entry_list) for a directory."""
     if depth >= max_depth:
         return "", []
@@ -161,14 +176,57 @@ def _build_tree(path: Path, depth: int, max_depth: int, prefix: str = "") -> tup
         is_last = i == len(entries) - 1
         connector = "└── " if is_last else "├── "
         lines.append(f"{prefix}{connector}{entry.name}")
-        rel = str(entry.relative_to(path))
+        rel = str(entry.relative_to(base_root))
         flat.append(rel)
         if entry.is_dir():
             ext_prefix = prefix + ("    " if is_last else "│   ")
-            child_lines, child_flat = _build_tree(entry, depth + 1, max_depth, ext_prefix)
+            child_lines, child_flat = _build_tree(
+                entry,
+                base_root,
+                depth + 1,
+                max_depth,
+                ext_prefix,
+            )
             lines.extend(child_lines)
             flat.extend(child_flat)
     return "\n".join(lines), flat
+
+
+def _build_nodes(
+    path: Path,
+    base_root: Path,
+    depth: int,
+    max_depth: int,
+) -> list[WorkspaceNodeResponse]:
+    if depth >= max_depth:
+        return []
+    try:
+        entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except (OSError, PermissionError):
+        return []
+
+    nodes: list[WorkspaceNodeResponse] = []
+    for entry in entries:
+        rel = str(entry.relative_to(base_root))
+        is_dir = entry.is_dir()
+        size = None
+        if not is_dir:
+            try:
+                size = entry.stat().st_size
+            except OSError:
+                size = None
+        nodes.append(
+            WorkspaceNodeResponse(
+                name=entry.name,
+                path=rel,
+                type="directory" if is_dir else "file",
+                size=size,
+                children=_build_nodes(entry, base_root, depth + 1, max_depth)
+                if is_dir
+                else [],
+            )
+        )
+    return nodes
 
 
 @router.get("/workspace", response_model=WorkspaceTreeResponse)
@@ -176,27 +234,39 @@ async def list_workspace(
     sid: str,
     path: str = "",
     depth: int = 3,
+    scope: str = "workspace",
     manager: SessionManager = Depends(get_session_manager),
 ) -> WorkspaceTreeResponse:
     ctx = require_session(sid, manager)
-    target = _safe_resolve(ctx.workspace_root, path)
+    root = _browse_root(ctx, scope).resolve()
+    target = _safe_resolve(root, path)
     if not target.exists():
         raise HTTPException(status_code=404, detail=f"Path not found: {path}")
     if not target.is_dir():
         raise HTTPException(status_code=400, detail=f"Not a directory: {path}")
-    tree, entries = _build_tree(target, 0, max(depth, 1))
-    rel = str(target.relative_to(ctx.workspace_root)) if target != ctx.workspace_root else ""
-    return WorkspaceTreeResponse(path=rel or ".", tree=tree, entries=entries)
+    max_depth = max(depth, 1)
+    tree, entries = _build_tree(target, root, 0, max_depth)
+    nodes = _build_nodes(target, root, 0, max_depth)
+    rel = str(target.relative_to(root)) if target != root else ""
+    return WorkspaceTreeResponse(
+        path=rel or ".",
+        tree=tree,
+        entries=entries,
+        root=scope,
+        nodes=nodes,
+    )
 
 
 @router.get("/workspace/file", response_model=WorkspaceFileResponse)
 async def read_workspace_file(
     sid: str,
     path: str,
+    scope: str = "workspace",
     manager: SessionManager = Depends(get_session_manager),
 ) -> WorkspaceFileResponse:
     ctx = require_session(sid, manager)
-    target = _safe_resolve(ctx.workspace_root, path)
+    root = _browse_root(ctx, scope).resolve()
+    target = _safe_resolve(root, path)
     if not target.exists():
         raise HTTPException(status_code=404, detail=f"File not found: {path}")
     if not target.is_file():
@@ -208,5 +278,5 @@ async def read_workspace_file(
         content = target.read_bytes().decode("latin-1", errors="replace")
         encoding = "latin-1"
     size = target.stat().st_size
-    rel = str(target.relative_to(ctx.workspace_root))
+    rel = str(target.relative_to(root))
     return WorkspaceFileResponse(path=rel, content=content, size=size, encoding=encoding)

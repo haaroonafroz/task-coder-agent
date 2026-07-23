@@ -79,7 +79,7 @@ class RunResponse(BaseModel):
     run_id: str
     session_id: str
     request: str
-    status: str  # queued | running | completed | partial | failed | error
+    status: str  # queued | running | completed | partial | failed | error | cancelled
     model: str
     queued_at: str
     started_at: Optional[str] = None
@@ -115,10 +115,20 @@ class HandoffResponse(BaseModel):
 # Workspace
 # ---------------------------------------------------------------------------
 
+class WorkspaceNodeResponse(BaseModel):
+    name: str
+    path: str
+    type: str
+    size: Optional[int] = None
+    children: list["WorkspaceNodeResponse"] = Field(default_factory=list)
+
+
 class WorkspaceTreeResponse(BaseModel):
     path: str
     tree: str
     entries: list[str] = Field(default_factory=list)
+    root: str = "workspace"
+    nodes: list[WorkspaceNodeResponse] = Field(default_factory=list)
 
 
 class WorkspaceFileResponse(BaseModel):
