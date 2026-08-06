@@ -8,6 +8,8 @@ from src.agents.validator import (
     _detect_collect_only_pass,
     _detect_policy_denial_replan,
     _pytest_ran_in_output,
+    _test_scaffold_contract_replan,
+    _target_file_boundary_fail,
 )
 
 
@@ -47,6 +49,25 @@ def test_block_infrastructure_replan_broad_markers() -> None:
     blocked = _block_infrastructure_replan(parsed, output, 1)
     assert blocked["verdict"] == "FAIL"
     assert blocked.get("replan_guidance") is None
+
+
+def test_block_infrastructure_replan_shell_127_without_pytest() -> None:
+    parsed = {
+        "verdict": "REPLAN",
+        "replan_guidance": (
+            "The validation environment is misconfigured. Please verify the "
+            "integrity of the virtual environment or reset the environment path."
+        ),
+    }
+    output = (
+        "stdout:\n\nstderr:\n/bin/bash: python: command not found\n"
+        "returncode: 127\nexecution_mode: shell\npolicy_denied: False"
+    )
+
+    blocked = _block_infrastructure_replan(parsed, output, 127)
+    assert blocked["verdict"] == "FAIL"
+    assert blocked.get("replan_guidance") is None
+    assert any("shell mode" in err.lower() for err in blocked["errors"])
 
 
 def test_all_skipped_spec_gaming_fails(tmp_path) -> None:
@@ -96,3 +117,48 @@ def test_policy_denial_replan_includes_allowlist() -> None:
 def test_policy_denial_not_triggered_without_flag() -> None:
     tool_result = {"returncode": 1, "stderr": "some error"}
     assert _detect_policy_denial_replan({}, {}, tool_result, "") is None
+
+
+def test_test_scaffold_milestone_requires_scaffold_contract() -> None:
+    milestone = {
+        "id": "M1",
+        "target_files": ["tests/test_x.py"],
+        "validation_contract": {
+            "type": "pytest",
+            "command": "python -m pytest tests/test_x.py --collect-only -q",
+        },
+    }
+
+    result = _test_scaffold_contract_replan(milestone, True)
+
+    assert result is not None
+    assert result["verdict"] == "REPLAN"
+    assert "test_scaffold" in result["replan_guidance"]
+
+
+def test_test_scaffold_contract_replan_allows_scaffold_type() -> None:
+    milestone = {
+        "id": "M1",
+        "target_files": ["tests/test_x.py"],
+        "validation_contract": {"type": "test_scaffold"},
+    }
+
+    assert _test_scaffold_contract_replan(milestone, True) is None
+
+
+def test_target_file_boundary_rejects_out_of_scope_edits() -> None:
+    milestone = {"id": "M1", "target_files": ["tests/test_x.py"]}
+    worker = {"files_modified": ["tests/test_x.py", "snake_logic.py"]}
+
+    result = _target_file_boundary_fail(milestone, worker)
+
+    assert result is not None
+    assert result["verdict"] == "FAIL"
+    assert result["out_of_scope_files"] == ["snake_logic.py"]
+
+
+def test_target_file_boundary_allows_workspace_prefix_equivalence() -> None:
+    milestone = {"id": "M1", "target_files": ["tests/test_x.py"]}
+    worker = {"files_modified": ["workspace/tests/test_x.py"]}
+
+    assert _target_file_boundary_fail(milestone, worker) is None
