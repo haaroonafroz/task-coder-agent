@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -35,13 +36,22 @@ _LEGACY_MEMORY_FILE = Path(__file__).parent.parent / "active_mission" / "memory_
 
 # ---------------------------------------------------------------------------
 # Optional Cognee import
+#
+# Cognee is OPT-IN: it performs cloud-LLM graph extraction on every write,
+# which blocks the serial pipeline for tens of seconds per milestone and adds
+# token cost. The JSON store serves every read path in the runtime, so the
+# default backend is "json". Set MISSIONS_MEMORY_BACKEND=cognee to re-enable.
 # ---------------------------------------------------------------------------
+_MEMORY_BACKEND = os.getenv("MISSIONS_MEMORY_BACKEND", "json").strip().lower()
+
 try:
     import cognee
-    _COGNEE_AVAILABLE = True
+    _COGNEE_INSTALLED = True
 except ImportError:
     cognee = None  # type: ignore
-    _COGNEE_AVAILABLE = False
+    _COGNEE_INSTALLED = False
+
+_COGNEE_AVAILABLE = _COGNEE_INSTALLED and _MEMORY_BACKEND == "cognee"
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +85,23 @@ class _AsyncRunner:
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return future.result(timeout=timeout)
 
+    def submit(self, coro) -> None:
+        """Schedule a coroutine fire-and-forget; never blocks the caller.
+
+        Memory writes are not on the critical path of the serial pipeline —
+        the JSON store is written synchronously for durability, so a dropped
+        or slow Cognee write must never stall milestone execution.
+        """
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+        def _swallow(fut: concurrent.futures.Future) -> None:
+            try:
+                fut.result()
+            except Exception as exc:
+                print(f"[Memory] Background Cognee write failed: {exc}")
+
+        future.add_done_callback(_swallow)
+
 
 _async_runner: Optional[_AsyncRunner] = None
 _runner_lock = threading.Lock()
@@ -93,6 +120,11 @@ def _get_runner() -> _AsyncRunner:
 def _run_async(coro, timeout: float = 30) -> Any:
     """Run a coroutine on the persistent background event loop."""
     return _get_runner().run(coro, timeout=timeout)
+
+
+def _submit_async(coro) -> None:
+    """Schedule a coroutine without blocking the serial runtime thread."""
+    _get_runner().submit(coro)
 
 
 # ---------------------------------------------------------------------------
@@ -137,9 +169,9 @@ class MissionMemory:
         )
         if _COGNEE_AVAILABLE:
             try:
-                _run_async(self._cognee_add_and_cognify(payload))
+                _submit_async(self._cognee_add_and_cognify(payload))
             except Exception as exc:
-                print(f"[Memory] Cognee write failed: {exc}; falling back to JSON.")
+                print(f"[Memory] Cognee write scheduling failed: {exc}")
 
         # Always write to the JSON store for durability
         self._json_write(milestone_id, current_status, plan_meta)
@@ -171,10 +203,13 @@ class MissionMemory:
         """
         if _COGNEE_AVAILABLE:
             try:
-                result = _run_async(self._cognee_search(
-                    f"What are the parameters, file locations, and dependencies "
-                    f"related to {target_class_or_feature}?"
-                ))
+                result = _run_async(
+                    self._cognee_search(
+                        f"What are the parameters, file locations, and dependencies "
+                        f"related to {target_class_or_feature}?"
+                    ),
+                    timeout=10,
+                )
                 if result:
                     return str(result)[:2000]
             except Exception as exc:
@@ -211,9 +246,9 @@ class MissionMemory:
         )
         if _COGNEE_AVAILABLE:
             try:
-                _run_async(self._cognee_add_and_cognify(payload))
+                _submit_async(self._cognee_add_and_cognify(payload))
             except Exception as exc:
-                print(f"[Memory] Cognee error-log write failed: {exc}")
+                print(f"[Memory] Cognee error-log scheduling failed: {exc}")
 
         store = self._load_store()
         store.setdefault("error_log", []).append({
