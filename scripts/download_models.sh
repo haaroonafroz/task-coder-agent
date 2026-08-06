@@ -76,11 +76,16 @@ case "$MODEL_ARG" in
         DRAFT_FILE="gemma-4-E4B-it-assistant.Q8_0.gguf"
         MODEL_ALIAS="gemma-4-e4b-it"
         ;;
-    --qwen3627b|*)
+    --qwen3627b)
         # Q8_0 (~4.3GB) — fits easily on a single 16GB V100
         TARGET_REPO="unsloth/Qwen3.6-27B-MTP-GGUF"
         TARGET_FILE="Qwen3.6-27B-UD-Q4_K_XL.gguf"
         MODEL_ALIAS="qwen3.6-27b-mtp"
+        ;;
+    --qwen36-mmproj)
+        TARGET_REPO="unsloth/Qwen3.6-27B-MTP-GGUF"
+        TARGET_FILE="mmproj-F16.gguf"
+        MODEL_ALIAS="qwen3.6-27b-mmproj"
         ;;
     --qwopus3627b|*)
         # Q8_0 (~4.3GB) — fits easily on a single 16GB V100

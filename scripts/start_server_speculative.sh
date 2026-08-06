@@ -26,9 +26,10 @@ if [ -f "$ENV_FILE" ]; then
 fi
 
 TARGET_FILE="${TARGET_MODEL_GGUF:-$REPO_ROOT/models/gemma-4-E4B-it-Q8_0.gguf}"
+MMPROJ_FILE="${MMPROJ_FILE:-$REPO_ROOT/models/mmproj-F16.gguf}"
 # DRAFT_FILE="${DRAFT_MODEL_GGUF:-$REPO_ROOT/models/gemma-4-E4B-it-assistant-F16.gguf}"
 MODEL_ALIAS="${MODEL_ALIAS:-gemma-4-e4b-it}"
-CONTEXT_LEN="${CONTEXT_LEN:-16384}"
+CONTEXT_LEN="${CONTEXT_LEN:-64000}"
 N_GPU_LAYERS="${N_GPU_LAYERS:--1}"
 NUM_DRAFT_TOKENS="${NUM_DRAFT_TOKENS:-2}"
 PORT=8001
@@ -99,6 +100,7 @@ llama-server \
     --cont-batching \
     --spec-type draft-mtp \
     --spec-draft-n-max "$NUM_DRAFT_TOKENS" \
+    --mmproj "$MMPROJ_FILE" \
     --port "$PORT" \
     --host 127.0.0.1 \
     --log-file "$LOG_FILE" \
