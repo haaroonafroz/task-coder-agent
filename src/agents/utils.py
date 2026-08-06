@@ -7,6 +7,7 @@ used by orchestrator, worker, and validator.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any, Optional
@@ -111,6 +112,52 @@ def trim_conversation(conversation: list[dict], max_turns: int = 12) -> list[dic
     if len(conversation) <= max_turns:
         return conversation
     return [conversation[0]] + conversation[-(max_turns - 1):]
+
+
+# ---------------------------------------------------------------------------
+# Failure fingerprinting (replan dedup / repeated-error circuit breaker)
+# ---------------------------------------------------------------------------
+
+_ERROR_LINE_KEYS = (
+    "error", "assert", "failed", "exception", "not found", "denied",
+    "no module", "traceback", "exit code", "returncode",
+)
+
+
+def failure_signature(
+    milestone_id: str,
+    command: str,
+    contract_output: str,
+    returncode: Optional[int],
+) -> str:
+    """
+    Stable fingerprint of a validation failure.
+
+    LLM verdicts paraphrase their guidance every time, so text comparison
+    cannot dedup repeated replan loops. This fingerprint keys on the
+    deterministic facts — milestone, contract command, exit code, and the
+    first error-looking output line — normalised to strip file paths, line
+    numbers, and digits so the SAME underlying failure always maps to the
+    SAME signature across retries and replans.
+    """
+    err_line = ""
+    for line in (contract_output or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if any(key in stripped.lower() for key in _ERROR_LINE_KEYS):
+            err_line = stripped
+            break
+
+    norm = re.sub(r"[\w./\\-]+\.py", "<file>", err_line.lower())
+    norm = re.sub(r"\d+", "<n>", norm)
+    norm = re.sub(r"\s+", " ", norm).strip()
+
+    base = (
+        f"{milestone_id}|rc={returncode}|"
+        f"{(command or '').strip().lower()}|{norm}"
+    )
+    return hashlib.sha1(base.encode()).hexdigest()[:12]
 
 
 # ---------------------------------------------------------------------------
