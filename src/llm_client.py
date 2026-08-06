@@ -60,6 +60,27 @@ TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.8"))
 TOP_P = float(os.getenv("LLM_TOP_P", "0.95"))
 SEED = int(os.getenv("LLM_SEED", "42"))
 
+# Per-role sampling defaults. Tool-calling and code generation need
+# near-deterministic sampling; planning tolerates more diversity.
+# Precedence: LLM_TEMPERATURE_<ROLE> env > LLM_TEMPERATURE env > role default.
+_ROLE_TEMPERATURE_DEFAULTS: dict[str, float] = {
+    "orchestrator": 0.5,
+    "worker": 0.2,
+    "validator": 0.2,
+}
+
+
+def _role_temperature(role: AgentRole) -> float:
+    raw = os.getenv(f"LLM_TEMPERATURE_{role.upper()}", "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    if os.getenv("LLM_TEMPERATURE"):
+        return TEMPERATURE
+    return _ROLE_TEMPERATURE_DEFAULTS.get(role, 0.5)
+
 
 @dataclass(frozen=True)
 class ResolvedModelConfig:
@@ -130,7 +151,15 @@ def _role_thinking_level(backend: str, role: AgentRole) -> ThinkingLevel:
         return "minimal" if role == "worker" else "medium"
 
     if backend == "local":
-        return "medium" if role in ("orchestrator", "validator") else "off"
+        if role == "worker":
+            return "off"
+        # llama.cpp templates only understand thinking on/off; any non-"off"
+        # level means enabled. Measured: orchestrator medium thinking is the
+        # dominant mission cost (~80%), so these are env-tunable.
+        raw = os.getenv(f"LOCAL_THINKING_LEVEL_{role.upper()}", "medium").strip().lower()
+        if raw in ("off", "minimal", "low", "medium", "high"):
+            return raw  # type: ignore[return-value]
+        return "medium"
 
     return "off"
 
@@ -242,17 +271,13 @@ def _local_user_content(prompt: str, thinking_level: ThinkingLevel) -> str:
 
 
 def _gemini_extra_body(thinking_level: ThinkingLevel) -> dict[str, Any]:
-    """
-    Gemini OpenAI-compat: pass thinking_config via extra_body.google.
-
-    Uses thinking_level (minimal/low/medium/high). Do not combine with
-    reasoning_effort — they are mutually exclusive on Gemini.
-    """
     return {
-        "google": {
-            "thinking_config": {
-                "thinking_level": thinking_level,
-                "include_thoughts": False,
+        "extra_body": {
+            "google": {
+                "thinking_config": {
+                    "thinking_level": thinking_level,
+                    "include_thoughts": False,
+                }
             }
         }
     }
@@ -267,19 +292,20 @@ def _build_client(cfg: ResolvedModelConfig) -> OpenAI:
 # ---------------------------------------------------------------------------
 
 def call_llm(
-    prompt: str,
+    prompt: Optional[str] = None,
     model: ModelChoice = "auto",
     max_tokens: int = 2048,
     system_prompt: Optional[str] = None,
     json_mode: bool = False,
     role: AgentRole = "worker",
     enable_thinking: Optional[bool] = None,
+    messages: Optional[list[dict[str, str]]] = None,
 ) -> LLMResult:
     """
     Send a prompt to the selected LLM and return the result with precise timing.
 
     Args:
-        prompt:        User-turn prompt text.
+        prompt:        User-turn prompt text. Ignored when ``messages`` is given.
         model:         Backend key: ``local`` | ``gemini`` | ``gpt4o`` | ``auto``.
         max_tokens:    Maximum completion tokens.
         system_prompt: Optional system-turn text prepended to messages.
@@ -287,6 +313,10 @@ def call_llm(
         role:          Agent role — selects per-role model + thinking from registry.
         enable_thinking: Deprecated. Maps to role thinking when provided without
                          changing role defaults (True → medium, False → off for local).
+        messages:      Optional native chat message list (``role``/``content``
+                       dicts). Prefer this over flattened single-turn prompts:
+                       it preserves role semantics and keeps the rendered prompt
+                       append-only so server-side prefix caches stay hot.
 
     Returns:
         LLMResult with text, timing, token counts, and resolved model id.
@@ -308,6 +338,7 @@ def call_llm(
                 json_mode=json_mode,
                 fallback_used=(attempt > 0),
                 enable_thinking_override=enable_thinking,
+                messages=messages,
             )
         except (APIConnectionError, ConnectionRefusedError, OSError) as exc:
             print(f"[LLMClient] {model_key} unreachable: {exc}. Trying next.")
@@ -331,7 +362,7 @@ def call_llm(
 
 
 def _call_single(
-    prompt: str,
+    prompt: Optional[str],
     model_key: str,
     role: AgentRole,
     max_tokens: int,
@@ -339,6 +370,7 @@ def _call_single(
     json_mode: bool,
     fallback_used: bool,
     enable_thinking_override: Optional[bool],
+    messages: Optional[list[dict[str, str]]] = None,
 ) -> LLMResult:
     """Execute a single streaming call to the given model backend."""
     cfg = resolve_model_config(model_key, role)
@@ -350,19 +382,25 @@ def _call_single(
 
     client = _build_client(cfg)
 
-    messages: list[dict[str, str]] = []
+    chat_messages: list[dict[str, str]] = []
     if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
+        chat_messages.append({"role": "system", "content": system_prompt})
 
-    user_content = prompt
-    if model_key == "local":
-        user_content = _local_user_content(prompt, thinking_level)
-    messages.append({"role": "user", "content": user_content})
+    if messages is not None:
+        chat_messages.extend({"role": m["role"], "content": m["content"]} for m in messages)
+    else:
+        chat_messages.append({"role": "user", "content": prompt or ""})
+
+    if model_key == "local" and thinking_level in ("off", "minimal"):
+        for msg in chat_messages:
+            if msg["role"] == "user":
+                msg["content"] = _local_user_content(msg["content"], thinking_level)
+                break
 
     kwargs: dict[str, Any] = dict(
         model=cfg.model_name,
-        messages=messages,
-        temperature=TEMPERATURE,
+        messages=chat_messages,
+        temperature=_role_temperature(role),
         top_p=TOP_P,
         seed=SEED,
         max_tokens=max_tokens,
@@ -371,6 +409,13 @@ def _call_single(
     )
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
+
+    # llama.cpp: /no_think prompt prefixes are NOT honoured by Qwen jinja
+    # chat templates — the model still emits hidden reasoning_content that
+    # consumes the completion budget (~270 tokens for a 7-token answer in
+    # measurement). enable_thinking must be set as a chat template kwarg.
+    if model_key == "local" and thinking_level == "off":
+        kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
 
     if model_key == "gemini" and thinking_level not in ("off",):
         kwargs["extra_body"] = _gemini_extra_body(thinking_level)
