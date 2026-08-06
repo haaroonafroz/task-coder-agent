@@ -14,11 +14,12 @@
 
 <!-- SKILL_START: write_file -->
 ## Skill Name: write_file
-- **Description:** Creates a completely new file or replaces the entire content of an existing file. Use only for new files or complete rewrites — prefer `patch_file` for targeted edits.
+- **Description:** Creates a completely new file or replaces the entire content of an existing file. Use only for new files or complete rewrites — prefer `patch_file` for targeted edits. Full rewrites of existing files larger than ~60 lines are rejected unless the file was read first this milestone or `rewrite` is true.
 - **Keywords:** write, create, file, new
 - **Parameters:**
-  - `file_path` (string): Workspace-relative destination path.
+  - `file_path` (string): Workspace-relative destination path. Must be one of the milestone's target files — other paths are rejected.
   - `content` (string): Full file content to write.
+  - `rewrite` (boolean, optional): Set true to force a full rewrite of a large existing file without a prior read. Escape hatch — prefer read_file + patch_file.
 - **Returns:** Confirmation message with the written byte count.
 - **When to use:** Creating new Python modules, config files, or test files from scratch.
 - **Example:**
@@ -32,7 +33,7 @@
 - **Description:** Performs a precise search-and-replace inside an existing file without touching surrounding code. Safer than write_file for incremental changes.
 - **Keywords:** patch, edit, replace, modify
 - **Parameters:**
-  - `file_path` (string): Workspace-relative path to the file.
+  - `file_path` (string): Workspace-relative path to the file. Must be one of the milestone's target files — other paths are rejected.
   - `search_string` (string): Exact text to find (must be unique in the file).
   - `replace_string` (string): Text to substitute in place of `search_string`.
 - **Returns:** Success confirmation or error if `search_string` was not found.
@@ -132,13 +133,16 @@
 
 <!-- SKILL_START: install_dependency -->
 ## Skill Name: install_dependency
-- **Description:** Installs a Python package into the local runtime environment via pip. Also appends the package to `requirements.txt` if it exists.
-- **Keywords:** install, pip, package, dependency
+- **Description:** Installs a Python package into the session venv via pip. Also appends the package to `requirements.txt` if it exists. **Required before complete** when target files import third-party libraries.
+- **Keywords:** install, pip, package, dependency, pygame, flask, httpx, requirements, third-party, runtime
 - **Parameters:**
-  - `package_name` (string): Package identifier, optionally with version pin (e.g. `httpx>=0.27.0`).
+  - `package_name` (string): Package identifier, optionally with version pin (e.g. `httpx>=0.27.0`, `pygame`).
 - **Returns:** pip install stdout/stderr and success flag.
-- **When to use:** When the implementation requires a library that is not already installed.
+- **When to use:** Before signalling `complete` whenever you add a non-stdlib third-party import (e.g. `import pygame`) in a target file. The session venv only includes pytest, flake8, and black by default.
 - **Example:**
+  ```json
+  {"tool": "install_dependency", "args": {"package_name": "pygame"}, "reasoning": "main.py imports pygame; install before complete."}
+  ```
   ```json
   {"tool": "install_dependency", "args": {"package_name": "httpx>=0.27.0"}, "reasoning": "Need httpx for async HTTP client in the new module."}
   ```
