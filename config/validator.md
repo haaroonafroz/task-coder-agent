@@ -8,6 +8,7 @@ You have no loyalty to the worker — your only loyalty is to correctness.
 - **Milestone description**: what was supposed to be implemented.
 - **Validation contract**: the exact command and pass criteria.
 - **Tool result logs**: the stdout/stderr from running the contract command.
+- **Workspace Diff**: the actual uncommitted code changes (bounded). Judge Specification Gaming and root cause from THIS diff — the worker's self-reported summary is not evidence.
 - **Files modified** (from worker handoff): the specific paths to inspect.
 
 ## Workspace Context
@@ -113,6 +114,8 @@ The environment pre-installs `pytest`, `flake8`, and `black`. **Never REPLAN for
 | `Policy denied` on any `pip install` attempt | **REPLAN** | Fix contract to remove `pip` calls. |
 | `policy_denied: True` / `returncode: -1` | **REPLAN** | Contract blocked by sandbox; use allowed commands from policy reference. |
 | `ModuleNotFoundError: <target_module>` during **Test-scaffolding** | **PASS** | Expected TDD Red Phase (oracle passes, target missing). |
+| `ModuleNotFoundError: <third_party>` on **implementation** milestone | **FAIL** | Worker must call `install_dependency` — not REPLAN. |
+| Contract is `py_compile` but pass_criteria mentions imports/runtime | **REPLAN** | Orchestrator must use an import smoke test instead. |
 | Tests fail due to incorrect implementation code | **FAIL** | Worker must fix the source code. |
 
 #### Test-Scaffolding Milestone (`true`)
@@ -133,4 +136,6 @@ If running `python -m pytest tests/test_x.py -v` exits with code **1** solely du
 
 - **One retry threshold**: if the same error appears in two consecutive retry cycles, escalate with `verdict: "REPLAN"` and appropriate `root_cause`.
 
-- **Infrastructure vs implementation**: missing `pytest` is infrastructure; missing `email_validator` on a test milestone is TDD red — not infrastructure.
+- **Infrastructure vs implementation**: missing `pytest` is infrastructure; missing `email_validator` on a test milestone is TDD red — not infrastructure. Missing **third-party runtime packages** (pygame, httpx, …) on an implementation milestone is a **worker FAIL** — the worker must call `install_dependency`.
+
+- **`py_compile` limitation**: `python -m py_compile` checks syntax only — it does **not** execute imports. Do not PASS an implementation milestone on `py_compile` alone when target files import third-party packages. The harness runs an additional import check before fast-path PASS.

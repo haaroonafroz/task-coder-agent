@@ -18,16 +18,30 @@ from __future__ import annotations
 import json
 import os
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
 from src.llm_client import call_llm, ModelChoice, resolve_model_config
 from src.telemetry import span_llm_call, TelemetryContext
 from src.sandbox.commands import execute_contract
+from src.sandbox.context import get_sandbox_context
+from src.sandbox.dependency_check import (
+    check_target_file_dependencies,
+    format_missing_dependency_message,
+    planned_module_names,
+)
 from src.sandbox.policy import describe_policy_for_profile, format_policy_reference
 from src.tools.paths import resolve_workspace_path
+from src.tools.git_ops import git_diff
 from src.events import EventEmitter
-from src.agents.utils import parse_json_from_text
+from src.agents.utils import parse_json_from_text, failure_signature
+from src.agents.test_scaffold_validator import (
+    build_python_stub_overlay,
+    collect_contract,
+    python_stub_env_overlay,
+    red_phase_contract,
+    validate_test_scaffold_structure,
+)
 
 # ---------------------------------------------------------------------------
 # Paths and configuration
@@ -37,7 +51,7 @@ _CONFIG_DIR = _ROOT / "config"
 
 _VALIDATOR_MD = (_CONFIG_DIR / "validator.md").read_text()
 
-MAX_TOKENS_VALIDATOR = int(os.getenv("MAX_TOKENS_VALIDATOR", "3072"))
+MAX_TOKENS_VALIDATOR = int(os.getenv("MAX_TOKENS_VALIDATOR", "48000"))
 MAX_RETRY_CYCLES     = 3
 
 
@@ -53,6 +67,7 @@ def run_validator(
     model: ModelChoice,
     emitter: "EventEmitter | None" = None,
     session: Optional[TelemetryContext] = None,
+    plan: Optional[dict] = None,
 ) -> dict[str, Any]:
     """
     Execute the validation contract and render a verdict.
@@ -67,6 +82,9 @@ def run_validator(
         emitter:           Optional EventEmitter for streaming validation events.
         session:           Optional telemetry context used to bind LLM spans to a
                            Phoenix session (Phase 5).
+        plan:              Optional full mission plan — used to recognise
+                           planned-but-not-yet-created local modules in the
+                           dependency check (TDD red-phase imports).
 
     Returns:
         A verdict dict with key "verdict": "PASS" | "FAIL" | "REPLAN".
@@ -110,7 +128,53 @@ def run_validator(
                 "code in your assigned source files so that it correctly passes the "
                 "original, unmodified test suite."
             ),
+            "failure_signature": failure_signature(
+                ms_id, command, f"spec gaming: {unauthorized_edits}", None
+            ),
         }
+
+    boundary_fail = _target_file_boundary_fail(milestone, worker_result)
+    if boundary_fail:
+        print(
+            f"    [Validator] REJECTED: Worker modified files outside target_files: "
+            f"{boundary_fail['out_of_scope_files']}"
+        )
+        boundary_fail["failure_signature"] = failure_signature(
+            ms_id, command,
+            f"out of scope: {boundary_fail['out_of_scope_files']}", None,
+        )
+        if emitter:
+            emitter.emit(
+                "validation.spec_gaming",
+                milestone_id=ms_id,
+                unauthorized_edits=boundary_fail["out_of_scope_files"],
+                reason="out_of_scope_target_files",
+            )
+            emitter.emit("validation.finished", milestone_id=ms_id, verdict="FAIL")
+        return boundary_fail
+
+    contract_type = str(contract.get("type", "")).lower()
+
+    # --- Phase-aware test scaffold validation --------------------------------
+    scaffold_replan = _test_scaffold_contract_replan(milestone, is_test_milestone)
+    if scaffold_replan:
+        return scaffold_replan
+
+    if contract_type == "test_scaffold":
+        if emitter:
+            emitter.emit("validation.started", milestone_id=ms_id, command=command)
+        scaffold_verdict = _run_test_scaffold_contract(
+            milestone=milestone,
+            emitter=emitter,
+        )
+        if emitter:
+            emitter.emit(
+                "validation.finished",
+                milestone_id=ms_id,
+                verdict=scaffold_verdict.get("verdict", "FAIL"),
+                path="test_scaffold",
+            )
+        return scaffold_verdict
 
     if emitter:
         emitter.emit("validation.started", milestone_id=ms_id, command=command)
@@ -151,6 +215,16 @@ def run_validator(
 
     returncode = tool_result.get("returncode") if command else None
 
+    # Failure fingerprint for replan dedup + raw output passthrough so the
+    # runtime can hand the worker the un-digested contract output on retry.
+    sig = failure_signature(ms_id, command, contract_output, returncode)
+
+    def _with_failure_context(verdict: dict) -> dict:
+        verdict.setdefault("failure_signature", sig)
+        if contract_output:
+            verdict.setdefault("contract_output", contract_output[:2000])
+        return verdict
+
     # --- Policy denial (contract never ran) ----------------------------------
     policy_replan = _detect_policy_denial_replan(
         milestone, contract, tool_result, contract_output
@@ -164,7 +238,7 @@ def run_validator(
                 verdict="REPLAN",
                 path="policy_denied",
             )
-        return policy_replan
+        return _with_failure_context(policy_replan)
 
     # --- Deterministic REPLAN check ------------------------------------------
     replan = _detect_contract_replan(milestone, worker_result, contract_output, returncode)
@@ -177,7 +251,7 @@ def run_validator(
                 verdict="REPLAN",
                 reason="deterministic",
             )
-        return replan
+        return _with_failure_context(replan)
     
     # --- TDD red-phase PASS (test-scaffolding milestone) ---------------------
     tdd_pass = _detect_tdd_red_pass(
@@ -207,7 +281,7 @@ def run_validator(
                 verdict="FAIL",
                 path="all_skipped",
             )
-        return skip_fail
+        return _with_failure_context(skip_fail)
 
     # --- Collect-only PASS (test-scaffolding milestone) ----------------------
     collect_pass = _detect_collect_only_pass(
@@ -226,6 +300,15 @@ def run_validator(
 
     # --- Fast-path PASS (contract exited 0) ----------------------------------
     if returncode == 0:
+        dep_fail = _missing_dependency_fail(
+            milestone,
+            target_files,
+            emitter=emitter,
+            planned_modules=planned_module_names(plan),
+        )
+        if dep_fail:
+            return _with_failure_context(dep_fail)
+
         if emitter:
             emitter.emit(
                 "validation.finished",
@@ -240,6 +323,7 @@ def run_validator(
         }
 
     # --- LLM verdict for non-zero exit or commandless milestones -------------
+    diff_block = _bounded_workspace_diff()
     prompt = (
         f"{_VALIDATOR_MD}\n\n"
         f"---\n\n"
@@ -251,6 +335,7 @@ def run_validator(
         f"**Test-scaffolding milestone**: {is_test_milestone}\n\n"
         f"## Validation Contract\n```json\n{json.dumps(contract, indent=2)}\n```\n\n"
         f"## Contract Execution Output\n```\n{contract_output or '(no command run)'}\n```\n\n"
+        f"{diff_block}"
         f"## Worker Handoff\n"
         f"Files modified: {worker_result.get('files_modified', [])}\n"
         f"Summary: {worker_result.get('summary', '')}\n\n"
@@ -277,6 +362,21 @@ def run_validator(
             json_mode=True, role="validator",
         )
 
+    if emitter:
+        emitter.emit(
+            "llm.call",
+            role="validator",
+            milestone_id=ms_id,
+            model_used=result.model_used,
+            tokens_prompt=result.tokens_prompt,
+            tokens_generated=result.tokens_generated,
+            prefill_ms=result.prefill_ms,
+            decode_ms=result.decode_ms,
+            total_ms=result.total_ms,
+            thinking_level=result.thinking_level,
+            fallback_used=result.fallback_used,
+        )
+
     parsed = parse_json_from_text(result.text)
     if parsed is None:
         if command and "returncode: 0" in contract_output:
@@ -299,12 +399,12 @@ def run_validator(
                 verdict="FAIL",
                 path="unparseable",
             )
-        return {
+        return _with_failure_context({
             "verdict": "FAIL",
             "milestone_id": ms_id,
             "errors": ["Could not parse validator response."],
             "fix_guidance": result.text[:500],
-        }
+        })
 
     parsed = _normalize_validator_verdict(parsed, returncode=returncode)
     parsed = _block_infrastructure_replan(parsed, contract_output, returncode)
@@ -323,12 +423,329 @@ def run_validator(
             path="llm",
         )
 
-    return parsed
+    return _with_failure_context(parsed)
 
 
 # ---------------------------------------------------------------------------
 # Validation helpers
 # ---------------------------------------------------------------------------
+
+_DIFF_MAX_CHARS = 4000
+
+
+def _bounded_workspace_diff() -> str:
+    """
+    Return the uncommitted workspace diff as a prompt block (size-capped).
+
+    The validator must judge spec-gaming and root cause from the ACTUAL code
+    changes, not the worker's self-reported summary. Missing diff is not
+    fatal — the block is simply omitted.
+    """
+    try:
+        result = git_diff()
+    except Exception:
+        return ""
+    if not result.get("success"):
+        return ""
+    diff_text = result.get("diff", "") or ""
+    if not diff_text.strip() or diff_text.startswith("(no"):
+        return ""
+    if len(diff_text) > _DIFF_MAX_CHARS:
+        head = diff_text[:3000]
+        tail = diff_text[-900:]
+        diff_text = f"{head}\n... [diff truncated {len(diff_text)} chars total] ...\n{tail}"
+    return f"## Workspace Diff (uncommitted changes)\n```diff\n{diff_text}\n```\n\n"
+
+def _run_test_scaffold_contract(
+    milestone: dict,
+    emitter: Optional[EventEmitter] = None,
+) -> dict:
+    """
+    Validate a spec/test milestone as an external contract.
+
+    This is intentionally stricter than pytest collect-only: it rejects tests
+    that embed production objects, then collects and red-runs the tests against
+    temporary generated stubs for the declared public API.
+    """
+    ms_id = milestone.get("id", "?")
+    workspace_root = resolve_workspace_path(".")
+    structural = validate_test_scaffold_structure(milestone, workspace_root)
+    if not structural.ok:
+        verdict = "REPLAN" if structural.needs_replan else "FAIL"
+        result = {
+            "verdict": verdict,
+            "milestone_id": ms_id,
+            "errors": structural.errors,
+            "warnings": structural.warnings,
+            "root_cause": (
+                "The test-scaffolding contract is underspecified."
+                if structural.needs_replan
+                else "The test scaffold embeds implementation details or is not a valid external spec."
+            ),
+            "fix_guidance": (
+                "Patch the plan with language, public_api, required_imports, and forbidden_definitions."
+                if structural.needs_replan
+                else (
+                    "Rewrite tests so they import the public API from source modules and do not "
+                    "define production classes, enums, functions, or methods inside test files."
+                )
+            ),
+        }
+        if structural.needs_replan:
+            result["replan_guidance"] = result["fix_guidance"]
+        return result
+
+    sandbox = get_sandbox_context()
+    if sandbox is None:
+        return {
+            "verdict": "FAIL",
+            "milestone_id": ms_id,
+            "errors": ["No active sandbox context for test_scaffold validation."],
+            "fix_guidance": "Run scaffold validation inside a session sandbox.",
+        }
+
+    stub_root = sandbox.tmp_dir / "validation_stubs" / str(ms_id)
+    try:
+        build_python_stub_overlay(milestone, sandbox.workspace_root, stub_root)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "verdict": "REPLAN",
+            "milestone_id": ms_id,
+            "errors": [f"Could not build test scaffold stubs: {exc}"],
+            "root_cause": "The public_api contract is invalid or incomplete.",
+            "fix_guidance": "Patch public_api with valid Python module paths and symbol names.",
+            "replan_guidance": (
+                f"Fix public_api for {ms_id}; it must contain valid Python module paths, "
+                "symbol names, kinds, and class methods/enums where needed."
+            ),
+        }
+
+    env_overlay = python_stub_env_overlay(stub_root, sandbox.workspace_root)
+
+    collect_result = execute_contract(
+        collect_contract(milestone),
+        timeout=120,
+        profile="validation",
+        env_overlay=env_overlay,
+    )
+    if emitter:
+        emitter.emit(
+            "validation.contract_run",
+            milestone_id=ms_id,
+            phase="test_scaffold_collect",
+            returncode=collect_result.get("returncode", -1),
+            python=collect_result.get("python", ""),
+            execution_mode=collect_result.get("execution_mode", "unknown"),
+            policy_denied=collect_result.get("policy_denied", False),
+        )
+
+    if collect_result.get("returncode") != 0:
+        return {
+            "verdict": "FAIL",
+            "milestone_id": ms_id,
+            "errors": ["Test scaffold did not collect against generated public API stubs."],
+            "validation_details": _format_tool_output(collect_result),
+            "fix_guidance": (
+                "Fix import names, syntax, fixtures, or test structure so the scaffold "
+                "collects against the declared public API stubs."
+            ),
+        }
+
+    red_result = execute_contract(
+        red_phase_contract(milestone),
+        timeout=120,
+        profile="validation",
+        env_overlay=env_overlay,
+    )
+    if emitter:
+        emitter.emit(
+            "validation.contract_run",
+            milestone_id=ms_id,
+            phase="test_scaffold_red",
+            returncode=red_result.get("returncode", -1),
+            python=red_result.get("python", ""),
+            execution_mode=red_result.get("execution_mode", "unknown"),
+            policy_denied=red_result.get("policy_denied", False),
+        )
+
+    if red_result.get("returncode") == 0:
+        return {
+            "verdict": "FAIL",
+            "milestone_id": ms_id,
+            "errors": ["Tests pass against empty generated stubs."],
+            "validation_details": _format_tool_output(red_result),
+            "root_cause": "The scaffold does not assert behavior strongly enough.",
+            "fix_guidance": (
+                "Add behavioral assertions that fail while public API symbols are only stubs."
+            ),
+        }
+
+    if red_result.get("policy_denied"):
+        return {
+            "verdict": "REPLAN",
+            "milestone_id": ms_id,
+            "errors": [red_result.get("stderr", "Policy denied")],
+            "root_cause": "The scaffold red-phase command is not permitted by sandbox policy.",
+            "fix_guidance": "Use a permitted pytest validation command.",
+            "replan_guidance": (
+                f"Update {ms_id} test_scaffold command to use python -m pytest "
+                "<test_file> --collect-only -q or a structured pytest target/args contract."
+            ),
+        }
+
+    return {
+        "verdict": "PASS",
+        "milestone_id": ms_id,
+        "validation_details": (
+            "Test scaffold imports the declared public API, avoids embedded implementation, "
+            "collects against generated stubs, and fails red-phase as expected."
+        ),
+        "warnings": structural.warnings,
+    }
+
+
+def _format_tool_output(result: dict) -> str:
+    return (
+        f"stdout:\n{result.get('stdout', '')}\n"
+        f"stderr:\n{result.get('stderr', '')}\n"
+        f"returncode: {result.get('returncode', -1)}\n"
+        f"execution_mode: {result.get('execution_mode', 'unknown')}"
+    )
+
+
+def _test_scaffold_contract_replan(
+    milestone: dict,
+    is_test_milestone: bool,
+) -> dict | None:
+    """Require phase-aware contracts for all test-writing milestones."""
+    if not is_test_milestone:
+        return None
+    contract = milestone.get("validation_contract", {}) or {}
+    if str(contract.get("type", "")).lower() == "test_scaffold":
+        return None
+
+    ms_id = milestone.get("id", "?")
+    return {
+        "verdict": "REPLAN",
+        "milestone_id": ms_id,
+        "errors": [
+            (
+                "Test-scaffolding milestones must use validation_contract.type="
+                "'test_scaffold' so the harness can validate tests as external specs."
+            )
+        ],
+        "root_cause": "The plan used an implementation-style validation contract for a spec milestone.",
+        "fix_guidance": None,
+        "replan_guidance": (
+            f"Patch {ms_id} to use validation_contract.type='test_scaffold'. "
+            "Add language, public_api, required_imports, forbidden_definitions, "
+            "and min_assertions. Tests must import the future implementation API "
+            "and must not define production objects inside tests."
+        ),
+    }
+
+
+def _missing_dependency_fail(
+    milestone: dict,
+    target_files: list[str],
+    *,
+    emitter: "EventEmitter | None" = None,
+    planned_modules: frozenset[str] = frozenset(),
+) -> dict | None:
+    """FAIL when target files import third-party packages not installed in the venv."""
+    if not target_files:
+        return None
+
+    report = check_target_file_dependencies(
+        target_files, planned_modules=planned_modules
+    )
+    if report.ok:
+        return None
+
+    ms_id = milestone.get("id", "?")
+    message = format_missing_dependency_message(report)
+    print(f"    [Validator] REJECTED: {message}")
+
+    if emitter:
+        emitter.emit(
+            "dependency.missing",
+            milestone_id=ms_id,
+            packages=report.missing_packages,
+            imports=report.missing_imports,
+            checked_files=report.checked_files,
+            source="validator",
+        )
+        emitter.emit("validation.finished", milestone_id=ms_id, verdict="FAIL")
+
+    return {
+        "verdict": "FAIL",
+        "milestone_id": ms_id,
+        "errors": [message, *report.errors],
+        "root_cause": (
+            "Target files import third-party packages that are not installed in "
+            "the session venv."
+        ),
+        "fix_guidance": (
+            "Call install_dependency for each missing package "
+            f"({', '.join(report.missing_packages) or 'see errors'}), then ensure "
+            "target files import successfully before signalling complete."
+        ),
+    }
+
+
+def _target_file_boundary_fail(
+    milestone: dict,
+    worker_result: dict,
+) -> dict | None:
+    """Fail milestones that modify files outside their declared target_files."""
+    target_files = {
+        _normalize_workspace_rel(path)
+        for path in milestone.get("target_files", [])
+        if str(path).strip()
+    }
+    modified_files = {
+        _normalize_workspace_rel(path)
+        for path in worker_result.get("files_modified", [])
+        if str(path).strip()
+    }
+    if not target_files or not modified_files:
+        return None
+
+    out_of_scope = sorted(modified_files - target_files)
+    if not out_of_scope:
+        return None
+
+    ms_id = milestone.get("id", "?")
+    return {
+        "verdict": "FAIL",
+        "milestone_id": ms_id,
+        "errors": [
+            (
+                "Worker modified files outside this milestone's target_files: "
+                f"{out_of_scope}. Allowed target_files: {sorted(target_files)}"
+            )
+        ],
+        "out_of_scope_files": out_of_scope,
+        "root_cause": (
+            "The worker exceeded the milestone boundary instead of limiting edits "
+            "to the files assigned by the orchestrator."
+        ),
+        "fix_guidance": (
+            "Revert out-of-scope changes and complete this milestone using only "
+            f"the declared target_files: {sorted(target_files)}."
+        ),
+    }
+
+
+def _normalize_workspace_rel(path: object) -> str:
+    raw = str(path).strip().replace("\\", "/")
+    while raw.startswith("./"):
+        raw = raw[2:]
+    if raw.startswith("workspace/"):
+        raw = raw[len("workspace/"):]
+    normalized = PurePosixPath(raw)
+    parts = [part for part in normalized.parts if part not in ("", ".")]
+    return str(PurePosixPath(*parts)) if parts else "."
 
 def _detect_contract_replan(
     milestone: dict,
@@ -607,18 +1024,41 @@ def _detect_all_skipped_spec_gaming(
     return None
 
 
+def _toolchain_evidence_in_output(
+    contract_output: str,
+    returncode: int | None,
+) -> bool:
+    """True when contract output shows the session toolchain actually ran."""
+    if _pytest_ran_in_output(contract_output, returncode):
+        return True
+    return "execution_mode: argv" in contract_output.lower()
+
+
+def _is_shell_interpreter_miss(
+    contract_output: str,
+    returncode: int | None,
+) -> bool:
+    """True for shell-mode exit 127 — usually a harness path issue, not a broken venv."""
+    if returncode != 127:
+        return False
+    return "execution_mode: shell" in contract_output.lower()
+
+
 def _block_infrastructure_replan(
     parsed: dict,
     contract_output: str,
     returncode: int | None,
 ) -> dict:
     """
-    Downgrade LLM REPLANs that ask for pytest/pip/env setup when pytest already ran.
+    Downgrade LLM REPLANs that blame missing pytest/pip/venv when the toolchain
+    already ran, or when shell-mode exit 127 indicates a contract execution path
+    issue rather than a broken session environment.
     """
     if parsed.get("verdict") != "REPLAN":
         return parsed
 
     guidance = str(parsed.get("replan_guidance", "")).lower()
+    shell_127 = _is_shell_interpreter_miss(contract_output, returncode)
     infra_markers = (
         "pip install",
         "install pytest",
@@ -630,31 +1070,63 @@ def _block_infrastructure_replan(
         "virtual environments",
         "path is configured",
         "interpreter",
+        "interpreter path",
+        "missing interpreter",
         "pytest is available",
         "requirements.txt installation",
         "container/ci environment",
+        "infrastructure",
+        "sandbox",
+        "symlink",
+        "command not found",
+        "no such file or directory",
+        "misconfigured",
+        "broken environment",
+        "environment's virtual environment",
+        "validation environment",
     )
-    if not any(m in guidance for m in infra_markers):
+    has_infra_guidance = any(m in guidance for m in infra_markers)
+
+    if not has_infra_guidance and not shell_127:
         return parsed
 
-    if not _pytest_ran_in_output(contract_output, returncode):
-        # Still block if output proves pytest ran via execution metadata
-        if "execution_mode: argv" not in contract_output.lower():
-            return parsed
+    if not _toolchain_evidence_in_output(contract_output, returncode) and not shell_127:
+        return parsed
+
+    if shell_127:
+        print(
+            "    [Validator] Blocking infrastructure REPLAN — shell-mode exit 127 "
+            "is a contract execution-path issue, not a missing venv."
+        )
+        parsed["verdict"] = "FAIL"
+        parsed["replan_guidance"] = None
+        parsed.setdefault("errors", []).append(
+            "Rejected infrastructure REPLAN: validation ran in shell mode and "
+            "returned exit 127. Prefer `python -m pytest`, `python -m py_compile`, "
+            "or `python -m flake8` so the harness compiles the contract to argv."
+        )
+        parsed["root_cause"] = (
+            parsed.get("root_cause")
+            or (
+                "Validator misclassified a shell-mode command-not-found failure "
+                "as a broken session environment."
+            )
+        )
+        return parsed
 
     print(
-        "    [Validator] Blocking infrastructure REPLAN — pytest already ran in "
-        "contract output."
+        "    [Validator] Blocking infrastructure REPLAN — session toolchain "
+        "evidence is present in contract output."
     )
     parsed["verdict"] = "FAIL"
     parsed["replan_guidance"] = None
     parsed.setdefault("errors", []).append(
-        "Rejected infrastructure REPLAN: pytest is available; failure is not "
-        "missing tooling."
+        "Rejected infrastructure REPLAN: session toolchain is available; failure "
+        "is not missing tooling."
     )
     parsed["root_cause"] = (
         parsed.get("root_cause")
-        or "Validator misclassified a normal pytest failure as missing infrastructure."
+        or "Validator misclassified a normal test failure as missing infrastructure."
     )
     return parsed
 

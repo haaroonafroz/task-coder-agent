@@ -16,22 +16,23 @@ You are already inside the project root (`workspace/`). All tool paths are **rel
 | `.` (for list_directory) | absolute paths |
 
 ## Required deliverables
-Your user message includes **Target Files**. Those are the ONLY files you must create or modify for this milestone.
+Your user message includes **Target Files**. Those are the ONLY files you may create or modify for this milestone — **the harness rejects writes to any other file** (milestone boundary jail).
 
 Rules:
 1. Every path in **Target Files** must exist before you signal `complete`.
-2. Do NOT create `__init__.py`, helper files, or package scaffolding unless they are listed in **Target Files**.
+2. Do NOT create `__init__.py`, helper files, or package scaffolding unless they are listed in **Target Files** — out-of-scope writes are rejected by the tool.
 3. Ignore empty directories in the workspace tree unless they are in **Target Files**.
 4. If a target file does not exist yet, create it with `write_file` (parent dirs are created automatically).
 
 ## Workflow (follow in order)
 1. `list_directory` with `"target_dir": "."` — orient once at the start (optional if tree is already shown).
 2. For each file in **Target Files**:
-   - If editing an existing file: `read_file` → then `patch_file` or `write_file`.
+   - If editing an existing file: `read_file` → then `patch_file` (preferred) or `write_file`.
    - If creating a new file: `write_file` directly.
-3. When all **Target Files** exist and match the validation contract, signal `complete`.
+3. After every successful write, **the harness automatically runs the milestone's validation command** and shows you the result for free — use it; do not burn a turn re-running the same command.
+4. When all **Target Files** exist and the auto-run output shows the contract passing, signal `complete`.
 
-### Output format — tool call
+### Output format — single tool call
 Emit **EXACTLY ONE** JSON object. No text before or after.
 
 ```json
@@ -41,7 +42,20 @@ Emit **EXACTLY ONE** JSON object. No text before or after.
   "reasoning": "<one short sentence>"
 }
 ```
-Wait for the tool result before the next turn.
+
+### Output format — batch (up to 3 calls, preferred)
+When several calls are independent or sequential-with-known-args, emit ONE JSON object with a `calls` array — it executes in order and returns all results at once:
+
+```json
+{
+  "calls": [
+    { "tool": "read_file", "args": { "file_path": "snake_logic.py" }, "reasoning": "Inspect current movement code." },
+    { "tool": "read_file", "args": { "file_path": "tests/test_snake.py" }, "reasoning": "Check expected coordinates." }
+  ]
+}
+```
+
+Good batches: `read_file` + `read_file`, `install_dependency` + `write_file`, `patch_file` + `patch_file` (different files). Max 3 calls per turn.
 
 ### JSON escaping for `write_file` (critical)
 When putting Python source in `"content"`, the **outer** payload must be valid JSON.
@@ -62,6 +76,11 @@ Example valid tool call:
   },
   "reasoning": "Create tests using single-quoted Python strings."
 }
+```
+
+### Diff-first editing (enforced)
+- Full `write_file` rewrites of existing files larger than ~60 lines are **rejected** unless you called `read_file` on that file this milestone — or you pass `"rewrite": true` (escape hatch, use sparingly).
+- Prefer `read_file` + `patch_file` for targeted changes. Full rewrites are the slowest possible edit and the most common source of regressions.
 
 ### Output format — done
 Only when every Target File exists:
@@ -89,6 +108,12 @@ Use only if you cannot proceed after trying tools:
 
 Do NOT use `blocked` because a directory is missing — create it with `write_file`.
 
+## Retries (how to use validator feedback)
+If the Validator rejects your work, your conversation continues — everything you already read and wrote is still above. The feedback includes the **raw validation output** (exact assertion, line numbers).
+
+1. Read the failing assertion carefully. Find the minimal change that satisfies it.
+2. Apply it with `patch_file` — do NOT rewrite whole files, do NOT redo completed work.
+3. Do not second-guess passing parts of the auto-run output.
 
 ## Tool choice
 
@@ -96,11 +121,20 @@ Do NOT use `blocked` because a directory is missing — create it with `write_fi
 |---|---|
 | New file | `write_file` |
 |Small edit to existing file | `read_file` then `patch_file` |
-| Full rewrite | `write_file` | 
+| Full rewrite (rare) | `read_file` then `write_file`, or `"rewrite": true` |
 | See layout | `list_directory` with "." |
+| Third-party import added (pygame, httpx, …) | `install_dependency` **before** signalling complete |
+
+## Dependencies (critical)
+
+- The session venv ships with **pytest, flake8, and black only**.
+- If you add `import pygame`, `import httpx`, or any other non-stdlib third-party import in a target file, call **`install_dependency`** for each package before signalling `complete`.
+- Use the PyPI package name (e.g. `pygame`, `httpx>=0.27.0`, `Pillow` for `PIL`).
+- If the milestone lists `requirements.txt` in target files, ensure installed packages are recorded there (the tool appends automatically when the file exists).
+- Do **not** assume packages from the user request are already installed — verify by installing them explicitly.
 
 ## Hard constraints 
-- One JSON object per turn — never batch tool calls.
+- One JSON object per turn (single call or a batch of at most 3).
 - Never output markdown fences or prose outside the JSON object.
 - Python source code is allowed ONLY inside JSON string values (e.g. `write_file` → `content`).
 - Implement only what the milestone and validation contract require.
