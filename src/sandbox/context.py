@@ -52,19 +52,54 @@ class SandboxContext:
     def ensure_venv(self) -> Path:
         """Create session-local venv if missing; return python path."""
         import subprocess
-        import sys
 
         if self.venv_python.exists():
+            self._harden_venv_symlinks()
             return self.venv_python
 
         self.venv_path.parent.mkdir(parents=True, exist_ok=True)
+        # Use the system base interpreter so the venv does not inherit symlinks
+        # from the host/project venv that live outside the session jail.
         subprocess.run(
-            [sys.executable, "-m", "venv", str(self.venv_path)],
+            [str(self._system_python()), "-m", "venv", str(self.venv_path)],
             check=True,
             capture_output=True,
             text=True,
         )
+        self._harden_venv_symlinks()
         return self.venv_python
+
+    def _system_python(self) -> Path:
+        """Return the host system interpreter used to anchor in-jail venv symlinks."""
+        import sys
+
+        base = getattr(sys, "base_executable", None) or sys.executable
+        return Path(base).resolve()
+
+    def _harden_venv_symlinks(self) -> None:
+        """Re-point venv interpreter symlinks that escape the session jail."""
+        if not self.venv_bin.is_dir():
+            return
+
+        jail = self.jail_root.resolve()
+        base_python = self._system_python()
+        interpreter_names = {
+            "python", "python3",
+            *(f"python{n}" for n in range(7, 14)),
+        }
+
+        for entry in self.venv_bin.iterdir():
+            if not entry.is_symlink():
+                continue
+            try:
+                target = entry.resolve()
+            except (OSError, RuntimeError):
+                continue
+            if jail in target.parents or target == jail:
+                continue
+            if entry.name in interpreter_names:
+                entry.unlink()
+                entry.symlink_to(base_python)
 
 
 def sandbox_from_session(session: SessionContext) -> SandboxContext:

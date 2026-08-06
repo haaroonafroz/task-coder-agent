@@ -202,10 +202,14 @@ class SubprocessExecutor:
         profile: ShellProfile = "worker",
         use_venv: bool = True,
         cwd: Optional[Path] = None,
+        env_overlay: Optional[dict[str, str]] = None,
     ) -> RunSpec:
+        env = build_sandbox_env(ctx, use_venv=use_venv)
+        if env_overlay:
+            env.update({str(k): str(v) for k, v in env_overlay.items()})
         return RunSpec(
             cwd=cwd or ctx.workspace_root,
-            env=build_sandbox_env(ctx, use_venv=use_venv),
+            env=env,
             timeout=timeout,
             network=network,
             profile=profile,
@@ -222,6 +226,7 @@ class SubprocessExecutor:
         profile: ShellProfile = "worker",
         cwd: Optional[Path] = None,
         use_venv: bool = True,
+        env_overlay: Optional[dict[str, str]] = None,
     ) -> ExecResult:
         """Execute argv (no shell) inside the sandbox."""
         sandbox = ctx or get_sandbox_context()
@@ -243,6 +248,7 @@ class SubprocessExecutor:
         spec = self._spec_from_ctx(
             sandbox, timeout=timeout, network=network,
             profile=profile, use_venv=use_venv, cwd=cwd,
+            env_overlay=env_overlay,
         )
 
         if self.backend == ExecutorBackend.BWRAP and _bwrap_available():
@@ -271,6 +277,7 @@ class SubprocessExecutor:
         timeout: int = 30,
         network: NetworkMode = NetworkMode.NONE,
         profile: ShellProfile = "worker",
+        env_overlay: Optional[dict[str, str]] = None,
     ) -> ExecResult:
         """Execute a shell script inside the sandbox after policy check."""
         sandbox = ctx or get_sandbox_context()
@@ -290,7 +297,13 @@ class SubprocessExecutor:
                 "python": resolve_python(sandbox),
             }
 
-        spec = self._spec_from_ctx(sandbox, timeout=timeout, network=network, profile=profile)
+        spec = self._spec_from_ctx(
+            sandbox,
+            timeout=timeout,
+            network=network,
+            profile=profile,
+            env_overlay=env_overlay,
+        )
 
         if self.backend == ExecutorBackend.BWRAP and _bwrap_available():
             inner = ["/bin/bash", "-c", script]

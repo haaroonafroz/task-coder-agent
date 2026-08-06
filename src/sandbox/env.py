@@ -61,7 +61,7 @@ def build_sandbox_env(
 
 
 def resolve_python(ctx: SandboxContext) -> str:
-    """Return python executable — prefer session venv when it exists."""
+    """Return absolute session venv python path — prefer venv when it exists."""
     if ctx.venv_python.exists():
-        return str(ctx.venv_python)
+        return str(ctx.venv_python.absolute())
     return sys.executable

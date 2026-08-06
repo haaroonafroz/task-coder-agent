@@ -29,6 +29,14 @@ _BARE_PYTEST_RE = re.compile(
     r"^\s*pytest\s+(\S+)(?:\s+(.*))?$",
     re.IGNORECASE,
 )
+_PY_COMPILE_MODULE_RE = re.compile(
+    r"^\s*(?:python3?)\s+-m\s+py_compile\s+(\S+)(?:\s+(.*))?$",
+    re.IGNORECASE,
+)
+_FLAKE8_MODULE_RE = re.compile(
+    r"^\s*(?:python3?)\s+-m\s+flake8\s+(\S+)(?:\s+(.*))?$",
+    re.IGNORECASE,
+)
 
 
 def canonicalize_shell_script(script: str, ctx: Optional[SandboxContext] = None) -> str:
@@ -76,6 +84,33 @@ def compile_contract_to_argv(
     command = str(contract.get("command", "")).strip()
     python = resolve_python(sandbox)
 
+    # The command string is the source of truth when present: its target and
+    # flags are more specific than contract-level defaults. Parsing it FIRST
+    # prevents e.g. type="lint" + "flake8 string_utils.py" from degenerating
+    # into linting "." (which sweeps in tests/ and fails on scaffolded test
+    # files the worker is forbidden to touch).
+    normalized = command.replace("workspace/", "").strip()
+    if normalized:
+        match = _PYTEST_MODULE_RE.match(normalized)
+        if match:
+            target, rest = match.group(1), match.group(2) or ""
+            return [python, "-m", "pytest", target, *_split_args(rest)]
+
+        match = _BARE_PYTEST_RE.match(normalized)
+        if match:
+            target, rest = match.group(1), match.group(2) or ""
+            return [python, "-m", "pytest", target, *_split_args(rest)]
+
+        match = _PY_COMPILE_MODULE_RE.match(normalized)
+        if match:
+            target, rest = match.group(1), match.group(2) or ""
+            return [python, "-m", "py_compile", target, *_split_args(rest)]
+
+        match = _FLAKE8_MODULE_RE.match(normalized)
+        if match:
+            target, rest = match.group(1), match.group(2) or ""
+            return [python, "-m", "flake8", target, *_split_args(rest)]
+
     if ctype == "pytest":
         target = contract.get("target") or contract.get("test_path")
         if target:
@@ -86,22 +121,6 @@ def compile_contract_to_argv(
         target = contract.get("target", ".")
         return [python, "-m", "flake8", str(target), "--max-line-length=120"]
 
-    if not command:
-        return None
-
-    # Recognize common orchestrator shell patterns and avoid shell interpolation.
-    normalized = command.replace("workspace/", "").strip()
-
-    match = _PYTEST_MODULE_RE.match(normalized)
-    if match:
-        target, rest = match.group(1), match.group(2) or ""
-        return [python, "-m", "pytest", target, *_split_args(rest)]
-
-    match = _BARE_PYTEST_RE.match(normalized)
-    if match:
-        target, rest = match.group(1), match.group(2) or ""
-        return [python, "-m", "pytest", target, *_split_args(rest)]
-
     return None
 
 
@@ -111,6 +130,7 @@ def execute_contract(
     ctx: Optional[SandboxContext] = None,
     timeout: int = 120,
     profile: ShellProfile = "validation",
+    env_overlay: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
     """
     Execute a validation contract using argv when possible, else canonical shell.
@@ -136,6 +156,7 @@ def execute_contract(
             ctx=sandbox,
             timeout=timeout,
             profile=profile,
+            env_overlay=env_overlay,
         )
         result["execution_mode"] = "argv"
         result["argv"] = argv
@@ -148,6 +169,7 @@ def execute_contract(
         ctx=sandbox,
         timeout=timeout,
         profile=profile,
+        env_overlay=env_overlay,
     )
     result["execution_mode"] = "shell"
     result["script"] = script
