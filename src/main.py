@@ -56,18 +56,26 @@ from src.telemetry import (
     telemetry_context_from_session,
 )
 from src.tools import dispatch
-from src.tools.file_ops import set_allow_test_edits
+from src.tools.file_ops import (
+    set_allow_test_edits,
+    begin_milestone_write_policy,
+    clear_milestone_write_policy,
+)
 from src.tools.paths import set_workspace_root, get_workspace_root
 from src.session import SessionContext, SessionManager
 from src.sandbox import activate_sandbox, deactivate_sandbox
+from src.sandbox.dependency_check import milestone_suggests_dependencies
 from src.run_control import RunCancelledError, ensure_not_cancelled
 from src.events import EventEmitter, emitter_for_session, register_emitter, unregister_emitter
 from src.agents import run_orchestration, replan_mission, run_worker, run_validator
+from src.agents.orchestrator import repair_plan_issues
+from src.agents.plan_lint import lint_plan
 
 _CONFIG_DIR   = _ROOT / "config"
 _SKILLS_PATH  = _CONFIG_DIR / "skills.md"
 
 MAX_RETRY_CYCLES = 3
+MAX_REPLANS_PER_MILESTONE = int(os.getenv("MAX_REPLANS_PER_MILESTONE", "2"))
 
 _PYTEST_INI = """\
 [pytest]
@@ -97,20 +105,26 @@ def _ensure_session_workspace(ctx: SessionContext) -> None:
 
 
 def _is_test_milestone(milestone: dict) -> bool:
-    """True when a milestone is explicitly a test/spec writing phase."""
-    title = milestone.get("title", "").lower()
-    desc  = milestone.get("description", "").lower()
+    """True when a milestone is explicitly a test/spec writing phase.
+
+    Uses structured detection only — contract type or target-file patterns.
+    Free-text keyword matching against title/description is intentionally
+    absent because implementation milestones routinely mention "tests"
+    in their descriptions (e.g. "implement X to pass M1 tests"), which would
+    cause false-positive classification and trigger incorrect replans.
+    """
+    contract_type = str(
+        milestone.get("validation_contract", {}).get("type", "")
+    ).lower()
+    if contract_type == "test_scaffold":
+        return True
+
     target_files = milestone.get("target_files", [])
-    only_test_targets = bool(target_files) and all(
-        "tests/" in f or f.startswith("test_") for f in target_files
-    )
-    return (
-        only_test_targets
-        or "test" in title
-        or "spec" in title
-        or "scaffold" in title
-        or "test" in desc
-        or "spec" in desc
+    if not target_files:
+        return False
+    return all(
+        f.startswith("tests/") or f.startswith("test_") or "/test_" in f
+        for f in target_files
     )
 
 
@@ -130,6 +144,7 @@ class MilestoneHandoff:
     commit_hash: str
     elapsed_ms: float
     error_log: list[str] = field(default_factory=list)
+    failure_signature: str = ""  # deterministic fingerprint for replan dedup
 
 
 @dataclass
@@ -259,6 +274,7 @@ class MissionsRuntime:
             except RunCancelledError:
                 return self._finish_cancelled(session, t_mission_start)
             finally:
+                clear_milestone_write_policy()
                 deactivate_sandbox()
                 self._cancel_check = None
 
@@ -319,13 +335,32 @@ class MissionsRuntime:
         """Run orchestration + the milestone loop + summary inside a span."""
         self._check_cancelled()
 
-        # Phase 1 — Orchestration
-        plan = run_orchestration(
-            user_request, self.model,
-            plan_path=session.plan_path,
-            mission_dir=session.root,
-            session=telemetry_ctx,
-        )
+        # Phase 1 — Orchestration (graceful failure: no uncaught tracebacks)
+        try:
+            plan = run_orchestration(
+                user_request, self.model,
+                plan_path=session.plan_path,
+                mission_dir=session.root,
+                session=telemetry_ctx,
+                emitter=self._emitter,
+            )
+        except Exception as exc:
+            print(f"  [Orchestrator] Plan generation failed: {exc}")
+            self._emitter.emit("mission.failed", phase="orchestration", error=str(exc))
+            return MissionResult(
+                mission_id="", title=session.title, status="failed",
+                milestones_passed=0, milestones_total=0, handoffs=[],
+                total_elapsed_ms=round(
+                    (time.perf_counter() - t_mission_start) * 1000.0, 2
+                ),
+                model_used=self.model, session_id=session.session_id,
+            )
+
+        # Phase 1.2 — deterministic plan lint: fix what's fixable in code,
+        # repair the rest with one Orchestrator patch pass — before a single
+        # worker cycle is burned on a structurally broken plan.
+        plan = self._lint_and_repair_plan(plan, session, telemetry_ctx)
+
         milestones = plan.get("milestones", [])
         mission_id = plan.get("mission_id", str(uuid.uuid4())[:8])
         title = plan.get("title", "Untitled Mission")
@@ -343,6 +378,11 @@ class MissionsRuntime:
         handoffs: list[MilestoneHandoff] = []
         passed = 0
         ms_index = 0
+        # Replan circuit breakers: consecutive-replan budget per milestone +
+        # failure-fingerprint dedup (identical failure → identical replan is
+        # always futile, regardless of paraphrased guidance).
+        replan_counts: dict[str, int] = {}
+        replan_signatures: dict[str, set] = {}
 
         while ms_index < len(milestones):
             self._check_cancelled()
@@ -379,17 +419,79 @@ class MissionsRuntime:
                     milestone_id=ms_id,
                     guidance=handoff.error_log[-1] if handoff.error_log else "",
                 )
-                plan = replan_mission(
-                    plan, handoff.error_log[-1], self.model,
-                    plan_path=session.plan_path,
-                    session=telemetry_ctx,
-                )
+
+                # --- Replan circuit breakers ----------------------------------
+                sig = handoff.failure_signature
+                seen = replan_signatures.setdefault(ms_id, set())
+                replan_count = replan_counts.get(ms_id, 0)
+
+                if sig and sig in seen:
+                    print(
+                        f"  [Runtime] REPLAN LOOP DETECTED for {ms_id}: identical "
+                        f"failure fingerprint ({sig}) seen before. Halting."
+                    )
+                    self._emitter.emit(
+                        "milestone.failed",
+                        milestone_id=ms_id,
+                        reason="replan_loop_same_failure",
+                        failure_signature=sig,
+                    )
+                    break
+
+                if replan_count >= MAX_REPLANS_PER_MILESTONE:
+                    print(
+                        f"  [Runtime] Replan budget exhausted for {ms_id} "
+                        f"({replan_count}/{MAX_REPLANS_PER_MILESTONE}). Halting."
+                    )
+                    self._emitter.emit(
+                        "milestone.failed",
+                        milestone_id=ms_id,
+                        reason="replan_budget_exhausted",
+                        replan_count=replan_count,
+                    )
+                    break
+
+                if sig:
+                    seen.add(sig)
+                replan_counts[ms_id] = replan_count + 1
+
+                try:
+                    plan = replan_mission(
+                        plan, handoff.error_log[-1], self.model,
+                        plan_path=session.plan_path,
+                        session=telemetry_ctx,
+                        emitter=self._emitter,
+                    )
+                except Exception as exc:
+                    print(f"  [Runtime] Replan failed: {exc} — halting mission.")
+                    self._emitter.emit(
+                        "milestone.failed",
+                        milestone_id=ms_id,
+                        reason="replan_failed",
+                        error=str(exc),
+                    )
+                    break
+
                 milestones = plan.get("milestones", [])
                 self._emitter.emit(
                     "plan.updated",
                     milestones_total=len(milestones),
                     milestone_ids=[m.get("id", "?") for m in milestones],
                 )
+
+                # Re-anchor the loop BY MILESTONE ID — patch-based replans can
+                # insert/remove milestones, so index arithmetic is unreliable.
+                new_index = next(
+                    (i for i, m in enumerate(milestones) if m.get("id") == ms_id),
+                    None,
+                )
+                if new_index is None:
+                    # The Orchestrator removed this milestone — its work is
+                    # deemed unnecessary; continue with whatever followed it.
+                    print(f"  [Runtime] Milestone {ms_id} removed by replan — continuing.")
+                    self._emitter.emit("milestone.removed_by_replan", milestone_id=ms_id)
+                    continue
+                ms_index = new_index
             else:
                 print(
                     f"  [Runtime] Milestone {ms_id} FAILED after "
@@ -454,6 +556,62 @@ class MissionsRuntime:
         return result
 
     # ------------------------------------------------------------------
+    # Plan lint (Phase 1.2)
+    # ------------------------------------------------------------------
+
+    def _lint_and_repair_plan(
+        self,
+        plan: dict,
+        session: SessionContext,
+        telemetry_ctx,
+    ) -> dict:
+        """
+        Deterministically lint the plan; repair remaining issues with one
+        Orchestrator patch pass. Never blocks the mission on lint failure —
+        worst case the validator catches the flaw at runtime as before.
+        """
+        try:
+            plan, fixes, issues = lint_plan(plan)
+        except Exception as exc:
+            print(f"  [PlanLint] Linting failed (non-fatal): {exc}")
+            return plan
+
+        if fixes:
+            for fix in fixes:
+                print(f"  [PlanLint] fixed: {fix}")
+            session.plan_path.write_text(
+                json.dumps(plan, indent=2), encoding="utf-8"
+            )
+            self._emitter.emit("plan.linted", fixes=fixes)
+
+        if not issues:
+            return plan
+
+        for issue in issues:
+            print(f"  [PlanLint] issue: {issue}")
+        self._emitter.emit("plan.lint_issues", issues=issues)
+
+        try:
+            plan = repair_plan_issues(
+                plan, issues, self.model,
+                plan_path=session.plan_path,
+                session=telemetry_ctx,
+                emitter=self._emitter,
+            )
+            _, _, remaining = lint_plan(plan)
+            if remaining:
+                print(
+                    f"  [PlanLint] {len(remaining)} issue(s) remain after repair — "
+                    "continuing; the validator will guard at runtime."
+                )
+                self._emitter.emit("plan.lint_issues", issues=remaining, stage="post_repair")
+        except Exception as exc:
+            print(f"  [PlanLint] Repair pass failed (non-fatal): {exc}")
+            self._emitter.emit("plan.lint_repair_failed", error=str(exc))
+
+        return plan
+
+    # ------------------------------------------------------------------
     # Milestone execution loop (glue: Phase 2 → 3 → 4)
     # ------------------------------------------------------------------
 
@@ -473,12 +631,30 @@ class MissionsRuntime:
         is_test = _is_test_milestone(milestone)
         set_allow_test_edits(is_test)
 
+        # Write jail: scope write/patch calls to this milestone's target_files
+        # so out-of-scope edits are rejected at the tool layer (one cheap turn)
+        # instead of post-hoc by the validator (one full worker cycle).
+        begin_milestone_write_policy(milestone.get("target_files"))
+
+        # The worker's conversation survives validator FAILs within this
+        # milestone: retries resume the same thread with new feedback instead
+        # of re-deriving the workspace from scratch (cold-start cost).
+        conversation: Optional[list] = None
+
         while retry_count < MAX_RETRY_CYCLES:
             self._check_cancelled()
 
             # Phase 2 — Dynamic skill routing
             intent = f"{ms_title}: {milestone.get('description', '')}"
             curated_tools_md = self._router.fetch_curated_skills(intent, top_k=3)
+            if milestone_suggests_dependencies(milestone, plan):
+                install_skill = self._router.get_skill_by_name("install_dependency")
+                if install_skill and "install_dependency" not in curated_tools_md:
+                    curated_tools_md = (
+                        f"{install_skill}\n\n---\n\n{curated_tools_md}"
+                        if curated_tools_md
+                        else install_skill
+                    )
             print(f"\n  [Phase 2] SKILL ROUTING — top tools selected for milestone {ms_id}.")
 
             # Phase 3 — Worker implementation
@@ -493,13 +669,16 @@ class MissionsRuntime:
                 emitter=self._emitter,
                 session=self._telemetry_ctx,
                 cancel_check=self._cancel_check,
+                prior_conversation=conversation,
             )
+            conversation = worker_result.get("conversation") or conversation
 
             if worker_result.get("status") == "cancelled":
                 raise RunCancelledError("Run cancelled by user")
 
             if worker_result.get("status") == "blocked":
                 reason = worker_result.get("reason", "Unknown block")
+                clarification = str(worker_result.get("clarification", "") or "")
                 error_log.append(f"Worker blocked: {reason}")
                 print(f"  [Runtime] Worker BLOCKED: {reason}")
                 elapsed_ms = (time.perf_counter() - t_start) * 1000.0
@@ -511,6 +690,28 @@ class MissionsRuntime:
                         tool_calls=worker_result.get("tool_calls", 0),
                         elapsed_ms=round(elapsed_ms, 2),
                     )
+
+                # A block WITH a clarification request usually means the plan
+                # itself is incoherent (missing target file, contradictory
+                # contract). Route it to the Orchestrator as a REPLAN instead
+                # of dead-halting the mission — replan circuit breakers bound
+                # the loop; a bare block still halts immediately.
+                if clarification.strip():
+                    error_log.append(
+                        f"Worker blocked with clarification request: {reason} "
+                        f"| Question: {clarification} | Fix the plan so this "
+                        "milestone's target_files and validation contract match "
+                        "what the implementation actually requires."
+                    )
+                    return MilestoneHandoff(
+                        milestone_id=ms_id, title=ms_title,
+                        worker_summary=reason, files_modified=[],
+                        tool_calls_made=worker_result.get("tool_calls", 0),
+                        retry_count=retry_count, verdict="REPLAN",
+                        commit_hash="", elapsed_ms=round(elapsed_ms, 2),
+                        error_log=error_log,
+                    )
+
                 return MilestoneHandoff(
                     milestone_id=ms_id, title=ms_title,
                     worker_summary=reason, files_modified=[],
@@ -530,6 +731,7 @@ class MissionsRuntime:
                 model=self.model,
                 emitter=self._emitter,
                 session=self._telemetry_ctx,
+                plan=plan,
             )
             verdict = verdict_data.get("verdict", "FAIL")
 
@@ -586,12 +788,20 @@ class MissionsRuntime:
                     retry_count=retry_count, verdict="REPLAN",
                     commit_hash="", elapsed_ms=round(elapsed_ms, 2),
                     error_log=error_log,
+                    failure_signature=verdict_data.get("failure_signature", ""),
                 )
 
             # FAIL — log, optionally store in memory, retry
             errors       = verdict_data.get("errors", [])
             fix_guidance = verdict_data.get("fix_guidance", "")
             error_summary = f"[Retry {retry_count + 1}] Errors: {errors} | Guidance: {fix_guidance}"
+            # Hand the worker the UN-digested contract output — LLM summaries
+            # of tracebacks routinely lose the exact assertion/line the fix needs.
+            raw_output = str(verdict_data.get("contract_output", "") or "")
+            if raw_output:
+                error_summary += (
+                    f"\nRaw validation output (truncated):\n{raw_output[-1500:]}"
+                )
             error_log.append(error_summary)
             print(f"\n  [✗] Milestone {ms_id} FAILED (retry {retry_count + 1}/{MAX_RETRY_CYCLES})")
             print(f"      Errors: {'; '.join(errors[:3])}")
