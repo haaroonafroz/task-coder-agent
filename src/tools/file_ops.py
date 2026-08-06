@@ -14,9 +14,13 @@ fields or an "error" message.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
-from src.tools.paths import get_workspace_root, resolve_workspace_path
+from src.tools.paths import (
+    get_workspace_root,
+    normalize_workspace_path,
+    resolve_workspace_path,
+)
 
 
 _ALLOW_TEST_EDITS = False
@@ -24,6 +28,58 @@ def set_allow_test_edits(allowed: bool) -> None:
     """Toggle whether tools are permitted to create or modify test files."""
     global _ALLOW_TEST_EDITS
     _ALLOW_TEST_EDITS = allowed
+
+
+# ---------------------------------------------------------------------------
+# Per-milestone write policy
+#
+# The runtime scopes each milestone to its declared target_files. Writes
+# outside that set are rejected AT THE TOOL LAYER (one cheap turn) instead of
+# post-hoc by the validator (one full worker+validation cycle). Read tracking
+# supports diff-first enforcement: full rewrites of large existing files are
+# only accepted after the file was read this milestone, or with rewrite=True.
+# ---------------------------------------------------------------------------
+_ALLOWED_WRITE_PATHS: Optional[set[str]] = None
+_READ_THIS_MILESTONE: set[str] = set()
+
+REWRITE_MIN_LINES = 60  # files larger than this require read-before-rewrite
+
+
+def begin_milestone_write_policy(allowed_paths: Optional[list[str]]) -> None:
+    """Set the milestone write jail and reset read-before-rewrite tracking."""
+    global _ALLOWED_WRITE_PATHS, _READ_THIS_MILESTONE
+    if allowed_paths:
+        _ALLOWED_WRITE_PATHS = {
+            normalize_workspace_path(p) for p in allowed_paths if str(p).strip()
+        }
+    else:
+        _ALLOWED_WRITE_PATHS = None
+    _READ_THIS_MILESTONE = set()
+
+
+def clear_milestone_write_policy() -> None:
+    """Remove the write jail (e.g. after the mission loop finishes)."""
+    global _ALLOWED_WRITE_PATHS, _READ_THIS_MILESTONE
+    _ALLOWED_WRITE_PATHS = None
+    _READ_THIS_MILESTONE = set()
+
+
+def _write_jail_error(target_rel: str) -> Optional[dict[str, Any]]:
+    """Return an error dict when the path is outside the milestone jail."""
+    if _ALLOWED_WRITE_PATHS is None:
+        return None
+    if target_rel in _ALLOWED_WRITE_PATHS:
+        return None
+    allowed = sorted(_ALLOWED_WRITE_PATHS)
+    return {
+        "success": False,
+        "error": (
+            f"MILESTONE BOUNDARY BREACH: '{target_rel}' is not in this milestone's "
+            f"target_files. You may ONLY create/edit: {allowed}. "
+            "Do not add scaffolding or helper files. If the plan itself is wrong, "
+            "signal blocked and explain why."
+        ),
+    }
 
 def _path_info(abs_path: Path) -> dict[str, str]:
     """Return consistent path metadata for LLM-facing tool results."""
@@ -71,6 +127,7 @@ def read_file(file_path: str) -> dict[str, Any]:
 
     try:
         content = target.read_text(encoding="utf-8")
+        _READ_THIS_MILESTONE.add(_path_info(target)["workspace_relative_path"])
         return {"success": True, "content": content, **_path_info(target)}
     except Exception as exc:
         return {"success": False, "error": str(exc)}
@@ -80,13 +137,17 @@ def read_file(file_path: str) -> dict[str, Any]:
 # write_file
 # ---------------------------------------------------------------------------
 
-def write_file(file_path: str, content: str) -> dict[str, Any]:
+def write_file(file_path: str, content: str, rewrite: bool = False) -> dict[str, Any]:
     """
     Write content to a file, creating parent directories as needed.
 
     Args:
         file_path: Destination path relative to workspace/.
         content:   Full text content to write.
+        rewrite:   Escape hatch allowing a full rewrite of a large existing
+                   file without a prior read_file this milestone. Prefer
+                   read_file + patch_file for targeted edits — full rewrites
+                   are the slowest possible edit on local models.
 
     Returns:
         {"success": True, "message": "<confirmation>", "bytes_written": <int>, ...}
@@ -98,7 +159,11 @@ def write_file(file_path: str, content: str) -> dict[str, Any]:
         return {"success": False, "error": str(exc)}
 
     target_rel = _path_info(target)["workspace_relative_path"]
-    
+
+    jail_error = _write_jail_error(target_rel)
+    if jail_error:
+        return jail_error
+
     # Programmatic Test Freeze Guardrail
     if not _ALLOW_TEST_EDITS and ("tests/" in target_rel or "test_" in target_rel):
         return {
@@ -109,6 +174,26 @@ def write_file(file_path: str, content: str) -> dict[str, Any]:
                 " to make existing tests pass, rather than modifying the test cases."
             )
         }
+
+    # Diff-first enforcement: rewriting a large existing file without reading
+    # it first almost always means the model is guessing at current content.
+    if target.exists() and not rewrite and target_rel not in _READ_THIS_MILESTONE:
+        try:
+            existing_lines = len(target.read_text(encoding="utf-8").splitlines())
+        except OSError:
+            existing_lines = 0
+        if existing_lines > REWRITE_MIN_LINES:
+            return {
+                "success": False,
+                "error": (
+                    f"REWRITE REJECTED: '{target_rel}' already exists with "
+                    f"{existing_lines} lines. Full-file rewrites are expensive and "
+                    "error-prone. Either:\n"
+                    "1. read_file it first, then patch_file the specific section, or\n"
+                    "2. read_file it first, then write_file the full content, or\n"
+                    '3. pass "rewrite": true if a complete rewrite is truly intended.'
+                ),
+            }
 
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -147,6 +232,11 @@ def patch_file(file_path: str, search_string: str, replace_string: str) -> dict[
         return {"success": False, "error": str(exc)}
 
     target_rel = _path_info(target)["workspace_relative_path"]
+
+    jail_error = _write_jail_error(target_rel)
+    if jail_error:
+        return jail_error
+
     # Programmatic Test Freeze Guardrail (Patch-level)
     if not _ALLOW_TEST_EDITS and ("tests/" in target_rel or "test_" in target_rel):
         return {
