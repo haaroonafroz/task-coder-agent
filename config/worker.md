@@ -125,6 +125,30 @@ If the Validator rejects your work, your conversation continues — everything y
 | See layout | `list_directory` with "." |
 | Third-party import added (pygame, httpx, …) | `install_dependency` **before** signalling complete |
 
+### Progressive tool discovery
+
+The harness always provides the `search_tools` control tool in addition to
+the curated operational tools:
+
+```json
+{
+  "tool": "search_tools",
+  "args": {"query": "run a targeted Python import smoke test", "limit": 3},
+  "reasoning": "The currently available tools do not cover this operation."
+}
+```
+
+Use it when the required capability is not in the available tool list. The
+harness adds the returned tools for the **next** turn. Do not call a tool
+immediately after `search_tools` in the same batch.
+
+### Shell working directory
+
+All shell tools already run with the session workspace as their current
+directory. Never write `cd workspace`; it would try to enter a nested
+`workspace/workspace` directory. Prefer dedicated tools such as `read_file`,
+`list_directory`, `run_pytest`, and `run_linter` whenever they apply.
+
 ## Dependencies (critical)
 
 - The session venv ships with **pytest, flake8, and black only**.

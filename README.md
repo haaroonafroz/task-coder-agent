@@ -181,6 +181,10 @@ LLM_TEMPERATURE_VALIDATOR=0.2
 MAX_WORKER_BATCH_CALLS=3
 WORKER_CONTRACT_AUTORUN_MAX=8
 
+# Tool-call circuit breakers
+MAX_SAME_TOOL_FAILURES=2
+MAX_CONSECUTIVE_TOOL_FAILURES=5
+
 # Replan circuit breaker
 MAX_REPLANS_PER_MILESTONE=2
 
@@ -378,6 +382,31 @@ The Worker uses **grammar-constrained decoding** (`json_mode`) so every response
 - A status signal: `{"status": "complete" | "blocked"}`
 
 Native chat messages (system + alternating user/assistant) are sent to the LLM — never a flattened single-turn blob — so the rendered prompt stays append-only and llama.cpp's prefix cache stays hot across turns. On validator FAIL, the conversation **resumes** (not cold-restarts) with the validator's raw contract output appended.
+
+### Progressive tool discovery and enforcement
+
+The initial Qdrant retrieval provides three operational tools plus one
+always-available deterministic `search_tools` meta-tool:
+
+```json
+{
+  "tool": "search_tools",
+  "args": {"query": "run a targeted Python import smoke test", "limit": 3},
+  "reasoning": "The current tool set does not cover this operation."
+}
+```
+
+The router performs dense+sparse retrieval without a second LLM. Newly
+discovered tools are appended to the conversation and become callable on the
+next Worker turn. The active tool set is enforced at runtime, and every tool
+call is checked against a deterministic argument schema. Unknown tools and
+wrong argument names receive actionable correction messages instead of being
+executed.
+
+Tool failures are classified and emitted to `events.jsonl` with bounded,
+redacted stdout/stderr tails, return codes, timeout/policy status, duration,
+and a stable failure signature. Repeating the same failure twice or making
+five consecutive failed calls trips the Worker circuit breaker.
 
 ### Harness-side contract auto-run
 

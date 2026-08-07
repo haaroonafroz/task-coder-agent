@@ -24,14 +24,15 @@ Protocol notes (small-model optimised):
 
 from __future__ import annotations
 
-import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from src.llm_client import call_llm, ModelChoice, resolve_model_config
 from src.telemetry import span_llm_call, span_tool_call, TelemetryContext
 from src.tools import dispatch
+from src.tools.tool_contracts import validate_tool_call
 from src.tools.paths import normalize_workspace_path, normalize_shell_command, get_workspace_root
 from src.events import EventEmitter
 from src.run_control import RunCancelledError, ensure_not_cancelled
@@ -48,6 +49,11 @@ from src.sandbox.dependency_check import (
     format_missing_dependency_message,
     planned_module_names,
 )
+from src.agents.tool_diagnostics import (
+    compact_tool_result,
+    event_diagnostics,
+    tool_failure_signature,
+)
 
 # ---------------------------------------------------------------------------
 # Paths and configuration
@@ -62,7 +68,22 @@ MAX_WORKER_TOOL_CALLS = int(os.getenv("MAX_WORKER_TOOL_CALLS", "20"))
 MAX_BATCH_CALLS       = int(os.getenv("MAX_WORKER_BATCH_CALLS", "3"))
 MAX_HISTORY_TURNS     = int(os.getenv("MAX_WORKER_HISTORY_TURNS", "40"))
 AUTORUN_MAX           = int(os.getenv("WORKER_CONTRACT_AUTORUN_MAX", "8"))
+MAX_SAME_TOOL_FAILURES = int(os.getenv("MAX_SAME_TOOL_FAILURES", "2"))
+MAX_CONSECUTIVE_TOOL_FAILURES = int(
+    os.getenv("MAX_CONSECUTIVE_TOOL_FAILURES", "5")
+)
 _NON_JSON_RETRIES     = 3
+
+SEARCH_TOOLS_MD = """\
+## Control tool: search_tools
+Use this when the currently available operational tools do not cover the next
+action. Retrieval is deterministic and returns up to 3 additional tools.
+Newly discovered tools become callable on the NEXT turn, not in the same batch.
+```json
+{"tool": "search_tools", "args": {"query": "<capability needed>", "limit": 3},
+ "reasoning": "The current tool set does not include this capability."}
+```
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +102,10 @@ def run_worker(
     session: Optional[TelemetryContext] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     prior_conversation: Optional[list[dict]] = None,
+    initial_tool_names: Optional[set[str]] = None,
+    prior_active_tools: Optional[set[str]] = None,
+    tool_searcher: Optional[Callable[[str, int], dict[str, Any]]] = None,
+    prior_failure_state: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """
     Execute the worker agent loop for a single milestone.
@@ -105,6 +130,10 @@ def run_worker(
         prior_conversation: Conversation from the previous attempt of THIS
                           milestone. When provided, the worker resumes its own
                           thread instead of re-deriving context from scratch.
+        initial_tool_names: Tools selected for the first Worker turn.
+        prior_active_tools: Discovered/active tools preserved across retries.
+        tool_searcher: Deterministic callback used by the search_tools meta-tool.
+        prior_failure_state: Failure counts preserved across Worker retries.
 
     Returns:
         dict with keys: status, summary, files_modified, tool_calls, conversation.
@@ -118,6 +147,10 @@ def run_worker(
     ms = _normalize_milestone_for_worker(milestone)
     target_files = ms.get("target_files", [])
     contract = ms.get("validation_contract", {})
+
+    active_tools = set(prior_active_tools or initial_tool_names or ())
+    active_tools.add("search_tools")
+    discovered_tools: set[str] = set(active_tools) - {"search_tools"}
 
     if prior_conversation:
         conversation: list[dict] = list(prior_conversation)
@@ -146,7 +179,8 @@ def run_worker(
                 if error_feedback else ""
             )
             + f"\n## Available Tools\n{curated_tools_md}\n\n"
-            "Start now. Emit ONE JSON object (a tool call, a batch of up to "
+            + SEARCH_TOOLS_MD
+            + "Start now. Emit ONE JSON object (a tool call, a batch of up to "
             f"{MAX_BATCH_CALLS} calls, complete, or blocked)."
         )
         conversation = [{"role": "user", "content": user_turn}]
@@ -155,9 +189,19 @@ def run_worker(
     non_json_retries = 0
     autorun_count = 0
     files_modified: list[str] = []
+    failure_state = prior_failure_state or {}
+    failure_counts: dict[str, int] = dict(failure_state.get("counts", {}))
+    consecutive_failures = int(failure_state.get("consecutive", 0))
+    breaker_reason: Optional[str] = None
 
     def _finish(result: dict) -> dict:
         result["conversation"] = conversation
+        result["active_tools"] = sorted(active_tools)
+        result["discovered_tools"] = sorted(discovered_tools)
+        result["failure_state"] = {
+            "counts": failure_counts,
+            "consecutive": consecutive_failures,
+        }
         return result
 
     while tool_call_count < MAX_WORKER_TOOL_CALLS:
@@ -335,13 +379,62 @@ def run_worker(
 
         batch_results: list[str] = []
         wrote_files = False
+        discovery_in_batch = False
         for call in calls:
             tool_name = call.get("tool", "")
+            if not isinstance(tool_name, str):
+                tool_name = repr(tool_name)
             tool_args = call.get("args", {}) or {}
             reasoning = call.get("reasoning", "")
 
             if not tool_name:
                 batch_results.append("Missing \"tool\" key in one call — skipped.")
+                continue
+
+            if discovery_in_batch:
+                batch_results.append(
+                    f"Tool `{tool_name}` was not executed because search_tools "
+                    "must complete before newly discovered tools can be called."
+                )
+                continue
+
+            contract_error = validate_tool_call(
+                tool_name,
+                tool_args,
+                active_tools=active_tools,
+            )
+            if contract_error:
+                tool_result = contract_error
+                tool_call_count += 1
+                batch_results.append(
+                    f"Tool result for `{tool_name}`:\n```json\n"
+                    f"{compact_tool_result(tool_result)}\n```"
+                )
+                if emitter:
+                    emitter.emit(
+                        "tool.result",
+                        milestone_id=ms_id,
+                        tool=tool_name,
+                        success=False,
+                        call_index=tool_call_count,
+                        **event_diagnostics(tool_name, tool_args, tool_result, 0.0),
+                    )
+                signature = tool_failure_signature(tool_name, tool_args, tool_result)
+                failure_counts[signature] = failure_counts.get(signature, 0) + 1
+                consecutive_failures += 1
+                if failure_counts[signature] >= MAX_SAME_TOOL_FAILURES:
+                    breaker_reason = (
+                        f"Repeated identical tool failure ({signature}) for "
+                        f"`{tool_name}`. Do not retry the same call; use "
+                        "search_tools or change the arguments."
+                    )
+                    break
+                if consecutive_failures >= MAX_CONSECUTIVE_TOOL_FAILURES:
+                    breaker_reason = (
+                        f"{MAX_CONSECUTIVE_TOOL_FAILURES} consecutive tool calls "
+                        "failed. Stop guessing and request clarification."
+                    )
+                    break
                 continue
 
             print(
@@ -359,10 +452,39 @@ def run_worker(
                     call_index=tool_call_count + 1,
                 )
 
-            with span_tool_call(tool_name, ms_id, session=session):
-                tool_result = dispatch(tool_name, tool_args)
+            started = time.perf_counter()
+            if tool_name == "search_tools":
+                limit = int(tool_args.get("limit", 3))
+                if tool_searcher is None:
+                    tool_result = {
+                        "success": False,
+                        "error_category": "tool_discovery_unavailable",
+                        "error": "Tool discovery is unavailable for this run.",
+                    }
+                else:
+                    with span_tool_call(tool_name, ms_id, session=session):
+                        tool_result = tool_searcher(
+                            str(tool_args["query"]),
+                            max(1, min(limit, 5)),
+                        )
+                    discovery_in_batch = True
+                    new_tools = set(tool_result.get("tools", []))
+                    active_tools.update(new_tools)
+                    discovered_tools.update(new_tools)
+                    if emitter:
+                        emitter.emit(
+                            "tool.discovery",
+                            milestone_id=ms_id,
+                            query=tool_args["query"],
+                            tools=sorted(new_tools),
+                            count=len(new_tools),
+                        )
+            else:
+                with span_tool_call(tool_name, ms_id, session=session):
+                    tool_result = dispatch(tool_name, tool_args)
 
             tool_call_count += 1
+            duration_ms = (time.perf_counter() - started) * 1000.0
 
             if emitter:
                 emitter.emit(
@@ -371,6 +493,9 @@ def run_worker(
                     tool=tool_name,
                     success=tool_result.get("success", False),
                     call_index=tool_call_count,
+                    **event_diagnostics(
+                        tool_name, tool_args, tool_result, duration_ms
+                    ),
                 )
 
             if tool_name in ("write_file", "patch_file") and tool_result.get("success"):
@@ -379,17 +504,42 @@ def run_worker(
                 if fpath:
                     files_modified.append(fpath)
 
-            result_text = json.dumps(tool_result, indent=2)[:4000]
+            result_text = compact_tool_result(tool_result)
             batch_results.append(
                 f"Tool result for `{tool_name}`:\n```json\n{result_text}\n```"
             )
 
-            if tool_call_count >= MAX_WORKER_TOOL_CALLS:
+            if tool_result.get("success"):
+                consecutive_failures = 0
+            else:
+                signature = tool_failure_signature(tool_name, tool_args, tool_result)
+                failure_counts[signature] = failure_counts.get(signature, 0) + 1
+                consecutive_failures += 1
+                if failure_counts[signature] >= MAX_SAME_TOOL_FAILURES:
+                    breaker_reason = (
+                        f"Repeated identical tool failure ({signature}) for "
+                        f"`{tool_name}`. Do not retry the same call; use "
+                        "search_tools or change the arguments."
+                    )
+                elif consecutive_failures >= MAX_CONSECUTIVE_TOOL_FAILURES:
+                    breaker_reason = (
+                        f"{MAX_CONSECUTIVE_TOOL_FAILURES} consecutive tool calls "
+                        "failed. Stop guessing and request clarification."
+                    )
+
+            if breaker_reason or tool_call_count >= MAX_WORKER_TOOL_CALLS:
                 break
 
         next_msg = "\n\n".join(batch_results) if batch_results else "(no tool calls executed)"
         if call_note:
             next_msg += f"\n\n{call_note}"
+        if breaker_reason:
+            next_msg += (
+                f"\n\n## TOOL FAILURE CIRCUIT BREAKER\n{breaker_reason}\n"
+                "Do not repeat the failed operation. If another capability is "
+                "needed, call search_tools; otherwise signal blocked with a "
+                "specific clarification request."
+            )
 
         # Harness-side contract auto-run: test feedback with zero LLM turns.
         if wrote_files and autorun_count < AUTORUN_MAX:
@@ -412,6 +562,25 @@ def run_worker(
 
         conversation.append({"role": "assistant", "content": raw})
         conversation.append({"role": "user", "content": next_msg})
+
+        if breaker_reason:
+            if emitter:
+                emitter.emit(
+                    "worker.tool_failure_breaker",
+                    milestone_id=ms_id,
+                    reason=breaker_reason,
+                    consecutive_failures=consecutive_failures,
+                    distinct_failures=len(failure_counts),
+                )
+            return _finish({
+                "status": "blocked",
+                "reason": breaker_reason,
+                "needs_clarification": (
+                    "Choose a different available tool or provide the missing "
+                    "workspace/contract information."
+                ),
+                "tool_calls": tool_call_count,
+            })
 
     # Budget exhausted
     ok, missing = target_files_exist(target_files)

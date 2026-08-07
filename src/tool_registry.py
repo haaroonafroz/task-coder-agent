@@ -334,6 +334,37 @@ class DynamicToolRouter:
 
         return self._keyword_fallback(task_description, top_k)
 
+    def search_tools(
+        self,
+        query: str,
+        top_k: int = 3,
+        rrf_k: int = 60,
+    ) -> dict:
+        """
+        Structured progressive-disclosure lookup for the Worker meta-tool.
+
+        Retrieval remains deterministic: no secondary LLM is invoked. The
+        existing Markdown method is retained for compatibility, while this
+        method also returns the canonical tool names so the runtime can expand
+        its active-tool allowlist after discovery.
+        """
+        top_k = max(1, min(int(top_k), 5))
+        documentation = self.fetch_curated_skills(query, top_k=top_k, rrf_k=rrf_k)
+        selected: list[dict] = []
+        for skill in self._skills:
+            if skill["raw_markdown"] in documentation:
+                selected.append({
+                    "name": skill["name"],
+                    "documentation": skill["raw_markdown"],
+                })
+        return {
+            "success": True,
+            "query": query,
+            "tools": [item["name"] for item in selected],
+            "documentation": documentation,
+            "count": len(selected),
+        }
+
     def _hybrid_search(self, query: str, top_k: int, rrf_k: int) -> str:
         dense_vec = self._encode_query(query)
         query_tokens = self._tokenize(query)

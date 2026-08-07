@@ -164,7 +164,7 @@
 
 <!-- SKILL_START: run_shellscript -->
 ## Skill Name: run_shellscript
-- **Description:** Executes an arbitrary shell script or command inside the workspace directory with a configurable timeout. Useful for build steps, data generation, or environment checks that don't map to a dedicated tool.
+- **Description:** Executes an arbitrary shell script or command inside the workspace directory with a configurable timeout. Do not run `cd workspace`; tool calls already start at the workspace root. Useful for build steps, data generation, or environment checks that don't map to a dedicated tool.
 - **Keywords:** shell, bash, script, execute
 - **Parameters:**
   - `script` (string): The shell command or multi-line bash script to run.
@@ -173,6 +173,7 @@
 - **When to use:** Running build scripts, initialising a database schema, generating fixtures, or any bespoke validation step not covered by run_pytest or run_linter.
 - **Example:**
   ```json
-  {"tool": "run_shellscript", "args": {"script": "cd workspace && python -c 'import src.app; print(src.app.VERSION)'", "timeout": 10}, "reasoning": "Quick smoke-test that the module is importable."}
+  {
+  "tool": "run_shellscript", "args": {"script": "python -c 'import app; print(app.VERSION)'", "timeout": 10},"reasoning": "Check that the local app module imports successfully."}
   ```
 <!-- SKILL_END -->

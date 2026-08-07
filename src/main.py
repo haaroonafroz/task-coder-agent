@@ -640,13 +640,24 @@ class MissionsRuntime:
         # milestone: retries resume the same thread with new feedback instead
         # of re-deriving the workspace from scratch (cold-start cost).
         conversation: Optional[list] = None
+        active_tools: set[str] = set()
+        tool_failure_state: dict[str, Any] = {}
 
         while retry_count < MAX_RETRY_CYCLES:
             self._check_cancelled()
 
             # Phase 2 — Dynamic skill routing
             intent = f"{ms_title}: {milestone.get('description', '')}"
-            curated_tools_md = self._router.fetch_curated_skills(intent, top_k=3)
+            initial_discovery = self._router.search_tools(intent, top_k=3)
+            curated_tools_md = initial_discovery.get("documentation", "")
+            active_tools.update(initial_discovery.get("tools", []))
+            self._emitter.emit(
+                "tool.routing",
+                milestone_id=ms_id,
+                query=intent,
+                tools=sorted(initial_discovery.get("tools", [])),
+                count=initial_discovery.get("count", 0),
+            )
             if milestone_suggests_dependencies(milestone, plan):
                 install_skill = self._router.get_skill_by_name("install_dependency")
                 if install_skill and "install_dependency" not in curated_tools_md:
@@ -655,6 +666,7 @@ class MissionsRuntime:
                         if curated_tools_md
                         else install_skill
                     )
+                    active_tools.add("install_dependency")
             print(f"\n  [Phase 2] SKILL ROUTING — top tools selected for milestone {ms_id}.")
 
             # Phase 3 — Worker implementation
@@ -670,8 +682,16 @@ class MissionsRuntime:
                 session=self._telemetry_ctx,
                 cancel_check=self._cancel_check,
                 prior_conversation=conversation,
+                initial_tool_names=active_tools,
+                prior_active_tools=active_tools,
+                tool_searcher=self._router.search_tools,
+                prior_failure_state=tool_failure_state,
             )
             conversation = worker_result.get("conversation") or conversation
+            active_tools.update(worker_result.get("active_tools", []))
+            tool_failure_state = worker_result.get(
+                "failure_state", tool_failure_state
+            )
 
             if worker_result.get("status") == "cancelled":
                 raise RunCancelledError("Run cancelled by user")
