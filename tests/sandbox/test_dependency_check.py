@@ -122,3 +122,42 @@ def test_missing_dependency_fail_ok_for_stdlib_only(tmp_path: Path) -> None:
             result = _missing_dependency_fail(milestone, ["main.py"])
 
     assert result is None
+
+
+def test_planned_module_names_include_scaffold_public_api() -> None:
+    from src.sandbox.dependency_check import planned_module_names
+
+    plan = {
+        "milestones": [
+            {
+                "id": "M1",
+                "target_files": ["tests/test_ui.py"],
+                "validation_contract": {
+                    "type": "test_scaffold",
+                    "public_api": [{"module": "kanban_ui", "name": "render_board"}],
+                    "required_imports": ["kanban_ui.render_board"],
+                },
+            }
+        ]
+    }
+
+    assert "kanban_ui" in planned_module_names(plan)
+
+
+def test_scaffold_dependency_phase_does_not_request_pip_install(tmp_path: Path) -> None:
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    (ws / "tests").mkdir()
+    (ws / "tests" / "test_ui.py").write_text(
+        "from kanban_ui import render_board\n",
+        encoding="utf-8",
+    )
+
+    report = check_target_file_dependencies(
+        ["tests/test_ui.py"],
+        workspace_root=ws,
+        phase="test_scaffold",
+    )
+
+    assert report.ok is True
+    assert report.missing_packages == []

@@ -50,6 +50,20 @@ def test_valid_shell_call_is_accepted() -> None:
     ) is None
 
 
+def test_serve_app_accepts_contract_entry_point() -> None:
+    assert validate_tool_call(
+        "serve_app",
+        {
+            "action": "start",
+            "kind": "generic",
+            "port": 9000,
+            "entry_point": "index.html",
+            "command": ["python", "-m", "http.server", "9000"],
+        },
+        active_tools={"serve_app"},
+    ) is None
+
+
 def test_search_tools_limit_is_bounded() -> None:
     result = validate_tool_call(
         "search_tools",

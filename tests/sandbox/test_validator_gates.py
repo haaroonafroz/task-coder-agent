@@ -8,8 +8,8 @@ from src.agents.validator import (
     _detect_collect_only_pass,
     _detect_policy_denial_replan,
     _pytest_ran_in_output,
-    _test_scaffold_contract_replan,
     _target_file_boundary_fail,
+    _unauthorized_test_edits,
 )
 
 
@@ -119,32 +119,6 @@ def test_policy_denial_not_triggered_without_flag() -> None:
     assert _detect_policy_denial_replan({}, {}, tool_result, "") is None
 
 
-def test_test_scaffold_milestone_requires_scaffold_contract() -> None:
-    milestone = {
-        "id": "M1",
-        "target_files": ["tests/test_x.py"],
-        "validation_contract": {
-            "type": "pytest",
-            "command": "python -m pytest tests/test_x.py --collect-only -q",
-        },
-    }
-
-    result = _test_scaffold_contract_replan(milestone, True)
-
-    assert result is not None
-    assert result["verdict"] == "REPLAN"
-    assert "test_scaffold" in result["replan_guidance"]
-
-
-def test_test_scaffold_contract_replan_allows_scaffold_type() -> None:
-    milestone = {
-        "id": "M1",
-        "target_files": ["tests/test_x.py"],
-        "validation_contract": {"type": "test_scaffold"},
-    }
-
-    assert _test_scaffold_contract_replan(milestone, True) is None
-
 
 def test_target_file_boundary_rejects_out_of_scope_edits() -> None:
     milestone = {"id": "M1", "target_files": ["tests/test_x.py"]}
@@ -162,3 +136,21 @@ def test_target_file_boundary_allows_workspace_prefix_equivalence() -> None:
     worker = {"files_modified": ["workspace/tests/test_x.py"]}
 
     assert _target_file_boundary_fail(milestone, worker) is None
+
+
+def test_new_agent_owned_test_is_not_spec_gaming() -> None:
+    worker = {
+        "files_modified": ["tests/test_roman.py"],
+        "created_files": ["tests/test_roman.py"],
+    }
+
+    assert _unauthorized_test_edits(worker) == []
+
+
+def test_existing_acceptance_test_edit_is_spec_gaming() -> None:
+    worker = {
+        "files_modified": ["tests/test_existing.py"],
+        "created_files": [],
+    }
+
+    assert _unauthorized_test_edits(worker) == ["tests/test_existing.py"]
