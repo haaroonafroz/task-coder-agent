@@ -42,6 +42,8 @@ from src.agents.test_scaffold_validator import (
     red_phase_contract,
     validate_test_scaffold_structure,
 )
+from src.agents.ui_validation import run_ui_smoke_contract
+from src.agents.validation_compiler import compile_validation_contract
 
 # ---------------------------------------------------------------------------
 # Paths and configuration
@@ -53,6 +55,19 @@ _VALIDATOR_MD = (_CONFIG_DIR / "validator.md").read_text()
 
 MAX_TOKENS_VALIDATOR = int(os.getenv("MAX_TOKENS_VALIDATOR", "48000"))
 MAX_RETRY_CYCLES     = 3
+
+
+def _unauthorized_test_edits(worker_result: dict) -> list[str]:
+    """Return modified tests that were not created during this milestone."""
+    created_files = {
+        _normalize_workspace_rel(path)
+        for path in worker_result.get("created_files", [])
+    }
+    return [
+        path for path in worker_result.get("files_modified", [])
+        if ("tests/" in path or "test_" in path)
+        and _normalize_workspace_rel(path) not in created_files
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -90,16 +105,24 @@ def run_validator(
         A verdict dict with key "verdict": "PASS" | "FAIL" | "REPLAN".
     """
     ms_id = milestone.get("id", "?")
-    contract = milestone.get("validation_contract", {})
+    contract, compile_error = compile_validation_contract(milestone)
+    if compile_error:
+        return {
+            "verdict": "REPLAN",
+            "milestone_id": ms_id,
+            "errors": [compile_error],
+            "root_cause": "The work packet cannot be compiled into validation checks.",
+            "replan_guidance": (
+                "Repair acceptance_criteria and validation_profile in the packet; "
+                "do not add a validation_contract."
+            ),
+        }
+    contract = contract or {}
     command = contract.get("command", "")
     target_files = milestone.get("target_files", [])
 
     # --- Structural audit: reject unauthorized test file edits ---------------
-    modified_files = worker_result.get("files_modified", [])
-    unauthorized_edits = [
-        f for f in modified_files
-        if "tests/" in f or "test_" in f
-    ]
+    unauthorized_edits = _unauthorized_test_edits(worker_result)
     if unauthorized_edits and not is_test_milestone:
         print(
             f"    [Validator] REJECTED: Worker illegally modified test files: "
@@ -155,26 +178,22 @@ def run_validator(
 
     contract_type = str(contract.get("type", "")).lower()
 
-    # --- Phase-aware test scaffold validation --------------------------------
-    scaffold_replan = _test_scaffold_contract_replan(milestone, is_test_milestone)
-    if scaffold_replan:
-        return scaffold_replan
-
-    if contract_type == "test_scaffold":
+    if contract_type == "ui_smoke":
         if emitter:
-            emitter.emit("validation.started", milestone_id=ms_id, command=command)
-        scaffold_verdict = _run_test_scaffold_contract(
-            milestone=milestone,
-            emitter=emitter,
-        )
+            emitter.emit(
+                "validation.started",
+                milestone_id=ms_id,
+                contract_type="ui_smoke",
+            )
+        ui_verdict = run_ui_smoke_contract(contract)
         if emitter:
             emitter.emit(
                 "validation.finished",
                 milestone_id=ms_id,
-                verdict=scaffold_verdict.get("verdict", "FAIL"),
-                path="test_scaffold",
+                verdict=ui_verdict.get("verdict", "FAIL"),
+                path="ui_smoke",
             )
-        return scaffold_verdict
+        return ui_verdict
 
     if emitter:
         emitter.emit("validation.started", milestone_id=ms_id, command=command)
@@ -252,7 +271,7 @@ def run_validator(
                 reason="deterministic",
             )
         return _with_failure_context(replan)
-    
+
     # --- TDD red-phase PASS (test-scaffolding milestone) ---------------------
     tdd_pass = _detect_tdd_red_pass(
         milestone, worker_result, contract_output, returncode, is_test_milestone
@@ -273,7 +292,7 @@ def run_validator(
         milestone, worker_result, contract_output, is_test_milestone
     )
     if skip_fail:
-        print(f"    [Validator] Spec-gaming FAIL: all tests skipped")
+        print("    [Validator] Spec-gaming FAIL: all tests skipped")
         if emitter:
             emitter.emit(
                 "validation.finished",
@@ -332,6 +351,8 @@ def run_validator(
         f"**Title**: {milestone.get('title', '')}\n"
         f"**Description**: {milestone.get('description', '')}\n"
         f"**Target files (worker may ONLY edit these)**: {target_files}\n\n"
+        f"**Acceptance criteria**: {json.dumps(milestone.get('acceptance_criteria', []))}\n"
+        f"**Validation profile**: {milestone.get('validation_profile', 'auto')}\n\n"
         f"**Test-scaffolding milestone**: {is_test_milestone}\n\n"
         f"## Validation Contract\n```json\n{json.dumps(contract, indent=2)}\n```\n\n"
         f"## Contract Execution Output\n```\n{contract_output or '(no command run)'}\n```\n\n"
@@ -349,7 +370,7 @@ def run_validator(
         )
 
     prompt += (
-        f"\nEmit your PASS, FAIL, or REPLAN JSON verdict now:"
+        "\nEmit your PASS, FAIL, or REPLAN JSON verdict now:"
     )
 
     span_model = (

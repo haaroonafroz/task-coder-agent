@@ -18,7 +18,10 @@ one corrective re-prompt instead of crashing the mission.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -144,6 +147,9 @@ def run_orchestration(
     model: ModelChoice,
     plan_path: Path = _LEGACY_PLAN_PATH,
     mission_dir: Path = _LEGACY_MISSION_DIR,
+    run_kind: str = "auto",
+    parent_plan_id: Optional[str] = None,
+    triage_report: Optional[dict[str, Any]] = None,
     session: Optional[TelemetryContext] = None,
     emitter: Optional[EventEmitter] = None,
 ) -> dict:
@@ -151,8 +157,10 @@ def run_orchestration(
     Decompose a user request into a structured milestone plan.
 
     Behaviour:
-      - If ``plan_path`` exists with pending milestones, resumes it
-        without calling the LLM (crash-recovery path).
+      - If ``run_kind`` is ``resume`` and ``plan_path`` has pending
+        milestones, resumes it without calling the LLM.
+      - ``repair`` and ``new`` always create a fresh plan while preserving
+        the previous plan in the session's ``plans/`` history directory.
       - Otherwise calls the Orchestrator LLM and persists the new plan.
 
     Returns:
@@ -169,7 +177,16 @@ def run_orchestration(
                     m for m in existing.get("milestones", [])
                     if m.get("status") != "completed"
                 ]
-                if pending:
+                if pending and run_kind in ("auto", "resume"):
+                    existing.setdefault(
+                        "plan_id",
+                        str(existing.get("mission_id") or f"legacy-{uuid.uuid4().hex[:12]}"),
+                    )
+                    existing.setdefault("run_kind", "resume")
+                    plan_path.write_text(
+                        json.dumps(existing, indent=2),
+                        encoding="utf-8",
+                    )
                     print(
                         f"  [Orchestrator] Resuming existing plan "
                         f"'{existing.get('title')}' — {len(pending)} milestones pending."
@@ -183,9 +200,16 @@ def run_orchestration(
     prompt = (
         f"{_ORCHESTRATOR_MD}\n\n"
         f"---\n\n"
+        f"## Run Mode\n{run_kind}\n\n"
+        f"## Parent Plan\n{parent_plan_id or '(none)'}\n\n"
         f"User Request:\n{user_request}\n\n"
-        f"Output the JSON plan now:"
     )
+    if triage_report:
+        prompt += (
+            "## Read-only Triage Report\n"
+            f"```json\n{json.dumps(triage_report, indent=2)[:12000]}\n```\n\n"
+        )
+    prompt += "Output the JSON plan now:"
 
     def _validate_plan(parsed: dict) -> Optional[str]:
         milestones = parsed.get("milestones")
@@ -196,10 +220,26 @@ def run_orchestration(
                 return f"milestone #{i + 1} is missing an 'id'"
             if not ms.get("target_files"):
                 return f"milestone '{ms.get('id')}' must list 'target_files'"
-            if not isinstance(ms.get("validation_contract"), dict):
+            criteria = ms.get("acceptance_criteria")
+            if (
+                not isinstance(criteria, list)
+                or not criteria
+                or any(not isinstance(item, str) or not item.strip() for item in criteria)
+            ):
                 return (
-                    f"milestone '{ms.get('id')}' must include a "
-                    "'validation_contract' object"
+                    f"milestone '{ms.get('id')}' must include a non-empty "
+                    "'acceptance_criteria' list of non-empty strings"
+                )
+            profile = str(ms.get("validation_profile", "auto")).lower()
+            if profile not in {"auto", "ui", "python", "lint", "structural"}:
+                return (
+                    f"milestone '{ms.get('id')}' has unsupported "
+                    f"validation_profile '{profile}'"
+                )
+            if "validation_contract" in ms:
+                return (
+                    f"milestone '{ms.get('id')}' must not include "
+                    "'validation_contract'; provide high-level intent only"
                 )
         return None
 
@@ -214,10 +254,44 @@ def run_orchestration(
         validate=_validate_plan,
     )
 
+    old_plan: Optional[dict[str, Any]] = None
+    if plan_path.exists() and run_kind not in ("auto", "resume"):
+        try:
+            old_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            old_plan = None
+    if old_plan:
+        _archive_plan(old_plan, mission_dir)
+
+    model_mission_id = str(plan.get("mission_id") or "").strip()
+    if run_kind == "repair" or not model_mission_id:
+        model_mission_id = f"{run_kind}-{uuid.uuid4().hex[:10]}"
+    plan["mission_id"] = model_mission_id
+    plan["plan_id"] = f"{run_kind}-{uuid.uuid4().hex[:12]}"
+    plan["run_kind"] = run_kind
+    plan["parent_plan_id"] = parent_plan_id
+    plan["request_hash"] = hashlib.sha256(
+        user_request.encode("utf-8")
+    ).hexdigest()[:16]
+
     mission_dir.mkdir(parents=True, exist_ok=True)
     plan_path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
     print(f"  [Orchestrator] Plan saved → {plan_path}")
     return plan
+
+
+def _archive_plan(plan: dict[str, Any], mission_dir: Path) -> None:
+    """Persist a completed or superseded plan before replacing plan.json."""
+    plan_id = str(
+        plan.get("plan_id")
+        or plan.get("mission_id")
+        or f"legacy-{int(time.time())}"
+    )
+    history_dir = mission_dir / "plans"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    destination = history_dir / f"{plan_id}.json"
+    if not destination.exists():
+        destination.write_text(json.dumps(plan, indent=2), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -229,20 +303,23 @@ _PATCH_FORMAT_GUIDE = """\
 
 Output a single JSON object with an "operations" list. Supported operations:
 
-1. Fix/replace a milestone's validation contract (MOST replans need only this):
-   {"op": "set_contract", "milestone_id": "M3", "validation_contract": {...complete contract object...}}
-
-2. Update milestone fields:
-   {"op": "update_milestone", "milestone_id": "M3", "fields": {"title": "...", "description": "...", "target_files": ["..."]}}
+1. Update milestone intent:
+   {"op": "update_milestone", "milestone_id": "M3", "fields": {
+     "acceptance_criteria": ["..."], "validation_profile": "python"
+   }}
 
 3. Insert a new milestone after an existing one:
-   {"op": "insert_milestone_after", "after_id": "M2", "milestone": {"id": "M2a", "title": "...", "description": "...", "depends_on": ["M2"], "target_files": ["..."], "validation_contract": {...}}}
+   {"op": "insert_milestone_after", "after_id": "M2", "milestone": {
+     "id": "M2a", "target_files": ["..."],
+     "acceptance_criteria": ["..."], "validation_profile": "auto"
+   }}
 
 4. Remove a pending milestone:
    {"op": "remove_milestone", "milestone_id": "M4"}
 
 Rules:
-- Use the SMALLEST patch that fixes the flaw. Prefer set_contract.
+- Use the SMALLEST patch that fixes the flaw. Update intent, not executable
+  validation details.
 - Milestones with status "completed" are immutable — the harness rejects patches touching them.
 - Milestone ids must stay unique; never reorder the plan yourself.
 """
@@ -259,9 +336,10 @@ def _replan_prompt(current_plan: dict, replan_guidance: str) -> str:
         f"### Harness Constraints (non-negotiable)\n"
         f"- pytest, flake8, and black are pre-installed in the session venv at activation.\n"
         f"- NEVER add Environment Setup, pip install, or tooling verification milestones.\n"
-        f"- Mission-specific packages (pygame, httpx, …) are installed by the worker via install_dependency — not via validation commands.\n"
-        f"- If a milestone imports third-party packages, use import smoke tests in validation_contract.command (not py_compile alone).\n"
-        f"- Fix validation_contract commands/paths only; do not replan for missing pytest.\n\n"
+        f"- Mission-specific packages are installed by the worker via "
+        f"install_dependency, not via validation commands.\n"
+        f"- Keep acceptance criteria observable and let the Validator choose commands.\n"
+        f"- Repair packet fields only; do not add executable validation contracts.\n\n"
         f"{_PATCH_FORMAT_GUIDE}\n"
         f"Output the plan patch JSON now:"
     )

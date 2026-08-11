@@ -95,6 +95,25 @@ Only when every Target File exists:
 
 `files_modified` must list paths from Target Files only.
 
+### Plan boundary
+The worker does not repair packets or validation strategy. If the assigned
+scope is insufficient, use `request_scope`; otherwise implement the packet and
+signal `complete`, `blocked`, or `request_scope`.
+
+### Output format — request scope
+Use when the milestone is coherent but cannot be completed without additional
+workspace files. Ask for scope instead of guessing, installing a local module,
+or writing a workaround into a test:
+
+```json
+{
+  "status": "request_scope",
+  "reason": "The implementation requires a helper module not in the current scope.",
+  "requested_paths": ["src/helpers.py"],
+  "requested_capabilities": []
+}
+```
+
 ### Output format — stuck
 Use only if you cannot proceed after trying tools:
 
@@ -123,7 +142,14 @@ If the Validator rejects your work, your conversation continues — everything y
 |Small edit to existing file | `read_file` then `patch_file` |
 | Full rewrite (rare) | `read_file` then `write_file`, or `"rewrite": true` |
 | See layout | `list_directory` with "." |
+| Local UI smoke check | `serve_app` then `inspect_ui` (ports **9000–9049** only) |
+| Too many harness servers | `serve_app` with `"action": "list"`, then `"action": "stop"` |
 | Third-party import added (pygame, httpx, …) | `install_dependency` **before** signalling complete |
+
+When you start a server for manual UI checks, the harness stops any servers
+**you** started when this milestone finishes (`complete`, `blocked`, or budget
+exhausted). Prefer stopping servers yourself once checks pass; do not leave
+servers running across turns unless you still need them.
 
 ### Progressive tool discovery
 
@@ -163,5 +189,5 @@ directory. Never write `cd workspace`; it would try to enter a nested
 - Python source code is allowed ONLY inside JSON string values (e.g. `write_file` → `content`).
 - Implement only what the milestone and validation contract require.
 - Code toward the validation command — read Validation Contract in your context.
-- **NEVER MODIFY TESTS**: You are strictly forbidden from modifying any files starting with `test_` or located inside the `tests/` directory. If validation tests are failing, fix the implementation. If you change a test file to pass validation, the Adversarial Validator will reject your submission immediately.
-- **TDD Pure Focus**: If tests are failing, the error lies in source code implementation. Debug and fix source files until they conform to the unmodified test suite.
+- **Protected tests**: Do not modify harness-owned or existing acceptance tests during implementation milestones. Test-scaffold milestones and explicitly agent-owned tests may be edited when their packet allows it.
+- If a required source/helper file is outside the packet, use `request_scope`; do not define production substitutes inside tests or install a local module as a package.

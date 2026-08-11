@@ -1,8 +1,9 @@
 """
 Worker Agent — Phase 3.
 
-Runs a multi-turn tool-call conversation loop until the worker signals
-"complete" or "blocked", or the per-milestone tool call budget is exhausted.
+    Runs a multi-turn tool-call conversation loop until the worker signals
+"complete", "blocked", or "request_scope", or the per-milestone tool call
+budget is exhausted.
 
 Protocol notes (small-model optimised):
 
@@ -32,8 +33,9 @@ from typing import Any, Callable, Optional
 from src.llm_client import call_llm, ModelChoice, resolve_model_config
 from src.telemetry import span_llm_call, span_tool_call, TelemetryContext
 from src.tools import dispatch
+from src.tools.file_ops import get_created_files
 from src.tools.tool_contracts import validate_tool_call
-from src.tools.paths import normalize_workspace_path, normalize_shell_command, get_workspace_root
+from src.tools.paths import normalize_workspace_path, get_workspace_root
 from src.events import EventEmitter
 from src.run_control import RunCancelledError, ensure_not_cancelled
 from src.agents.utils import (
@@ -44,6 +46,8 @@ from src.agents.utils import (
 )
 from src.sandbox.commands import execute_contract
 from src.sandbox.context import get_sandbox_context
+from src.sandbox.process_manager import stop_server
+from src.agents.validation_compiler import compile_validation_contract
 from src.sandbox.dependency_check import (
     check_target_file_dependencies,
     format_missing_dependency_message,
@@ -66,8 +70,10 @@ _WORKER_MD = (_CONFIG_DIR / "worker.md").read_text()
 MAX_TOKENS_WORKER     = int(os.getenv("MAX_TOKENS_WORKER", "12288"))
 MAX_WORKER_TOOL_CALLS = int(os.getenv("MAX_WORKER_TOOL_CALLS", "20"))
 MAX_BATCH_CALLS       = int(os.getenv("MAX_WORKER_BATCH_CALLS", "3"))
-MAX_HISTORY_TURNS     = int(os.getenv("MAX_WORKER_HISTORY_TURNS", "40"))
+MAX_HISTORY_TURNS     = int(os.getenv("MAX_WORKER_HISTORY_TURNS", "16"))
 AUTORUN_MAX           = int(os.getenv("WORKER_CONTRACT_AUTORUN_MAX", "8"))
+AUTORUN_STDOUT_CHARS  = int(os.getenv("WORKER_AUTORUN_STDOUT_CHARS", "600"))
+AUTORUN_STDERR_CHARS  = int(os.getenv("WORKER_AUTORUN_STDERR_CHARS", "400"))
 MAX_SAME_TOOL_FAILURES = int(os.getenv("MAX_SAME_TOOL_FAILURES", "2"))
 MAX_CONSECUTIVE_TOOL_FAILURES = int(
     os.getenv("MAX_CONSECUTIVE_TOOL_FAILURES", "5")
@@ -112,8 +118,8 @@ def run_worker(
 
     The worker is given the milestone brief, workspace context, curated tools,
     and (on retries) error feedback from the Validator. It emits JSON tool
-    calls (single or batched) until it signals complete/blocked or exhausts
-    its budget.
+    calls (single or batched) until it signals complete, request_scope,
+    blocked, or exhausts its budget.
 
     Args:
         milestone:        The milestone dict from the plan.
@@ -146,7 +152,8 @@ def run_worker(
 
     ms = _normalize_milestone_for_worker(milestone)
     target_files = ms.get("target_files", [])
-    contract = ms.get("validation_contract", {})
+    contract, _compile_error = compile_validation_contract(milestone)
+    contract = contract or {}
 
     active_tools = set(prior_active_tools or initial_tool_names or ())
     active_tools.add("search_tools")
@@ -181,7 +188,7 @@ def run_worker(
             + f"\n## Available Tools\n{curated_tools_md}\n\n"
             + SEARCH_TOOLS_MD
             + "Start now. Emit ONE JSON object (a tool call, a batch of up to "
-            f"{MAX_BATCH_CALLS} calls, complete, or blocked)."
+            f"{MAX_BATCH_CALLS} calls, complete, request_scope, or blocked)."
         )
         conversation = [{"role": "user", "content": user_turn}]
 
@@ -193,9 +200,17 @@ def run_worker(
     failure_counts: dict[str, int] = dict(failure_state.get("counts", {}))
     consecutive_failures = int(failure_state.get("consecutive", 0))
     breaker_reason: Optional[str] = None
+    started_server_ids: set[str] = set()
+
+    def _cleanup_started_servers() -> None:
+        for server_id in list(started_server_ids):
+            stop_server(server_id)
+            started_server_ids.discard(server_id)
 
     def _finish(result: dict) -> dict:
+        _cleanup_started_servers()
         result["conversation"] = conversation
+        result["created_files"] = get_created_files()
         result["active_tools"] = sorted(active_tools)
         result["discovered_tools"] = sorted(discovered_tools)
         result["failure_state"] = {
@@ -279,6 +294,28 @@ def run_worker(
         non_json_retries = 0
         status = parsed.get("status")
 
+        if status == "request_scope":
+            requested = parsed.get("requested_paths", parsed.get("requested_files", []))
+            if not isinstance(requested, list):
+                requested = []
+            reason = str(parsed.get("reason", "Additional workspace scope is required."))
+            print(f"    [Worker] REQUEST_SCOPE after {tool_call_count} tool call(s).")
+            if emitter:
+                emitter.emit(
+                    "worker.request_scope",
+                    milestone_id=ms_id,
+                    reason=reason,
+                    requested_paths=[str(path) for path in requested],
+                    tool_calls=tool_call_count,
+                )
+            return _finish({
+                "status": "request_scope",
+                "reason": reason,
+                "requested_paths": [str(path) for path in requested],
+                "requested_capabilities": parsed.get("requested_capabilities", []),
+                "tool_calls": tool_call_count,
+            })
+
         if status == "complete":
             files_modified.extend(parsed.get("files_modified", []))
             print(f"    [Worker] Signalled COMPLETE after {tool_call_count} tool call(s).")
@@ -304,6 +341,11 @@ def run_worker(
             dep_report = check_target_file_dependencies(
                 target_files,
                 planned_modules=planned_module_names(plan),
+                phase=(
+                    "test_scaffold"
+                    if str(contract.get("type", "")).lower() == "test_scaffold"
+                    else "implementation"
+                ),
             )
             if not dep_report.ok:
                 message = format_missing_dependency_message(dep_report)
@@ -483,6 +525,17 @@ def run_worker(
                 with span_tool_call(tool_name, ms_id, session=session):
                     tool_result = dispatch(tool_name, tool_args)
 
+            if tool_name == "serve_app":
+                action = str(tool_args.get("action", "start")).lower().strip()
+                if tool_result.get("success"):
+                    if action == "start":
+                        server_id = str(tool_result.get("server_id", "")).strip()
+                        if server_id:
+                            started_server_ids.add(server_id)
+                    elif action == "stop":
+                        server_id = str(tool_args.get("server_id", "")).strip()
+                        started_server_ids.discard(server_id)
+
             tool_call_count += 1
             duration_ms = (time.perf_counter() - started) * 1000.0
 
@@ -660,7 +713,11 @@ def _autorun_contract(
     auto-run is not possible (no command / no sandbox).
     """
     command = str(contract.get("command", "")).strip()
-    if not command or get_sandbox_context() is None:
+    if (
+        not command
+        or str(contract.get("type", "")).lower() == "ui_smoke"
+        or get_sandbox_context() is None
+    ):
         return ""
 
     result = execute_contract(contract, timeout=60, profile="validation")
@@ -675,8 +732,8 @@ def _autorun_contract(
             policy_denied=result.get("policy_denied", False),
         )
 
-    stdout_tail = (result.get("stdout", "") or "")[-900:]
-    stderr_tail = (result.get("stderr", "") or "")[-600:]
+    stdout_tail = (result.get("stdout", "") or "")[-AUTORUN_STDOUT_CHARS:]
+    stderr_tail = (result.get("stderr", "") or "")[-AUTORUN_STDERR_CHARS:]
     status_line = "PASS (exit 0)" if returncode == 0 else f"FAILING (exit {returncode})"
     return (
         f"## Auto-run of validation contract (harness, free feedback)\n"
@@ -720,10 +777,11 @@ def _normalize_milestone_for_worker(milestone: dict) -> dict:
     ms["target_files"] = [
         normalize_workspace_path(p) for p in milestone.get("target_files", [])
     ]
-    contract = dict(milestone.get("validation_contract", {}))
-    if contract.get("command"):
-        contract["command"] = normalize_shell_command(contract["command"])
-    ms["validation_contract"] = contract
+    ms["acceptance_criteria"] = [
+        str(item).strip()
+        for item in milestone.get("acceptance_criteria", [])
+        if str(item).strip()
+    ]
     return ms
 
 
@@ -761,10 +819,8 @@ def _worker_milestone_brief(ms: dict) -> str:
         if target_files
         else "- (none listed)"
     )
-    contract = ms.get("validation_contract", {})
-
     red_phase_note = ""
-    is_scaffold = str(contract.get("type", "")).lower() == "test_scaffold" or (
+    is_scaffold = str(ms.get("validation_profile", "")).lower() == "test_scaffold" or (
         target_files
         and all(
             p.startswith("tests/") or p.startswith("test_") or "/test_" in p
@@ -782,9 +838,10 @@ def _worker_milestone_brief(ms: dict) -> str:
     return (
         "## REQUIRED deliverables (must all exist before complete)\n"
         f"{targets_md}\n\n"
-        "## Validation command (your code must pass this)\n"
-        f"```\n{contract.get('command', '(none)')}\n```\n"
-        f"Pass criteria: {contract.get('pass_criteria', '(none)')}\n\n"
+        "## Acceptance criteria (the Validator will compile the checks)\n"
+        + "\n".join(f"- {item}" for item in ms.get("acceptance_criteria", []))
+        + "\n\n"
+        f"Validation profile: {ms.get('validation_profile', 'auto')}\n\n"
         "## Rules for this milestone\n"
         "- Work ONLY on the required deliverables above — writes to other files are rejected.\n"
         "- Do NOT create `__init__.py` or other scaffolding unless listed above.\n"

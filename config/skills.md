@@ -4,11 +4,93 @@
 - **Keywords:** read, file, content, inspect
 - **Parameters:**
   - `file_path` (string): Workspace-relative path of the file to read (e.g. `src/utils.py`).
+-  - `offset` (integer, optional): One-based line number to start from.
+-  - `limit` (integer, optional): Maximum number of lines to return.
 - **Returns:** String content of the file or an error message if the file does not exist.
 - **When to use:** Before any write or patch operation; when validating that a file was correctly written; when debugging unexpected behaviour.
 - **Example:**
   ```json
   {"tool": "read_file", "args": {"file_path": "src/utils.py"}, "reasoning": "Need to check existing imports before adding one."}
+  ```
+<!-- SKILL_END -->
+
+<!-- SKILL_START: serve_app -->
+## Skill Name: serve_app
+- **Description:** Starts and manages a local development server inside the session jail.
+- **Keywords:** serve, start, streamlit, vite, react, fastapi, uvicorn, localhost, app
+- **Parameters:**
+  - `action` (string): `start`, `list`, `status`, `logs`, or `stop`.
+  - `kind` (string, optional): `vite`, `streamlit`, `fastapi`, or `generic`.
+  - `port` (integer, optional): Session port in the harness allowlist (9000–9049).
+  - `app_path` (string, optional): Streamlit entry point.
+  - `module` (string, optional): ASGI module, such as `app:app`.
+  - `command` (array, optional): Allowlisted argv for a generic server.
+  - `server_id` (string, optional): Existing server identifier for status/logs/stop.
+- **Returns:** Managed server identifier, readiness, bounded logs, lifecycle status,
+  and (for `list` / errors) the active server registry plus `allowed_ports`.
+- **When to use:** Before inspecting a React/Vite, Streamlit, FastAPI, or other local UI.
+  Call `list` when the harness reports too many active servers, then `stop` stale ones.
+- **Example:**
+  ```json
+  {"tool": "serve_app", "args": {"action": "start", "kind": "streamlit", "app_path": "app.py", "port": 9000}, "reasoning": "Start the app for local UI checks."}
+  ```
+  ```json
+  {"tool": "serve_app", "args": {"action": "list"}, "reasoning": "See which harness-managed servers are still running."}
+  ```
+<!-- SKILL_END -->
+
+<!-- SKILL_START: inspect_ui -->
+## Skill Name: inspect_ui
+- **Description:** Checks a running managed local UI using loopback-only requests
+  and the harness-wide Playwright browser backend.
+- **Keywords:** inspect, ui, browser, frontend, streamlit, react, visible, assert
+- **Parameters:**
+  - `server_id` (string): Identifier returned by `serve_app`.
+  - `action` (string, optional): `navigate`, `snapshot`, `assert_text`, `screenshot`, `accessibility`, `audit`, `click`, or `fill`.
+  - `path` (string, optional): Local URL path.
+  - `text` (string, optional): Text that must be visible for `assert_text`.
+  - `selector` (string, optional): Browser locator for `click` or `fill`.
+  - `value` (string, optional): Value for `fill`.
+- **Returns:** HTTP status, title, bounded visible text, assertion result,
+  browser console/page errors, failed requests, accessibility issues, and
+  sandbox artifact paths when applicable.
+- **When to use:** Verify UI output after starting a managed local server.
+  Browser actions use the harness-wide Playwright/Chromium installation.
+- **Example:**
+  ```json
+  {"tool": "inspect_ui", "args": {"server_id": "server-1234", "action": "assert_text", "text": "To Do"}, "reasoning": "Check that the board renders its columns."}
+  ```
+<!-- SKILL_END -->
+
+<!-- SKILL_START: project_info -->
+## Skill Name: project_info
+- **Description:** Reports detected project ecosystems, manifests, toolchains, workspace entries, and active sandbox capabilities.
+- **Keywords:** project, ecosystem, manifest, package, toolchain, workspace, environment
+- **Parameters:**
+  - `max_entries` (integer, optional): Maximum bounded workspace entries to return.
+- **Returns:** Structured project metadata and a bounded file list.
+- **When to use:** At the start of a task or when deciding which test/build capability is appropriate.
+- **Example:**
+  ```json
+  {"tool": "project_info", "args": {}, "reasoning": "Detect the project stack before choosing checks."}
+  ```
+<!-- SKILL_END -->
+
+<!-- SKILL_START: run_checks -->
+## Skill Name: run_checks
+- **Description:** Runs bounded test, lint, typecheck, or build checks using the detected project ecosystem.
+- **Keywords:** test, build, lint, typecheck, pytest, npm, vitest, go, cargo, maven, gradle
+- **Parameters:**
+  - `ecosystem` (string, optional): `auto`, `python`, `node`, `go`, `rust`, `jvm`, or `generic`.
+  - `checks` (array, optional): Any of `test`, `lint`, `typecheck`, or `build`.
+  - `target` (string, optional): Workspace-relative target, default `.`.
+  - `args` (array, optional): Additional argv tokens.
+  - `timeout` (integer, optional): Maximum duration in seconds.
+- **Returns:** Structured result for each check, including argv, return code, output, and policy status.
+- **When to use:** After edits, before completion, and whenever the project is not Python-only.
+- **Example:**
+  ```json
+  {"tool": "run_checks", "args": {"ecosystem": "auto", "checks": ["test", "build"]}, "reasoning": "Verify behavior and compilation."}
   ```
 <!-- SKILL_END -->
 
