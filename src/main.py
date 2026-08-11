@@ -64,10 +64,17 @@ from src.tools.file_ops import (
 from src.tools.paths import set_workspace_root, get_workspace_root
 from src.session import SessionContext, SessionManager
 from src.sandbox import activate_sandbox, deactivate_sandbox
+from src.sandbox.process_manager import format_allowed_ports_block
 from src.sandbox.dependency_check import milestone_suggests_dependencies
 from src.run_control import RunCancelledError, ensure_not_cancelled
 from src.events import EventEmitter, emitter_for_session, register_emitter, unregister_emitter
-from src.agents import run_orchestration, replan_mission, run_worker, run_validator
+from src.agents import (
+    replan_mission,
+    run_orchestration,
+    run_triage,
+    run_validator,
+    run_worker,
+)
 from src.agents.orchestrator import repair_plan_issues
 from src.agents.plan_lint import lint_plan
 
@@ -76,6 +83,18 @@ _SKILLS_PATH  = _CONFIG_DIR / "skills.md"
 
 MAX_RETRY_CYCLES = 3
 MAX_REPLANS_PER_MILESTONE = int(os.getenv("MAX_REPLANS_PER_MILESTONE", "2"))
+_CORE_WORKER_TOOLS = (
+    "read_file",
+    "write_file",
+    "patch_file",
+    "list_directory",
+    "search_grep",
+    "run_pytest",
+    "run_linter",
+    "project_info",
+    "run_checks",
+)
+_UI_HINTS = ("ui", "frontend", "react", "vite", "streamlit", "browser", "web app")
 
 _PYTEST_INI = """\
 [pytest]
@@ -107,18 +126,12 @@ def _ensure_session_workspace(ctx: SessionContext) -> None:
 def _is_test_milestone(milestone: dict) -> bool:
     """True when a milestone is explicitly a test/spec writing phase.
 
-    Uses structured detection only — contract type or target-file patterns.
+    Uses target-file patterns only.
     Free-text keyword matching against title/description is intentionally
     absent because implementation milestones routinely mention "tests"
     in their descriptions (e.g. "implement X to pass M1 tests"), which would
     cause false-positive classification and trigger incorrect replans.
     """
-    contract_type = str(
-        milestone.get("validation_contract", {}).get("type", "")
-    ).lower()
-    if contract_type == "test_scaffold":
-        return True
-
     target_files = milestone.get("target_files", [])
     if not target_files:
         return False
@@ -158,6 +171,8 @@ class MissionResult:
     total_elapsed_ms: float
     model_used: str
     session_id: str
+    run_kind: str = "new"
+    plan_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +207,7 @@ class MissionsRuntime:
         self._emitter: Optional[EventEmitter] = None
         self._telemetry_ctx = None  # set per-run in run() (Phase 5)
         self._cancel_check: Optional[Callable[[], bool]] = None
+        self._active_run_kind = "new"
 
     def _check_cancelled(self) -> None:
         """Raise if the active run received a cancel request."""
@@ -206,6 +222,7 @@ class MissionsRuntime:
         user_request: str,
         session: Optional[SessionContext] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
+        run_kind: str = "auto",
     ) -> MissionResult:
         """
         Execute a full mission from a user request inside a session.
@@ -218,6 +235,9 @@ class MissionsRuntime:
             user_request: Plain-English description of what to build or fix.
             session:      Optional pre-existing session to run inside.
             cancel_check: Optional callable returning True when the run should stop.
+            run_kind: ``auto`` selects resume for pending plans and repair for
+                completed plans; explicit values are ``new``, ``resume``, and
+                ``repair``.
 
         Returns:
             MissionResult with per-milestone handoff telemetry.
@@ -232,6 +252,13 @@ class MissionsRuntime:
                 title=title, model=self.model
             )
         self._session = session
+        effective_run_kind = self._resolve_run_kind(session, run_kind)
+        previous_plan = self._load_plan(session)
+        parent_plan_id = (
+            str(previous_plan.get("plan_id") or previous_plan.get("mission_id") or "")
+            if effective_run_kind == "repair"
+            else None
+        )
 
         _ensure_session_workspace(session)
         self._session_manager.update_status(session, "running")
@@ -243,6 +270,7 @@ class MissionsRuntime:
             "session.started",
             request=user_request,
             model=self.model,
+            run_kind=effective_run_kind,
             workspace=str(session.workspace_root),
         )
 
@@ -269,7 +297,13 @@ class MissionsRuntime:
         ):
             try:
                 return self._run_mission_body(
-                    user_request, session, telemetry_ctx, t_mission_start
+                    user_request,
+                    session,
+                    telemetry_ctx,
+                    t_mission_start,
+                    run_kind=effective_run_kind,
+                    parent_plan_id=parent_plan_id,
+                    previous_plan=previous_plan,
                 )
             except RunCancelledError:
                 return self._finish_cancelled(session, t_mission_start)
@@ -319,7 +353,32 @@ class MissionsRuntime:
             total_elapsed_ms=round(total_ms, 2),
             model_used=self.model,
             session_id=session.session_id,
+            run_kind=getattr(self, "_active_run_kind", "new"),
+            plan_id=plan.get("plan_id") or plan.get("mission_id"),
         )
+
+    @staticmethod
+    def _load_plan(session: SessionContext) -> dict[str, Any]:
+        """Load the current plan without treating it as a resume decision."""
+        if not session.plan_path.exists():
+            return {}
+        try:
+            value = json.loads(session.plan_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @classmethod
+    def _resolve_run_kind(cls, session: SessionContext, requested: str) -> str:
+        """Distinguish crash recovery from a user-requested repair."""
+        if requested in {"new", "resume", "repair"}:
+            return requested
+        plan = cls._load_plan(session)
+        if any(m.get("status") != "completed" for m in plan.get("milestones", [])):
+            return "resume"
+        if plan.get("milestones"):
+            return "repair"
+        return "new"
 
     # ------------------------------------------------------------------
     # Mission body (orchestration → milestone loop → summary)
@@ -331,9 +390,34 @@ class MissionsRuntime:
         session: SessionContext,
         telemetry_ctx,
         t_mission_start: float,
+        *,
+        run_kind: str,
+        parent_plan_id: Optional[str],
+        previous_plan: dict[str, Any],
     ) -> MissionResult:
         """Run orchestration + the milestone loop + summary inside a span."""
         self._check_cancelled()
+
+        self._active_run_kind = run_kind
+        triage_report: Optional[dict[str, Any]] = None
+
+        # Repair runs get a read-only diagnosis before planning. A triage
+        # failure is non-fatal: the Orchestrator can still use the request and
+        # current workspace snapshot.
+        if run_kind == "repair":
+            try:
+                triage_report = run_triage(
+                    user_request,
+                    workspace_root=session.workspace_root,
+                    session_root=session.root,
+                    model=self.model,
+                    previous_plan=previous_plan,
+                    session=telemetry_ctx,
+                    emitter=self._emitter,
+                )
+            except Exception as exc:
+                print(f"  [Triage] Triage failed (non-fatal): {exc}")
+                self._emitter.emit("triage.failed", error=str(exc), fatal=False)
 
         # Phase 1 — Orchestration (graceful failure: no uncaught tracebacks)
         try:
@@ -341,6 +425,9 @@ class MissionsRuntime:
                 user_request, self.model,
                 plan_path=session.plan_path,
                 mission_dir=session.root,
+                run_kind=run_kind,
+                parent_plan_id=parent_plan_id,
+                triage_report=triage_report,
                 session=telemetry_ctx,
                 emitter=self._emitter,
             )
@@ -353,7 +440,10 @@ class MissionsRuntime:
                 total_elapsed_ms=round(
                     (time.perf_counter() - t_mission_start) * 1000.0, 2
                 ),
-                model_used=self.model, session_id=session.session_id,
+                model_used=self.model,
+                session_id=session.session_id,
+                run_kind=run_kind,
+                plan_id=None,
             )
 
         # Phase 1.2 — deterministic plan lint: fix what's fixable in code,
@@ -363,12 +453,16 @@ class MissionsRuntime:
 
         milestones = plan.get("milestones", [])
         mission_id = plan.get("mission_id", str(uuid.uuid4())[:8])
+        plan_id = str(plan.get("plan_id") or mission_id)
         title = plan.get("title", "Untitled Mission")
 
         self._emitter.emit(
             "plan.created",
             mission_id=mission_id,
             title=title,
+            run_kind=run_kind,
+            plan_id=plan_id,
+            parent_plan_id=parent_plan_id,
             milestones_total=len(milestones),
             milestone_ids=[m.get("id", "?") for m in milestones],
         )
@@ -394,11 +488,20 @@ class MissionsRuntime:
             print(f"  MILESTONE {ms_id}: {ms_title}")
             print(f"{'─'*70}")
 
-            # Crash-recovery: skip already-completed milestones
-            if self._memory:
-                resume = self._memory.check_resume_point(ms_id)
+            # Crash-recovery: only a resume run may reuse completion memory,
+            # and the memory must belong to this exact plan.
+            if run_kind == "resume" and self._memory:
+                resume = self._memory.check_resume_point(ms_id, plan_id=plan_id)
                 if resume and resume.get("status") == "completed":
                     print(f"  [Memory] Milestone {ms_id} already completed — skipping.")
+                    ms["status"] = "completed"
+                    try:
+                        session.plan_path.write_text(
+                            json.dumps(plan, indent=2),
+                            encoding="utf-8",
+                        )
+                    except OSError as exc:
+                        print(f"  [Memory] Could not persist skipped milestone: {exc}")
                     self._emitter.emit("milestone.skipped", milestone_id=ms_id, title=ms_title)
                     passed += 1
                     ms_index += 1
@@ -410,8 +513,14 @@ class MissionsRuntime:
 
             if handoff.verdict == "PASS":
                 passed += 1
+                ms["status"] = "completed"
                 if self._memory:
-                    self._memory.log_milestone_state(ms_id, asdict(handoff), "completed")
+                    self._memory.log_milestone_state(
+                        ms_id,
+                        asdict(handoff),
+                        "completed",
+                        plan_id=plan_id,
+                    )
                 ms_index += 1
             elif handoff.verdict == "REPLAN":
                 self._emitter.emit(
@@ -510,6 +619,21 @@ class MissionsRuntime:
             "completed" if passed == len(milestones)
             else ("partial" if passed > 0 else "failed")
         )
+        incomplete_ids = [
+            str(m.get("id", "?"))
+            for m in milestones
+            if m.get("status") != "completed"
+        ]
+        audit_passed = not incomplete_ids and passed == len(milestones)
+        if not audit_passed:
+            status = "partial" if passed > 0 else "failed"
+        self._emitter.emit(
+            "mission.audit",
+            passed=audit_passed,
+            incomplete_milestones=incomplete_ids,
+            run_kind=run_kind,
+            plan_id=plan_id,
+        )
 
         self._session_manager.update_status(session, status)
 
@@ -523,12 +647,16 @@ class MissionsRuntime:
             total_elapsed_ms=round(total_ms, 2),
             model_used=self.model,
             session_id=session.session_id,
+            run_kind=run_kind,
+            plan_id=plan_id,
         )
 
         if self._emitter:
             self._emitter.emit(
                 "mission.complete",
                 status=status,
+                run_kind=run_kind,
+                plan_id=plan_id,
                 milestones_passed=passed,
                 milestones_total=len(milestones),
                 total_elapsed_ms=result.total_elapsed_ms,
@@ -634,7 +762,20 @@ class MissionsRuntime:
         # Write jail: scope write/patch calls to this milestone's target_files
         # so out-of-scope edits are rejected at the tool layer (one cheap turn)
         # instead of post-hoc by the validator (one full worker cycle).
-        begin_milestone_write_policy(milestone.get("target_files"))
+        target_files = milestone.get("target_files", [])
+        allow_new_test_files = (
+            not is_test
+            and any(
+                str(path).startswith("tests/")
+                or str(path).startswith("test_")
+                or "/test_" in str(path)
+                for path in target_files
+            )
+        )
+        begin_milestone_write_policy(
+            target_files,
+            allow_new_test_files=allow_new_test_files,
+        )
 
         # The worker's conversation survives validator FAILs within this
         # milestone: retries resume the same thread with new feedback instead
@@ -643,31 +784,72 @@ class MissionsRuntime:
         active_tools: set[str] = set()
         tool_failure_state: dict[str, Any] = {}
 
+        # Route once per packet. Core inspection/edit/test tools are always
+        # available so a retry cannot lose the ability to inspect or repair
+        # the files it already touched.
+        acceptance = milestone.get("acceptance_criteria", [])
+        intent = (
+            f"{ms_title}: {milestone.get('description', '')}\n"
+            f"Acceptance criteria: {acceptance}\n"
+            f"Validation profile: {milestone.get('validation_profile', 'auto')}"
+        )
+        initial_discovery = self._router.search_tools(intent, top_k=3)
+        curated_tools_md = initial_discovery.get("documentation", "")
+        active_tools.update(initial_discovery.get("tools", []))
+        for tool_name in _CORE_WORKER_TOOLS:
+            skill = self._router.get_skill_by_name(tool_name)
+            if skill and skill not in curated_tools_md:
+                curated_tools_md = (
+                    f"{skill}\n\n---\n\n{curated_tools_md}"
+                    if curated_tools_md
+                    else skill
+                )
+            active_tools.add(tool_name)
+        is_ui_packet = (
+            str(milestone.get("validation_profile", "")).lower() == "ui"
+            or any(str(path).lower().endswith((".html", ".jsx", ".tsx", ".vue"))
+                   for path in target_files)
+        )
+        if is_ui_packet or any(
+            hint in f"{ms_title} {milestone.get('description', '')}".lower()
+            for hint in _UI_HINTS
+        ):
+            for tool_name in ("serve_app", "inspect_ui"):
+                skill = self._router.get_skill_by_name(tool_name)
+                if skill and skill not in curated_tools_md:
+                    curated_tools_md = (
+                        f"{skill}\n\n---\n\n{curated_tools_md}"
+                        if curated_tools_md
+                        else skill
+                    )
+                active_tools.add(tool_name)
+            curated_tools_md = (
+                f"{curated_tools_md}\n\n{format_allowed_ports_block()}"
+                if curated_tools_md
+                else format_allowed_ports_block()
+            )
+        self._emitter.emit(
+            "tool.routing",
+            milestone_id=ms_id,
+            query=intent,
+            tools=sorted(active_tools),
+            count=len(active_tools),
+            routed_tools=sorted(initial_discovery.get("tools", [])),
+            core_tools=list(_CORE_WORKER_TOOLS),
+        )
+        if milestone_suggests_dependencies(milestone, plan):
+            install_skill = self._router.get_skill_by_name("install_dependency")
+            if install_skill and "install_dependency" not in curated_tools_md:
+                curated_tools_md = (
+                    f"{install_skill}\n\n---\n\n{curated_tools_md}"
+                    if curated_tools_md
+                    else install_skill
+                )
+                active_tools.add("install_dependency")
+        print(f"\n  [Phase 2] SKILL ROUTING — tools selected for milestone {ms_id}.")
+
         while retry_count < MAX_RETRY_CYCLES:
             self._check_cancelled()
-
-            # Phase 2 — Dynamic skill routing
-            intent = f"{ms_title}: {milestone.get('description', '')}"
-            initial_discovery = self._router.search_tools(intent, top_k=3)
-            curated_tools_md = initial_discovery.get("documentation", "")
-            active_tools.update(initial_discovery.get("tools", []))
-            self._emitter.emit(
-                "tool.routing",
-                milestone_id=ms_id,
-                query=intent,
-                tools=sorted(initial_discovery.get("tools", [])),
-                count=initial_discovery.get("count", 0),
-            )
-            if milestone_suggests_dependencies(milestone, plan):
-                install_skill = self._router.get_skill_by_name("install_dependency")
-                if install_skill and "install_dependency" not in curated_tools_md:
-                    curated_tools_md = (
-                        f"{install_skill}\n\n---\n\n{curated_tools_md}"
-                        if curated_tools_md
-                        else install_skill
-                    )
-                    active_tools.add("install_dependency")
-            print(f"\n  [Phase 2] SKILL ROUTING — top tools selected for milestone {ms_id}.")
 
             # Phase 3 — Worker implementation
             worker_result = run_worker(
@@ -696,9 +878,17 @@ class MissionsRuntime:
             if worker_result.get("status") == "cancelled":
                 raise RunCancelledError("Run cancelled by user")
 
-            if worker_result.get("status") == "blocked":
+            worker_status = worker_result.get("status")
+            if worker_status in {"blocked", "request_scope"}:
                 reason = worker_result.get("reason", "Unknown block")
                 clarification = str(worker_result.get("clarification", "") or "")
+                requested_paths = worker_result.get("requested_paths", [])
+                if worker_status == "request_scope" and requested_paths:
+                    clarification = (
+                        f"Requested workspace paths: {requested_paths}. "
+                        "The current work packet must be expanded before implementation "
+                        "can continue."
+                    )
                 error_log.append(f"Worker blocked: {reason}")
                 print(f"  [Runtime] Worker BLOCKED: {reason}")
                 elapsed_ms = (time.perf_counter() - t_start) * 1000.0
@@ -720,7 +910,7 @@ class MissionsRuntime:
                     error_log.append(
                         f"Worker blocked with clarification request: {reason} "
                         f"| Question: {clarification} | Fix the plan so this "
-                        "milestone's target_files and validation contract match "
+                        "milestone's writable scope, target_files, and validation contract match "
                         "what the implementation actually requires."
                     )
                     return MilestoneHandoff(
@@ -797,7 +987,15 @@ class MissionsRuntime:
                     error_log.append("REPLAN rejected: empty replan_guidance.")
                     retry_count += 1
                     continue
-                error_log.append(f"REPLAN requested: {replan_guidance}")
+                worker_replan = verdict_data.get("worker_replan")
+                if isinstance(worker_replan, dict):
+                    error_log.append(
+                        f"REPLAN requested: {replan_guidance}\n"
+                        "Structured worker replan request:\n"
+                        f"{json.dumps(worker_replan, sort_keys=True)}"
+                    )
+                else:
+                    error_log.append(f"REPLAN requested: {replan_guidance}")
                 print(f"\n  [!] Validator requested REPLAN: {replan_guidance}")
                 elapsed_ms = (time.perf_counter() - t_start) * 1000.0
                 return MilestoneHandoff(
@@ -819,8 +1017,14 @@ class MissionsRuntime:
             # of tracebacks routinely lose the exact assertion/line the fix needs.
             raw_output = str(verdict_data.get("contract_output", "") or "")
             if raw_output:
+                if len(raw_output) > 1500:
+                    raw_output = (
+                        raw_output[:500]
+                        + "\n...[middle omitted]...\n"
+                        + raw_output[-1000:]
+                    )
                 error_summary += (
-                    f"\nRaw validation output (truncated):\n{raw_output[-1500:]}"
+                    f"\nRaw validation output (bounded):\n{raw_output}"
                 )
             error_log.append(error_summary)
             print(f"\n  [✗] Milestone {ms_id} FAILED (retry {retry_count + 1}/{MAX_RETRY_CYCLES})")
@@ -979,6 +1183,12 @@ def main() -> None:
         help="Resume an existing session by id (under sessions/<id>/)",
     )
     parser.add_argument(
+        "--run-kind",
+        choices=["auto", "new", "resume", "repair"],
+        default="auto",
+        help="Run lifecycle mode (default: auto; repair reuses the current workspace)",
+    )
+    parser.add_argument(
         "--list-sessions",
         action="store_true",
         help="List existing sessions and exit",
@@ -1046,7 +1256,7 @@ def main() -> None:
             sys.exit(1)
         print(f"[Runtime] Resuming session {session.session_id} ({session.title}).")
 
-    result = runtime.run(request, session=session)
+    result = runtime.run(request, session=session, run_kind=args.run_kind)
     sys.exit(0 if result.status == "completed" else 1)
 
 

@@ -22,6 +22,7 @@ Environment variables (can be set in .env):
   GEMINI_API_KEY, GEMINI_MODEL
   GEMINI_THINKING_LEVEL_DEFAULT, GEMINI_THINKING_LEVEL_MAX
   OPENAI_API_KEY, OPENAI_LLM_MODEL, OPENAI_LLM_MODEL_ENRICHMENT
+  LLM_TEMPERATURE, LLM_TEMPERATURE_<ROLE>, LLM_TOP_P, LLM_TOP_P_<ROLE>, LLM_SEED
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ except ImportError:
 # Types
 # ---------------------------------------------------------------------------
 ModelChoice = Literal["local", "gemini", "gpt4o", "auto"]
-AgentRole = Literal["orchestrator", "worker", "validator"]
+AgentRole = Literal["triage", "orchestrator", "worker", "validator"]
 ThinkingLevel = Literal["off", "minimal", "low", "medium", "high"]
 
 # Parameters not accepted by each backend's OpenAI-compatible endpoint.
@@ -56,30 +57,40 @@ _UNSUPPORTED_PARAMS: dict[str, set[str]] = {
 
 _FALLBACK_CHAIN: list[str] = ["local", "gemini", "gpt4o"]
 
-TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.8"))
-TOP_P = float(os.getenv("LLM_TOP_P", "0.95"))
 SEED = int(os.getenv("LLM_SEED", "42"))
 
-# Per-role sampling defaults. Tool-calling and code generation need
-# near-deterministic sampling; planning tolerates more diversity.
-# Precedence: LLM_TEMPERATURE_<ROLE> env > LLM_TEMPERATURE env > role default.
-_ROLE_TEMPERATURE_DEFAULTS: dict[str, float] = {
-    "orchestrator": 0.5,
-    "worker": 0.2,
-    "validator": 0.2,
-}
+
+def _env_float(name: str) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid float in {name}={raw!r}") from exc
 
 
-def _role_temperature(role: AgentRole) -> float:
-    raw = os.getenv(f"LLM_TEMPERATURE_{role.upper()}", "").strip()
+def _role_sampling(role: AgentRole, base_var: str) -> float:
+    """Resolve a per-role float from env.
+
+    Precedence: ``{base_var}_<ROLE>`` > ``{base_var}`` (both must be set in .env).
+    """
+    role_var = f"{base_var}_{role.upper()}"
+    raw = os.getenv(role_var, "").strip()
     if raw:
         try:
             return float(raw)
-        except ValueError:
-            pass
-    if os.getenv("LLM_TEMPERATURE"):
-        return TEMPERATURE
-    return _ROLE_TEMPERATURE_DEFAULTS.get(role, 0.5)
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid float in {role_var}={raw!r}") from exc
+    return _env_float(base_var)
+
+
+def _role_temperature(role: AgentRole) -> float:
+    return _role_sampling(role, "LLM_TEMPERATURE")
+
+
+def _role_top_p(role: AgentRole) -> float:
+    return _role_sampling(role, "LLM_TOP_P")
 
 
 @dataclass(frozen=True)
@@ -137,7 +148,7 @@ def _role_thinking_level(backend: str, role: AgentRole) -> ThinkingLevel:
 
     Gemini reads GEMINI_THINKING_LEVEL_DEFAULT (worker) and
     GEMINI_THINKING_LEVEL_MAX (orchestrator/validator).
-    Local uses medium for planning/validation, off for worker (/no_think).
+    Local uses medium for triage/planning/validation, off for worker (/no_think).
     GPT has no thinking knob — level is always off (model choice handles capability).
     """
     if backend == "gemini":
@@ -183,7 +194,7 @@ def resolve_model_config(backend: str, role: AgentRole) -> ResolvedModelConfig:
 
     Args:
         backend: ``local`` | ``gemini`` | ``gpt4o`` (not ``auto``).
-        role:    ``orchestrator`` | ``worker`` | ``validator``.
+        role:    ``triage`` | ``orchestrator`` | ``worker`` | ``validator``.
 
     Returns:
         A :class:`ResolvedModelConfig` with everything needed for one LLM call.
@@ -211,11 +222,11 @@ def get_model_catalog() -> list[dict[str, Any]]:
         meta = _endpoint_meta(key)
         models_by_role = {
             role: _role_model_name(key, role)
-            for role in ("orchestrator", "worker", "validator")
+            for role in ("triage", "orchestrator", "worker", "validator")
         }
         thinking_by_role = {
             role: _role_thinking_level(key, role)
-            for role in ("orchestrator", "worker", "validator")
+            for role in ("triage", "orchestrator", "worker", "validator")
         }
         entries.append({
             "key": key,
@@ -230,11 +241,13 @@ def get_model_catalog() -> list[dict[str, Any]]:
         "base_url": "",
         "model": "(auto — local → gemini → gpt4o)",
         "models_by_role": {
+            "triage": "(fallback chain)",
             "orchestrator": "(fallback chain)",
             "worker": "(fallback chain)",
             "validator": "(fallback chain)",
         },
         "thinking_by_role": {
+            "triage": "per-backend",
             "orchestrator": "per-backend",
             "worker": "per-backend",
             "validator": "per-backend",
@@ -263,10 +276,24 @@ _ENDPOINTS: dict[str, dict] = _build_legacy_endpoints()
 # Provider-specific thinking adapters
 # ---------------------------------------------------------------------------
 
-def _local_user_content(prompt: str, thinking_level: ThinkingLevel) -> str:
-    """Qwen/Qwopus: prepend /no_think when thinking is off or minimal."""
+def _local_user_content(
+    prompt: Any,
+    thinking_level: ThinkingLevel,
+) -> Any:
+    """Add the local thinking directive without corrupting image parts."""
     if thinking_level in ("off", "minimal"):
-        return "/no_think\n\n" + prompt
+        if isinstance(prompt, str):
+            return "/no_think\n\n" + prompt
+        if isinstance(prompt, list):
+            parts = [
+                dict(part) if isinstance(part, dict) else part
+                for part in prompt
+            ]
+            for part in parts:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    part["text"] = "/no_think\n\n" + str(part.get("text", ""))
+                    break
+            return parts
     return prompt
 
 
@@ -299,7 +326,7 @@ def call_llm(
     json_mode: bool = False,
     role: AgentRole = "worker",
     enable_thinking: Optional[bool] = None,
-    messages: Optional[list[dict[str, str]]] = None,
+    messages: Optional[list[dict[str, Any]]] = None,
 ) -> LLMResult:
     """
     Send a prompt to the selected LLM and return the result with precise timing.
@@ -314,7 +341,9 @@ def call_llm(
         enable_thinking: Deprecated. Maps to role thinking when provided without
                          changing role defaults (True → medium, False → off for local).
         messages:      Optional native chat message list (``role``/``content``
-                       dicts). Prefer this over flattened single-turn prompts:
+                       dicts). Content may be a string or an OpenAI-compatible
+                       multimodal content-part list. Prefer this over flattened
+                       single-turn prompts:
                        it preserves role semantics and keeps the rendered prompt
                        append-only so server-side prefix caches stay hot.
 
@@ -370,7 +399,7 @@ def _call_single(
     json_mode: bool,
     fallback_used: bool,
     enable_thinking_override: Optional[bool],
-    messages: Optional[list[dict[str, str]]] = None,
+    messages: Optional[list[dict[str, Any]]] = None,
 ) -> LLMResult:
     """Execute a single streaming call to the given model backend."""
     cfg = resolve_model_config(model_key, role)
@@ -382,12 +411,15 @@ def _call_single(
 
     client = _build_client(cfg)
 
-    chat_messages: list[dict[str, str]] = []
+    chat_messages: list[dict[str, Any]] = []
     if system_prompt:
         chat_messages.append({"role": "system", "content": system_prompt})
 
     if messages is not None:
-        chat_messages.extend({"role": m["role"], "content": m["content"]} for m in messages)
+        chat_messages.extend(
+            {"role": m["role"], "content": m.get("content", "")}
+            for m in messages
+        )
     else:
         chat_messages.append({"role": "user", "content": prompt or ""})
 
@@ -401,7 +433,7 @@ def _call_single(
         model=cfg.model_name,
         messages=chat_messages,
         temperature=_role_temperature(role),
-        top_p=TOP_P,
+        top_p=_role_top_p(role),
         seed=SEED,
         max_tokens=max_tokens,
         stream=True,

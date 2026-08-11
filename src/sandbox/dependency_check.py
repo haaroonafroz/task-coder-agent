@@ -129,6 +129,21 @@ def planned_module_names(plan: Optional[dict]) -> frozenset[str]:
     names: set[str] = set()
     if not plan:
         return frozenset()
+
+    def add_module_name(module: object) -> None:
+        value = str(module or "").strip()
+        if not value:
+            return
+        parts = value.split(".")
+        if parts[0].isidentifier():
+            names.add(parts[0])
+
+    def add_import_root(import_spec: object) -> None:
+        value = str(import_spec or "").strip()
+        if not value:
+            return
+        add_module_name(value.split(".", 1)[0])
+
     for ms in plan.get("milestones", []) or []:
         if not isinstance(ms, dict):
             continue
@@ -138,6 +153,16 @@ def planned_module_names(plan: Optional[dict]) -> frozenset[str]:
                 names.add(p.stem)
                 if len(p.parts) > 1:
                     names.add(p.parts[0])
+        contract = ms.get("validation_contract", {})
+        if isinstance(contract, dict):
+            # Test-scaffold contracts refer to future source modules before
+            # those files exist. Treat those declarations as local modules;
+            # otherwise the worker is incorrectly told to pip-install them.
+            for api in contract.get("public_api", []) or []:
+                if isinstance(api, dict):
+                    add_module_name(api.get("module"))
+            for import_spec in contract.get("required_imports", []) or []:
+                add_import_root(import_spec)
     return frozenset(names)
 
 
@@ -225,10 +250,23 @@ def check_target_file_dependencies(
     ctx: Optional[SandboxContext] = None,
     workspace_root: Optional[Path] = None,
     planned_modules: Optional[frozenset[str]] = None,
+    phase: str = "implementation",
 ) -> DependencyReport:
     """
     Scan ``file_paths`` for third-party imports and verify they are installed.
+
+    Test-scaffold files are intentionally exempt from package installation
+    checks. Their imports describe the future implementation API and are
+    validated by the scaffold validator/stub overlay instead.
     """
+    if str(phase).strip().lower() in {"scaffold", "test_scaffold", "test-only"}:
+        return DependencyReport(
+            required_imports=[],
+            missing_imports=[],
+            missing_packages=[],
+            checked_files=[],
+            errors=[],
+        )
     sandbox = ctx or get_sandbox_context()
     ws = workspace_root
     if ws is None and sandbox is not None:

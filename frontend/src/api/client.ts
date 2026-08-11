@@ -15,6 +15,7 @@ import type {
   WorkspaceFile,
   Upload,
   ModelChoice,
+  RunKind,
   WorkspaceScope,
 } from "./types";
 
@@ -75,7 +76,12 @@ export const api = {
 
   createMessage(
     sid: string,
-    body: { content: string; trigger_run?: boolean; model?: ModelChoice }
+    body: {
+      content: string;
+      trigger_run?: boolean;
+      model?: ModelChoice;
+      run_kind?: RunKind;
+    }
   ): Promise<Message> {
     return req(`/sessions/${sid}/messages`, {
       method: "POST",

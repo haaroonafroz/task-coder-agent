@@ -13,7 +13,7 @@ from typing import Any
 TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "read_file": {
         "required": {"file_path": str},
-        "optional": {},
+        "optional": {"offset": int, "limit": int},
     },
     "write_file": {
         "required": {"file_path": str, "content": str},
@@ -66,6 +66,44 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "search_tools": {
         "required": {"query": str},
         "optional": {"limit": int},
+    },
+    "project_info": {
+        "required": {},
+        "optional": {"max_entries": int},
+    },
+    "run_checks": {
+        "required": {},
+        "optional": {
+            "ecosystem": str,
+            "checks": list,
+            "target": str,
+            "args": list,
+            "timeout": int,
+        },
+    },
+    "serve_app": {
+        "required": {"action": str},
+        "optional": {
+            "kind": str,
+            "port": int,
+            "app_path": str,
+            "entry_point": str,
+            "module": str,
+            "command": list,
+            "server_id": str,
+            "ready_url": str,
+            "timeout": int,
+        },
+    },
+    "inspect_ui": {
+        "required": {"server_id": str},
+        "optional": {
+            "action": str,
+            "path": str,
+            "text": str,
+            "selector": str,
+            "value": str,
+        },
     },
 }
 

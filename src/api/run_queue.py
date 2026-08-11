@@ -55,6 +55,8 @@ class RunRecord:
     status: str  # queued | running | completed | partial | failed | error | cancelled
     model: str
     queued_at: str
+    run_kind: str = "auto"
+    plan_id: Optional[str] = None
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     result: Optional[dict[str, Any]] = None
@@ -113,6 +115,7 @@ class RunRegistry:
         session_id: str,
         request: str,
         model: str,
+        run_kind: str = "auto",
     ) -> RunRecord:
         run_id = uuid.uuid4().hex[:12]
         rec = RunRecord(
@@ -122,6 +125,7 @@ class RunRegistry:
             status="queued",
             model=model,
             queued_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            run_kind=run_kind,
         )
         with self._lock:
             self._runs[run_id] = rec
@@ -272,10 +276,16 @@ class RunQueue:
         ctx: SessionContext,
         request: str,
         model: Optional[ModelChoice] = None,
+        run_kind: str = "auto",
     ) -> RunRecord:
         """Create a run record and submit it to the serial worker."""
         chosen_model = model or ctx.selected_model or "auto"
-        rec = self._registry.create(ctx.session_id, request, str(chosen_model))
+        rec = self._registry.create(
+            ctx.session_id,
+            request,
+            str(chosen_model),
+            run_kind=run_kind,
+        )
         self._queue.put((rec, ctx, chosen_model))
         return rec
 
@@ -380,7 +390,10 @@ class RunQueue:
                 rec.request,
                 session=fresh,
                 cancel_check=cancel_check,
+                run_kind=rec.run_kind,
             )
+            rec.plan_id = result.plan_id or rec.plan_id or result.mission_id
+            rec.run_kind = result.run_kind
             if result.status == "cancelled" or self._cancellation.is_cancelled(rec.run_id):
                 rec.status = "cancelled"
                 rec.error = "Run cancelled by user"
@@ -393,6 +406,8 @@ class RunQueue:
                     "total_elapsed_ms": result.total_elapsed_ms,
                     "model_used": result.model_used,
                     "session_id": result.session_id,
+                    "run_kind": result.run_kind,
+                    "plan_id": result.plan_id,
                 }
                 try:
                     self._message_store.append(
@@ -413,6 +428,8 @@ class RunQueue:
                     "total_elapsed_ms": result.total_elapsed_ms,
                     "model_used": result.model_used,
                     "session_id": result.session_id,
+                    "run_kind": result.run_kind,
+                    "plan_id": result.plan_id,
                 }
                 rec.status = result.status
         except RunCancelledError as exc:

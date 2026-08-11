@@ -9,7 +9,7 @@ serialized as strings and optional fields relaxed for partial updates.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -56,6 +56,7 @@ class MessageCreate(BaseModel):
     content: str = Field(..., min_length=1)
     trigger_run: bool = True
     model: Optional[ModelChoice] = None
+    run_kind: Literal["auto", "new", "resume", "repair"] = "auto"
 
 
 class MessageResponse(BaseModel):
@@ -64,6 +65,7 @@ class MessageResponse(BaseModel):
     content: str
     ts: str
     run_id: Optional[str] = None
+    run_kind: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +75,7 @@ class MessageResponse(BaseModel):
 class RunCreate(BaseModel):
     request: str = Field(..., min_length=1)
     model: Optional[ModelChoice] = None
+    run_kind: Literal["auto", "new", "resume", "repair"] = "auto"
 
 
 class RunResponse(BaseModel):
@@ -86,6 +89,8 @@ class RunResponse(BaseModel):
     finished_at: Optional[str] = None
     result: Optional[dict[str, Any]] = None
     error: Optional[str] = None
+    run_kind: str = "auto"
+    plan_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

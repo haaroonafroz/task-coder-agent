@@ -152,7 +152,11 @@ class MissionMemory:
     # ------------------------------------------------------------------
 
     def log_milestone_state(
-        self, milestone_id: str, plan_meta: dict, current_status: str
+        self,
+        milestone_id: str,
+        plan_meta: dict,
+        current_status: str,
+        plan_id: Optional[str] = None,
     ) -> None:
         """
         Persist the current state of a milestone into the memory backend.
@@ -161,9 +165,13 @@ class MissionMemory:
             milestone_id:   Milestone identifier (e.g. "M2").
             plan_meta:      Full handoff dict for this milestone.
             current_status: "pending" | "in_progress" | "completed" | "failed".
+            plan_id: Stable plan identity used to isolate crash recovery from
+                later repair plans. When omitted, the legacy milestone store is
+                used for backward compatibility only.
         """
+        plan_id = plan_id or str(plan_meta.get("plan_id") or plan_meta.get("mission_id") or "")
         payload = (
-            f"Milestone: {milestone_id}. "
+            f"Plan: {plan_id or 'legacy'}. Milestone: {milestone_id}. "
             f"Status: {current_status}. "
             f"Metadata: {json.dumps(plan_meta)[:800]}."
         )
@@ -174,15 +182,26 @@ class MissionMemory:
                 print(f"[Memory] Cognee write scheduling failed: {exc}")
 
         # Always write to the JSON store for durability
-        self._json_write(milestone_id, current_status, plan_meta)
+        self._json_write(plan_id, milestone_id, current_status, plan_meta)
 
-    def check_resume_point(self, milestone_id: str) -> Optional[dict]:
+    def check_resume_point(
+        self,
+        milestone_id: str,
+        plan_id: Optional[str] = None,
+    ) -> Optional[dict]:
         """
         Check whether a milestone was previously completed.
 
         Returns the stored state dict if found, or None.
         """
         store = self._load_store()
+        if plan_id:
+            return (
+                store.get("plans", {})
+                .get(plan_id, {})
+                .get("milestones", {})
+                .get(milestone_id)
+            )
         return store.get("milestones", {}).get(milestone_id)
 
     # ------------------------------------------------------------------
@@ -313,7 +332,14 @@ class MissionMemory:
     def _ensure_store(self) -> None:
         self._memory_file.parent.mkdir(parents=True, exist_ok=True)
         if not self._memory_file.exists():
-            self._save_store({"milestones": {}, "error_log": []})
+            self._save_store({"plans": {}, "milestones": {}, "error_log": []})
+            return
+        # Preserve pre-plan-namespace stores, but never use their milestone
+        # entries for a new plan. They remain available to older callers.
+        store = self._load_store()
+        if "plans" not in store:
+            store["plans"] = {}
+            self._save_store(store)
 
     def _load_store(self) -> dict:
         try:
@@ -324,11 +350,24 @@ class MissionMemory:
     def _save_store(self, data: dict) -> None:
         self._memory_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-    def _json_write(self, milestone_id: str, status: str, meta: dict) -> None:
+    def _json_write(
+        self,
+        plan_id: str,
+        milestone_id: str,
+        status: str,
+        meta: dict,
+    ) -> None:
         store = self._load_store()
-        store.setdefault("milestones", {})[milestone_id] = {
+        entry = {
             "status": status,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             **{k: v for k, v in meta.items() if k != "error_log"},
         }
+        if plan_id:
+            plan = store.setdefault("plans", {}).setdefault(
+                plan_id, {"milestones": {}}
+            )
+            plan.setdefault("milestones", {})[milestone_id] = entry
+        else:
+            store.setdefault("milestones", {})[milestone_id] = entry
         self._save_store(store)

@@ -8,7 +8,6 @@ silently reordered/renamed/dropped), and unauditable. Instead the
 Orchestrator emits a small op-list which this module validates and applies
 in code:
 
-  {"op": "set_contract",           "milestone_id": "M3", "validation_contract": {...}}
   {"op": "update_milestone",       "milestone_id": "M3", "fields": {"title"?, "description"?, "target_files"?}}
   {"op": "insert_milestone_after", "after_id": "M2",     "milestone": {...}}
   {"op": "remove_milestone",       "milestone_id": "M4"}
@@ -16,7 +15,7 @@ in code:
 Invariants enforced here (not by the LLM):
   - Milestones with status "completed" are immutable.
   - Milestone ids stay unique.
-  - Inserted milestones must carry id/title/target_files/validation_contract.
+  - Inserted milestones must carry id/title/target_files/acceptance_criteria.
   - depends_on references are cleaned up after removals.
 """
 
@@ -26,13 +25,15 @@ import copy
 from typing import Any
 
 SUPPORTED_OPS = (
-    "set_contract",
     "update_milestone",
     "insert_milestone_after",
     "remove_milestone",
 )
 
-_UPDATABLE_FIELDS = ("title", "description", "target_files", "depends_on")
+_UPDATABLE_FIELDS = (
+    "title", "description", "target_files", "depends_on",
+    "acceptance_criteria", "validation_profile",
+)
 
 
 class PlanPatchError(ValueError):
@@ -66,9 +67,9 @@ def _validate_new_milestone(ms: Any, existing_ids: set[str]) -> dict:
         raise PlanPatchError(
             f"inserted milestone '{ms_id}' must list non-empty 'target_files'"
         )
-    if not isinstance(ms.get("validation_contract"), dict):
+    if not isinstance(ms.get("acceptance_criteria"), list) or not ms["acceptance_criteria"]:
         raise PlanPatchError(
-            f"inserted milestone '{ms_id}' must include a 'validation_contract' object"
+            f"inserted milestone '{ms_id}' must include non-empty 'acceptance_criteria'"
         )
     out = copy.deepcopy(ms)
     out.setdefault("depends_on", [])
@@ -111,23 +112,7 @@ def apply_plan_patch(plan: dict, operations: Any) -> dict:
 
         index = _index_by_id(milestones)
 
-        if kind == "set_contract":
-            ms_id = str(op.get("milestone_id", "")).strip()
-            if ms_id not in index:
-                raise PlanPatchError(f"set_contract: milestone '{ms_id}' not found")
-            target = milestones[index[ms_id]]
-            if _is_completed(target):
-                raise PlanPatchError(
-                    f"set_contract: milestone '{ms_id}' is completed and immutable"
-                )
-            contract = op.get("validation_contract")
-            if not isinstance(contract, dict) or not contract:
-                raise PlanPatchError(
-                    "set_contract: 'validation_contract' must be a non-empty object"
-                )
-            target["validation_contract"] = copy.deepcopy(contract)
-
-        elif kind == "update_milestone":
+        if kind == "update_milestone":
             ms_id = str(op.get("milestone_id", "")).strip()
             if ms_id not in index:
                 raise PlanPatchError(f"update_milestone: milestone '{ms_id}' not found")
@@ -149,6 +134,16 @@ def apply_plan_patch(plan: dict, operations: Any) -> dict:
                 )
             if "target_files" in fields and not isinstance(fields["target_files"], list):
                 raise PlanPatchError("update_milestone: 'target_files' must be a list")
+            if (
+                "acceptance_criteria" in fields
+                and (
+                    not isinstance(fields["acceptance_criteria"], list)
+                    or not fields["acceptance_criteria"]
+                )
+            ):
+                raise PlanPatchError(
+                    "update_milestone: 'acceptance_criteria' must be a non-empty list"
+                )
             target.update(copy.deepcopy(fields))
 
         elif kind == "insert_milestone_after":

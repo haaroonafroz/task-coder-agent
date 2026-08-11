@@ -136,6 +136,9 @@ def get_sandbox_context() -> Optional[SandboxContext]:
 
 
 def deactivate_sandbox() -> None:
-    """Clear the active sandbox after a run completes."""
+    """Stop harness-owned processes and clear the active sandbox."""
     global _active
+    from src.sandbox.process_manager import stop_all_servers
+
+    stop_all_servers()
     _active = None

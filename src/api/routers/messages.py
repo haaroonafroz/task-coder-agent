@@ -31,9 +31,15 @@ async def create_message(
     ctx = require_session(sid, manager)
     run_id: Optional[str] = None
     if body.trigger_run:
-        rec = run_queue.enqueue(ctx, body.content, model=body.model)
+        rec = run_queue.enqueue(
+            ctx,
+            body.content,
+            model=body.model,
+            run_kind=body.run_kind,
+        )
         run_id = rec.run_id
     msg = message_store.append(ctx, "user", body.content, run_id=run_id)
+    msg["run_kind"] = body.run_kind
     return MessageResponse(**msg)
 
 

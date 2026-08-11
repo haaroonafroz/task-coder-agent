@@ -1,6 +1,7 @@
 // TypeScript types mirroring the Phase 3 FastAPI Pydantic schemas.
 
 export type ModelChoice = "auto" | "local" | "gemini" | "gpt4o";
+export type RunKind = "auto" | "new" | "resume" | "repair";
 
 export interface Session {
   session_id: string;
@@ -22,6 +23,7 @@ export interface Message {
   content: string;
   ts: string;
   run_id: string | null;
+  run_kind?: RunKind;
 }
 
 export interface Run {
@@ -35,6 +37,8 @@ export interface Run {
   finished_at: string | null;
   result: Record<string, unknown> | null;
   error: string | null;
+  run_kind: RunKind;
+  plan_id: string | null;
 }
 
 export interface Milestone {

@@ -24,6 +24,10 @@ from src.tools.paths import (
 
 
 _ALLOW_TEST_EDITS = False
+_NEW_TEST_PATHS: set[str] = set()
+_CREATED_THIS_MILESTONE: set[str] = set()
+
+
 def set_allow_test_edits(allowed: bool) -> None:
     """Toggle whether tools are permitted to create or modify test files."""
     global _ALLOW_TEST_EDITS
@@ -45,9 +49,18 @@ _READ_THIS_MILESTONE: set[str] = set()
 REWRITE_MIN_LINES = 60  # files larger than this require read-before-rewrite
 
 
-def begin_milestone_write_policy(allowed_paths: Optional[list[str]]) -> None:
+def _is_test_path(path: str) -> bool:
+    return path.startswith("tests/") or path.startswith("test_") or "/test_" in path
+
+
+def begin_milestone_write_policy(
+    allowed_paths: Optional[list[str]],
+    *,
+    allow_new_test_files: bool = False,
+) -> None:
     """Set the milestone write jail and reset read-before-rewrite tracking."""
     global _ALLOWED_WRITE_PATHS, _READ_THIS_MILESTONE
+    global _NEW_TEST_PATHS, _CREATED_THIS_MILESTONE
     if allowed_paths:
         _ALLOWED_WRITE_PATHS = {
             normalize_workspace_path(p) for p in allowed_paths if str(p).strip()
@@ -55,13 +68,46 @@ def begin_milestone_write_policy(allowed_paths: Optional[list[str]]) -> None:
     else:
         _ALLOWED_WRITE_PATHS = None
     _READ_THIS_MILESTONE = set()
+    _CREATED_THIS_MILESTONE = set()
+    if allow_new_test_files and _ALLOWED_WRITE_PATHS:
+        workspace = get_workspace_root().resolve()
+        _NEW_TEST_PATHS = {
+            path for path in _ALLOWED_WRITE_PATHS
+            if _is_test_path(path) and not (workspace / path).exists()
+        }
+    else:
+        _NEW_TEST_PATHS = set()
 
 
 def clear_milestone_write_policy() -> None:
     """Remove the write jail (e.g. after the mission loop finishes)."""
     global _ALLOWED_WRITE_PATHS, _READ_THIS_MILESTONE
+    global _NEW_TEST_PATHS, _CREATED_THIS_MILESTONE
     _ALLOWED_WRITE_PATHS = None
     _READ_THIS_MILESTONE = set()
+    _NEW_TEST_PATHS = set()
+    _CREATED_THIS_MILESTONE = set()
+
+
+def get_created_files() -> list[str]:
+    """Return files created during the active milestone."""
+    return sorted(_CREATED_THIS_MILESTONE)
+
+
+def _test_write_error(target_rel: str) -> Optional[dict[str, Any]]:
+    """Protect existing tests while allowing explicitly planned new tests."""
+    if _ALLOW_TEST_EDITS or not _is_test_path(target_rel):
+        return None
+    if target_rel in _NEW_TEST_PATHS:
+        return None
+    return {
+        "success": False,
+        "error": (
+            f"PROTECTED FILE BREACH: Modifying existing acceptance test "
+            f"('{target_rel}') is forbidden in this milestone. Create or modify "
+            "an explicitly planned agent-owned test, or fix the implementation."
+        ),
+    }
 
 
 def _write_jail_error(target_rel: str) -> Optional[dict[str, Any]]:
@@ -80,6 +126,7 @@ def _write_jail_error(target_rel: str) -> Optional[dict[str, Any]]:
             "signal blocked and explain why."
         ),
     }
+
 
 def _path_info(abs_path: Path) -> dict[str, str]:
     """Return consistent path metadata for LLM-facing tool results."""
@@ -100,12 +147,18 @@ def _path_info(abs_path: Path) -> dict[str, str]:
 # read_file
 # ---------------------------------------------------------------------------
 
-def read_file(file_path: str) -> dict[str, Any]:
+def read_file(
+    file_path: str,
+    offset: int = 1,
+    limit: Optional[int] = None,
+) -> dict[str, Any]:
     """
     Read and return the raw string content of a file.
 
     Args:
         file_path: Path relative to workspace/ (e.g. validator/email.py).
+        offset: One-based line number to start reading from.
+        limit: Maximum number of lines to return.
 
     Returns:
         {"success": True, "content": "<file text>", ...path info...}
@@ -128,7 +181,20 @@ def read_file(file_path: str) -> dict[str, Any]:
     try:
         content = target.read_text(encoding="utf-8")
         _READ_THIS_MILESTONE.add(_path_info(target)["workspace_relative_path"])
-        return {"success": True, "content": content, **_path_info(target)}
+        lines = content.splitlines(keepends=True)
+        start = max(1, int(offset))
+        if limit is None:
+            selected = lines[start - 1:]
+        else:
+            selected = lines[start - 1:start - 1 + max(0, int(limit))]
+        return {
+            "success": True,
+            "content": "".join(selected),
+            "start_line": start,
+            "end_line": start + len(selected) - 1 if selected else start - 1,
+            "total_lines": len(lines),
+            **_path_info(target),
+        }
     except Exception as exc:
         return {"success": False, "error": str(exc)}
 
@@ -164,16 +230,9 @@ def write_file(file_path: str, content: str, rewrite: bool = False) -> dict[str,
     if jail_error:
         return jail_error
 
-    # Programmatic Test Freeze Guardrail
-    if not _ALLOW_TEST_EDITS and ("tests/" in target_rel or "test_" in target_rel):
-        return {
-            "success": False,
-            "error": (
-                f"PROTECTED FILE BREACH: Modifying test files ('{target_rel}') is strictly forbidden "
-                "during implementation milestones. You must correct your source code"
-                " to make existing tests pass, rather than modifying the test cases."
-            )
-        }
+    test_error = _test_write_error(target_rel)
+    if test_error:
+        return test_error
 
     # Diff-first enforcement: rewriting a large existing file without reading
     # it first almost always means the model is guessing at current content.
@@ -195,9 +254,12 @@ def write_file(file_path: str, content: str, rewrite: bool = False) -> dict[str,
                 ),
             }
 
+    was_new = not target.exists()
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
+        if was_new:
+            _CREATED_THIS_MILESTONE.add(target_rel)
         byte_count = len(content.encode("utf-8"))
         return {
             "success": True,
@@ -237,16 +299,9 @@ def patch_file(file_path: str, search_string: str, replace_string: str) -> dict[
     if jail_error:
         return jail_error
 
-    # Programmatic Test Freeze Guardrail (Patch-level)
-    if not _ALLOW_TEST_EDITS and ("tests/" in target_rel or "test_" in target_rel):
-        return {
-            "success": False,
-            "error": (
-                f"PROTECTED FILE BREACH: Modifying test files ('{target_rel}') is strictly forbidden "
-                "during implementation milestones. You must correct your source code "
-                " to make existing tests pass, rather than modifying the test cases."
-            )
-        }
+    test_error = _test_write_error(target_rel)
+    if test_error:
+        return test_error
 
     if not target.exists():
         return {"success": False, "error": f"File not found: {file_path}"}

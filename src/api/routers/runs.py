@@ -24,7 +24,12 @@ async def create_run(
     run_queue: RunQueue = Depends(get_run_queue),
 ) -> RunResponse:
     ctx = require_session(sid, manager)
-    rec = run_queue.enqueue(ctx, body.request, model=body.model)
+    rec = run_queue.enqueue(
+        ctx,
+        body.request,
+        model=body.model,
+        run_kind=body.run_kind,
+    )
     return RunResponse(**rec.to_dict())
 
 

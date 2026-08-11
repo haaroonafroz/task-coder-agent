@@ -17,6 +17,7 @@ type FeedItem =
   | { kind: "event"; id: string; ts: string; event: SSEEvent };
 
 function eventRole(type: string): string {
+  if (type.startsWith("triage.")) return "triage";
   if (type.startsWith("plan.") || type.includes("replan")) return "orchestrator";
   if (type.startsWith("worker.") || type.startsWith("tool.")) return "worker";
   if (type.startsWith("validation.")) return "validator";
@@ -26,6 +27,14 @@ function eventRole(type: string): string {
 
 function eventTitle(ev: SSEEvent): string {
   const data = ev.data || {};
+  if (ev.type === "triage.started") return "Analyzing the current workspace for repair";
+  if (ev.type === "triage.completed") {
+    return `Triage completed (${String(data.confidence ?? "unknown")} confidence)`;
+  }
+  if (ev.type === "triage.failed") return "Triage unavailable; continuing with repair planning";
+  if (ev.type === "mission.audit") {
+    return data.passed === true ? "Completion audit passed" : "Completion audit found incomplete milestones";
+  }
   if (ev.type === "plan.created") {
     return `Plan created: ${String(data.title ?? "untitled mission")}`;
   }

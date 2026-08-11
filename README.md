@@ -1,8 +1,8 @@
 # Missions Architecture — Self-Improving Multi-Agent Coding Runtime
 
-A serial multi-agent system for building software with **small local LLMs**. The runtime decomposes a user request into milestones, routes a minimal tool set per step, implements code in an isolated workspace, and validates each milestone against an explicit **Validation Contract** before committing. Failed milestones retry with grounded error feedback; structural contract flaws trigger **negotiated replanning** with the Orchestrator.
+A serial multi-agent system for building software with **small local LLMs**. The runtime decomposes a user request into concise work packets, routes a minimal tool set per step, implements code in an isolated workspace, and has the Validator compile and run checks from each packet's acceptance criteria. Failed milestones retry with grounded error feedback; incomplete packets trigger negotiated replanning with the Orchestrator.
 
-This repo is a proof of concept: the architecture (not raw model scale) is what makes local 27B-class models usable for non-trivial Python tasks.
+This repo is a proof of concept: the architecture (not raw model scale) is what makes local 27B-class models usable for non-trivial coding tasks.
 
 ---
 
@@ -13,10 +13,10 @@ Large cloud models tolerate sloppy agent design. Small local models do not. This
 | Principle | How it is enforced |
 |---|---|
 | **Separation of concerns** | Orchestrator plans; Worker implements; Validator adversarially checks. No role shares another role's prompt or tools. |
-| **Contract-first delivery** | Every milestone ships with a machine-runnable `validation_contract.command` (pytest, lint, shell). PASS is deterministic before merge. |
-| **Negotiation through contracts** | Validator can emit `REPLAN` when the plan itself is wrong (e.g. test command mismatch). Orchestrator emits a small patch op-list (`set_contract` / `update_milestone` / `insert` / `remove`) applied deterministically — the whole plan is never regenerated. |
-| **Anti spec-gaming** | Workers cannot edit test files during implementation milestones, and cannot write outside the milestone's `target_files` at all. Both guardrails reject at the tool layer (one cheap turn) instead of post-hoc by the validator. |
-| **Grounded context** | Qdrant injects 2–3 relevant tools per milestone (not all 12). A JSON memory store records failures and milestone state; Cognee is opt-in and fire-and-forget when enabled. |
+| **Acceptance-first delivery** | Every milestone ships with observable acceptance criteria and a validation profile. The Validator compiles executable checks; low-level commands never burden the planning model. |
+| **Negotiation through packets** | Validator can emit `REPLAN` when packet intent is incomplete or contradictory. Orchestrator emits a small patch op-list (`update_milestone` / `insert` / `remove`) applied deterministically — the whole plan is never regenerated. |
+| **Anti spec-gaming** | Harness-owned acceptance tests remain protected, while agent-owned tests may be part of a coherent implementation slice. Workspace writes remain jailed, with `request_scope` available when a packet is incomplete. |
+| **Grounded context** | Core inspection/edit/check tools remain available across retries; Qdrant adds niche capabilities. A JSON memory store records failures and milestone state; Cognee is opt-in and fire-and-forget when enabled. |
 | **Diff-first editing** | Full `write_file` rewrites of existing files >60 lines are rejected unless the file was read first this milestone (or `rewrite=true`). Keeps decode cost low and regressions rare. |
 | **Serial execution** | One LLM call at a time — required on dual 16 GB GPUs where parallel agents would OOM. |
 | **Observability** | Arize Phoenix traces Orchestrator / Worker / Validator calls; `llm.call` events with token counts and prefill/decode timing land in `events.jsonl`; the web UI streams session events in real time. |
@@ -85,7 +85,7 @@ config/
   orchestrator.md      # Planning persona + contract rules + patch-ops format
   worker.md            # Implementation persona + batched tool-call format
   validator.md        # Adversarial QA persona + diff review
-  skills.md            # 12 tools (chunked for Qdrant indexing)
+  skills.md            # Tool capabilities (chunked for Qdrant indexing)
 
 src/
   main.py              # MissionsRuntime — serial pipeline + replan circuit breakers
@@ -101,7 +101,7 @@ src/
     plan_ops.py        # Deterministic plan patch validation + application
     plan_lint.py       # Pre-execution plan lint (schema, contracts, deps)
     utils.py           # JSON parsing, conversation trim, failure fingerprints
-  tools/               # file_ops (write jail + diff-first), git_ops, system_ops
+  tools/               # file ops, git ops, polyglot checks, managed UI tools
 
 frontend/
   src/                 # React control UI
@@ -147,7 +147,11 @@ cd coding-agent
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+python -m playwright install chromium
 ```
+
+The Chromium browser is installed once in the harness environment and is used
+by managed `ui_smoke` validation. It is not installed into mission workspaces.
 
 Install the React control UI dependencies:
 
@@ -344,6 +348,25 @@ python -m src.main --no-telemetry "..."    # disable Phoenix spans
 python -m src.main --no-memory    "..."    # disable memory layer entirely
 ```
 
+### Repairing a completed session
+
+Submitting a follow-up request to a completed session automatically starts a
+`repair` run in the existing workspace. Repair runs perform a read-only triage
+pass, create a new plan linked to the previous plan, and never reuse the
+previous plan's completed milestone state. Plans are archived under
+`sessions/<session-id>/plans/`.
+
+The lifecycle can also be selected explicitly from the CLI:
+
+```bash
+python -m src.main --session <session-id> --run-kind repair \
+  "Fix the runtime error reported above and add a regression test"
+python -m src.main --session <session-id> --run-kind resume \
+  "Continue the interrupted run"
+python -m src.main --session <session-id> --run-kind new \
+  "Start a separate task in this workspace"
+```
+
 ### Reset between missions
 
 ```bash
@@ -365,27 +388,31 @@ Artifacts after a run:
 
 ### Small context, small tool surface
 
-The Worker never sees all 12 tools. `tool_registry.py` indexes `config/skills.md` into **Qdrant Cloud** with:
+The Worker receives a small persistent core surface and can discover niche
+capabilities. `tool_registry.py` indexes `config/skills.md` into **Qdrant Cloud** with:
 
 - **Dense vectors:** `BAAI/bge-base-en-v1.5` (768-dim, local via HuggingFace)
 - **Sparse vectors:** BM25-style TF-IDF with per-skill **keyword boost** from `Keywords:` metadata
-- **Fusion:** Reciprocal Rank Fusion → top 3 skills injected per milestone
+- **Fusion:** Reciprocal Rank Fusion → top 3 niche skills injected per milestone
 
 This reduces tool-selection fatigue — a common failure mode for 7B–27B models given long tool lists.
 
 ### Worker protocol (json_mode + batched calls)
 
-The Worker uses **grammar-constrained decoding** (`json_mode`) so every response is guaranteed parseable JSON, eliminating the invalid-JSON retry class. Each turn the worker emits one JSON object:
+The Worker requests structured JSON mode and applies deterministic parsing and
+repair when providers return malformed output. Each turn the worker emits one
+JSON object:
 
 - A single tool call: `{"tool": "...", "args": {...}, "reasoning": "..."}`
 - A batch of up to 3 calls: `{"calls": [...]}` — one LLM round trip instead of three
-- A status signal: `{"status": "complete" | "blocked"}`
+- A status signal: `{"status": "complete" | "blocked" | "request_scope"}`
 
 Native chat messages (system + alternating user/assistant) are sent to the LLM — never a flattened single-turn blob — so the rendered prompt stays append-only and llama.cpp's prefix cache stays hot across turns. On validator FAIL, the conversation **resumes** (not cold-restarts) with the validator's raw contract output appended.
 
 ### Progressive tool discovery and enforcement
 
-The initial Qdrant retrieval provides three operational tools plus one
+The runtime always exposes file inspection/editing, project discovery and
+verification tools. Qdrant adds specialized capabilities plus the
 always-available deterministic `search_tools` meta-tool:
 
 ```json
@@ -408,35 +435,34 @@ redacted stdout/stderr tails, return codes, timeout/policy status, duration,
 and a stable failure signature. Repeating the same failure twice or making
 five consecutive failed calls trips the Worker circuit breaker.
 
-### Harness-side contract auto-run
+### Harness-side validation feedback
 
-After every successful `write_file` / `patch_file`, the harness automatically runs the milestone's validation contract and appends result to the worker's next turn — test feedback costs **zero LLM turns** (capped at 8 auto-runs per milestone).
+After every successful `write_file` / `patch_file`, the harness automatically
+runs the Validator-compiled test or lint check and appends result to the
+worker's next turn. UI checks are run by the Validator after the worker
+signals completion.
 
 ### Write jail + diff-first enforcement
 
-- **Per-milestone write jail**: `write_file` and `patch_file` reject paths outside the milestone's `target_files` at the tool layer — one cheap turn instead of a full worker+validation cycle.
+- **Per-milestone write policy**: `write_file` and `patch_file` reject paths outside the packet's declared scope at the tool layer; the worker can return `request_scope` when a legitimate helper or manifest is missing.
 - **Diff-first**: full `write_file` rewrites of existing files >60 lines are rejected unless the file was read first this milestone, or `"rewrite": true` is passed.
 
-### Validation contracts and replanning
+### Acceptance criteria and replanning
 
-Each milestone in `plan.json` includes:
+Each milestone in `plan.json` includes high-level intent:
 
 ```json
-"validation_contract": {
-  "type": "pytest",
-  "command": "python -m pytest tests/test_foo.py -v",
-  "pass_criteria": "All tests pass"
-}
+"acceptance_criteria": ["The feature behaves correctly."],
+"validation_profile": "python"
 ```
 
-The Validator runs the command first. Structural checks (e.g. illegal test-file edits, out-of-scope writes) short-circuit before an LLM call. The LLM validator receives the **bounded git diff** of actual changes, not just the worker's self-report. Every verdict carries a **failure signature** (deterministic fingerprint of milestone + command + returncode + error line) for replan dedup.
+The Validator compiles the profile and criteria into canonical checks. Structural checks (e.g. illegal test-file edits, out-of-scope writes) short-circuit before an LLM call. The LLM validator receives the **bounded git diff** of actual changes, not just the worker's self-report. Every verdict carries a **failure signature** for replan dedup.
 
 If the **plan** is wrong — not the implementation — the Validator returns `REPLAN` and the Orchestrator emits a **patch op-list**:
 
 ```json
 {"operations": [
-  {"op": "set_contract", "milestone_id": "M3", "validation_contract": {...}},
-  {"op": "update_milestone", "milestone_id": "M3", "fields": {"target_files": ["..."]}},
+  {"op": "update_milestone", "milestone_id": "M3", "fields": {"acceptance_criteria": ["..."], "validation_profile": "ui"}},
   {"op": "insert_milestone_after", "after_id": "M2", "milestone": {...}},
   {"op": "remove_milestone", "milestone_id": "M4"}
 ]}

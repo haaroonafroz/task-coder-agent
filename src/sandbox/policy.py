@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
 
-ShellProfile = str  # "worker" | "validation" | "pip"
+ShellProfile = str  # "worker" | "validation" | "pip" | "devserver" | "browser"
 
 
 class SandboxMode(str, Enum):
@@ -33,6 +33,7 @@ class SandboxMode(str, Enum):
 class NetworkMode(str, Enum):
     NONE = "none"
     PIP_EGRESS = "pip"  # allow network for pip only
+    LOCALHOST = "localhost"  # reserved for harness-managed local services
 
 
 # Blocked in all profiles.
@@ -95,6 +96,11 @@ _VALIDATION_ALLOW: set[str] = {
 }
 
 _PIP_ALLOW: set[str] = {"python", "python3"}
+_DEVSERVER_ALLOW: set[str] = {
+    "python", "python3", "node", "npm", "pnpm", "yarn", "npx",
+    "streamlit", "uvicorn", "vite",
+}
+_BROWSER_ALLOW: set[str] = {"python", "python3", "node", "npx"}
 
 _ALLOWED_PY_MODULES_WORKER: set[str] = {
     "pytest", "flake8", "black", "mypy", "ruff", "compileall", "py_compile",
@@ -168,6 +174,10 @@ def _allowlist_for_profile(profile: ShellProfile) -> set[str]:
         return _VALIDATION_ALLOW
     if profile == "pip":
         return _PIP_ALLOW
+    if profile == "devserver":
+        return _DEVSERVER_ALLOW
+    if profile == "browser":
+        return _BROWSER_ALLOW
     return _WORKER_ALLOW
 
 
@@ -176,6 +186,10 @@ def _py_modules_for_profile(profile: ShellProfile) -> set[str]:
         return _ALLOWED_PY_MODULES_VALIDATION
     if profile == "pip":
         return _ALLOWED_PY_MODULES_PIP
+    if profile in {"devserver", "browser"}:
+        return {
+            "streamlit", "uvicorn", "http.server", "http.server",
+        }
     return _ALLOWED_PY_MODULES_WORKER
 
 
@@ -324,10 +338,18 @@ def validate_argv(
     argv: list[str],
     profile: ShellProfile = "worker",
 ) -> PolicyVerdict:
-    """Validate an argv list (no shell) — profile-aware blocklist only."""
+    """Validate an argv list (no shell) with profile-aware restrictions."""
     if not argv:
         return PolicyVerdict(False, "Empty argv")
     block = _check_blocklist(" ".join(argv), profile)
     if block:
         return PolicyVerdict(False, block)
+    if profile in {"devserver", "browser"}:
+        token = _first_command_token(" ".join(argv))
+        allow = _allowlist_for_profile(profile)
+        if token not in allow and not is_python_interpreter(token):
+            return PolicyVerdict(
+                False,
+                f"Command '{token}' not in {profile} allowlist",
+            )
     return PolicyVerdict(True)
