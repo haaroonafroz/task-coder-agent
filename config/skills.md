@@ -46,19 +46,27 @@
 - **Keywords:** inspect, ui, browser, frontend, streamlit, react, visible, assert
 - **Parameters:**
   - `server_id` (string): Identifier returned by `serve_app`.
-  - `action` (string, optional): `navigate`, `snapshot`, `assert_text`, `screenshot`, `accessibility`, `audit`, `click`, or `fill`.
+  - `action` (string, optional): `navigate`, `snapshot`, `assert_text`, `flow`,
+    `screenshot`, `accessibility`, `audit`, `click`, or `fill`.
   - `path` (string, optional): Local URL path.
   - `text` (string, optional): Text that must be visible for `assert_text`.
   - `selector` (string, optional): Browser locator for `click` or `fill`.
   - `value` (string, optional): Value for `fill`.
+  - `steps` (array, optional): Ordered steps for `flow` — each step is an object
+    with `action` (`fill`, `click`, `assert_text`, `assert_visible`, `snapshot`,
+    `wait`), plus `selector`, `value`, `text`, or `ms` as needed.
 - **Returns:** HTTP status, title, bounded visible text, assertion result,
-  browser console/page errors, failed requests, accessibility issues, and
-  sandbox artifact paths when applicable.
-- **When to use:** Verify UI output after starting a managed local server.
-  Browser actions use the harness-wide Playwright/Chromium installation.
+  browser console/page errors, failed requests, accessibility issues, flow step
+  results, actionable hints, and sandbox artifact paths when applicable.
+- **When to use:** Optional worker preflight after `serve_app`. Use `flow` for
+  multi-step interactions in **one** browser session. The validator runs official
+  smoke checks after you signal `complete`.
 - **Example:**
   ```json
-  {"tool": "inspect_ui", "args": {"server_id": "server-1234", "action": "assert_text", "text": "To Do"}, "reasoning": "Check that the board renders its columns."}
+  {"tool": "inspect_ui", "args": {"server_id": "server-1234", "action": "accessibility"}, "reasoning": "Quick a11y preflight before complete."}
+  ```
+  ```json
+  {"tool": "inspect_ui", "args": {"server_id": "server-1234", "action": "flow", "steps": [{"action": "fill", "selector": "#name", "value": "Exercise"}, {"action": "click", "selector": "#add-btn"}, {"action": "assert_text", "text": "Exercise"}]}, "reasoning": "Verify add-habit interaction in one browser session."}
   ```
 <!-- SKILL_END -->
 

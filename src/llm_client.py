@@ -116,6 +116,15 @@ class LLMResult:
     tokens_prompt: int = 0
     fallback_used: bool = False
     thinking_level: Optional[str] = None
+    thinking_text: str = ""
+
+
+def get_context_length() -> int:
+    """Return configured llama.cpp context length for UI metrics."""
+    try:
+        return max(1024, int(os.getenv("CONTEXT_LEN", "32768")))
+    except ValueError:
+        return 32768
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +243,7 @@ def get_model_catalog() -> list[dict[str, Any]]:
             "model": models_by_role["orchestrator"],
             "models_by_role": models_by_role,
             "thinking_by_role": thinking_by_role,
+            "context_length": get_context_length() if key == "local" else None,
         })
 
     entries.insert(0, {
@@ -252,6 +262,7 @@ def get_model_catalog() -> list[dict[str, Any]]:
             "worker": "per-backend",
             "validator": "per-backend",
         },
+        "context_length": get_context_length(),
     })
     return entries
 
@@ -327,6 +338,7 @@ def call_llm(
     role: AgentRole = "worker",
     enable_thinking: Optional[bool] = None,
     messages: Optional[list[dict[str, Any]]] = None,
+    stream_context: Any = None,
 ) -> LLMResult:
     """
     Send a prompt to the selected LLM and return the result with precise timing.
@@ -368,6 +380,7 @@ def call_llm(
                 fallback_used=(attempt > 0),
                 enable_thinking_override=enable_thinking,
                 messages=messages,
+                stream_context=stream_context,
             )
         except (APIConnectionError, ConnectionRefusedError, OSError) as exc:
             print(f"[LLMClient] {model_key} unreachable: {exc}. Trying next.")
@@ -400,6 +413,7 @@ def _call_single(
     fallback_used: bool,
     enable_thinking_override: Optional[bool],
     messages: Optional[list[dict[str, Any]]] = None,
+    stream_context: Any = None,
 ) -> LLMResult:
     """Execute a single streaming call to the given model backend."""
     cfg = resolve_model_config(model_key, role)
@@ -408,6 +422,10 @@ def _call_single(
     thinking_level = cfg.thinking_level
     if enable_thinking_override is not None and model_key == "local":
         thinking_level = "medium" if enable_thinking_override else "off"
+
+    model_used = f"{model_key}/{cfg.model_name}"
+    if stream_context is not None:
+        stream_context.start(model_used=model_used, thinking_level=thinking_level)
 
     client = _build_client(cfg)
 
@@ -457,19 +475,52 @@ def _call_single(
 
     t0 = time.perf_counter()
     t_first: Optional[float] = None
-    chunks: list[str] = []
+    content_chunks: list[str] = []
+    thinking_chunks: list[str] = []
+    pending_thinking = ""
+    pending_content = ""
     prompt_tokens = 0
     completion_tokens = 0
+    delta_flush = 48
+
+    def _flush(channel: str, pending: str) -> str:
+        if stream_context is not None and pending:
+            stream_context.delta(channel, pending)
+        return ""
 
     stream = client.chat.completions.create(**kwargs)
     for chunk in stream:
-        if t_first is None and chunk.choices and chunk.choices[0].delta.content:
+        if not chunk.choices:
+            if chunk.usage is not None:
+                prompt_tokens = chunk.usage.prompt_tokens or 0
+                completion_tokens = chunk.usage.completion_tokens or 0
+            continue
+
+        delta = chunk.choices[0].delta
+        reasoning = getattr(delta, "reasoning_content", None)
+        content = getattr(delta, "content", None)
+
+        if t_first is None and (reasoning or content):
             t_first = time.perf_counter()
-        if chunk.choices and chunk.choices[0].delta.content:
-            chunks.append(chunk.choices[0].delta.content)
+
+        if reasoning:
+            thinking_chunks.append(reasoning)
+            pending_thinking += reasoning
+            if len(pending_thinking) >= delta_flush:
+                pending_thinking = _flush("thinking", pending_thinking)
+
+        if content:
+            content_chunks.append(content)
+            pending_content += content
+            if len(pending_content) >= delta_flush:
+                pending_content = _flush("content", pending_content)
+
         if chunk.usage is not None:
             prompt_tokens = chunk.usage.prompt_tokens or 0
             completion_tokens = chunk.usage.completion_tokens or 0
+
+    pending_thinking = _flush("thinking", pending_thinking)
+    pending_content = _flush("content", pending_content)
 
     t2 = time.perf_counter()
     if t_first is None:
@@ -485,9 +536,12 @@ def _call_single(
             f"(role={role}, thinking={thinking_level})"
         )
 
-    return LLMResult(
-        text="".join(chunks),
-        model_used=f"{model_key}/{cfg.model_name}",
+    thinking_text = "".join(thinking_chunks)
+    text = "".join(content_chunks)
+
+    result = LLMResult(
+        text=text,
+        model_used=model_used,
         prefill_ms=round(prefill_ms, 2),
         decode_ms=round(decode_ms, 2),
         total_ms=round(total_ms, 2),
@@ -495,4 +549,14 @@ def _call_single(
         tokens_prompt=prompt_tokens,
         fallback_used=fallback_used,
         thinking_level=thinking_level,
+        thinking_text=thinking_text,
     )
+
+    if stream_context is not None:
+        stream_context.finish(
+            result,
+            thinking_text=thinking_text,
+            output_text=text,
+        )
+
+    return result

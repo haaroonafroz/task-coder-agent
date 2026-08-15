@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Session, Message, ModelChoice, SSEEvent } from "../api/types";
 import { ModelSelect } from "./ModelSelect";
+import { PersonaTurn } from "./PersonaTurn";
 import { useModels } from "../hooks";
+import { buildChatItems, formatTs, missionStatusLabel } from "../hooks/useChatTurns";
 
 interface Props {
   session: Session | null;
@@ -12,98 +14,22 @@ interface Props {
   onSend: (content: string, triggerRun: boolean, model?: string) => void;
 }
 
-type FeedItem =
-  | { kind: "message"; id: string; ts: string; message: Message }
-  | { kind: "event"; id: string; ts: string; event: SSEEvent };
-
-function eventRole(type: string): string {
-  if (type.startsWith("triage.")) return "triage";
-  if (type.startsWith("plan.") || type.includes("replan")) return "orchestrator";
-  if (type.startsWith("worker.") || type.startsWith("tool.")) return "worker";
-  if (type.startsWith("validation.")) return "validator";
-  if (type.startsWith("milestone.")) return "milestone";
-  return "system";
-}
-
-function eventTitle(ev: SSEEvent): string {
-  const data = ev.data || {};
-  if (ev.type === "triage.started") return "Analyzing the current workspace for repair";
-  if (ev.type === "triage.completed") {
-    return `Triage completed (${String(data.confidence ?? "unknown")} confidence)`;
-  }
-  if (ev.type === "triage.failed") return "Triage unavailable; continuing with repair planning";
-  if (ev.type === "mission.audit") {
-    return data.passed === true ? "Completion audit passed" : "Completion audit found incomplete milestones";
-  }
-  if (ev.type === "plan.created") {
-    return `Plan created: ${String(data.title ?? "untitled mission")}`;
-  }
-  if (ev.type === "plan.updated") return "Plan updated after replanning";
-  if (ev.type === "milestone.started") {
-    return `Started ${String(data.milestone_id ?? "milestone")}: ${String(data.title ?? "")}`;
-  }
-  if (ev.type === "milestone.passed") {
-    return `${String(data.milestone_id ?? "Milestone")} passed`;
-  }
-  if (ev.type === "milestone.replan") {
-    return `Replan requested for ${String(data.milestone_id ?? "milestone")}`;
-  }
-  if (ev.type === "tool.called") {
-    const tool = String(data.tool ?? "tool");
-    const reasoning = typeof data.reasoning === "string" ? data.reasoning : "";
-    return reasoning ? `${tool}: ${reasoning}` : `${tool} called`;
-  }
-  if (ev.type === "tool.result") {
-    return `${String(data.tool ?? "tool")} completed`;
-  }
-  if (ev.type === "validation.contract_run") {
-    return `Validation contract exited ${String(data.returncode ?? "?")}`;
-  }
-  if (ev.type === "validation.finished") {
-    return `Validation ${String(data.verdict ?? "finished")}`;
-  }
-  if (ev.type === "worker.invalid_json") {
-    return `Worker emitted invalid JSON (${String(data.attempt ?? "?")}/${String(
-      data.max_attempts ?? "?"
-    )})`;
-  }
-  if (ev.type === "mission.complete") {
-    return `Mission ${String(data.status ?? "complete")}`;
-  }
-  if (typeof data.reason === "string") return data.reason;
-  if (typeof data.status === "string") return data.status;
-  return ev.type;
-}
-
-function shouldShowDetails(ev: SSEEvent): boolean {
-  return Object.keys(ev.data || {}).length > 0;
-}
-
-function formatTs(ts: string): string {
-  return ts.split("T")[1] || ts;
-}
-
 export function ChatPanel({ session, messages, sending, connected, events, onSend }: Props) {
   const [input, setInput] = useState("");
   const [model, setModel] = useState<ModelChoice>("auto");
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const { models } = useModels();
 
-  const feed = useMemo<FeedItem[]>(() => {
-    const messageItems: FeedItem[] = messages.map((message) => ({
-      kind: "message",
-      id: `message-${message.id}`,
-      ts: message.ts,
-      message,
-    }));
-    const eventItems: FeedItem[] = events.map((event, index) => ({
-      kind: "event",
-      id: `event-${event.index ?? index}-${event.ts}-${event.type}`,
-      ts: event.ts,
-      event,
-    }));
-    return [...messageItems, ...eventItems].sort((a, b) => a.ts.localeCompare(b.ts));
-  }, [messages, events]);
+  const contextLength = useMemo(() => {
+    const local = models.find((entry) => entry.key === "local");
+    const auto = models.find((entry) => entry.key === "auto");
+    return local?.context_length ?? auto?.context_length ?? null;
+  }, [models]);
+
+  const feed = useMemo(
+    () => buildChatItems(messages, events),
+    [messages, events],
+  );
 
   useEffect(() => {
     if (session) {
@@ -113,7 +39,7 @@ export function ChatPanel({ session, messages, sending, connected, events, onSen
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [feed.length]);
+  }, [feed]);
 
   const handleSend = () => {
     if (!input.trim() || sending) return;
@@ -124,9 +50,7 @@ export function ChatPanel({ session, messages, sending, connected, events, onSen
   if (!session) {
     return (
       <div className="panel">
-        <div className="empty-state">
-          Select or create a session to start chatting.
-        </div>
+        <div className="empty-state">Select or create a session to start chatting.</div>
       </div>
     );
   }
@@ -150,40 +74,43 @@ export function ChatPanel({ session, messages, sending, connected, events, onSen
           </div>
         )}
         {feed.map((item) => {
-          if (item.kind === "message") {
-            const msg = item.message;
+          if (item.kind === "user") {
             return (
-              <div key={item.id} className={`message ${msg.role}`}>
-                <div className="role">
-                  {msg.role}
-                  {msg.run_id && <span className="run-chip">run:{msg.run_id.slice(0, 8)}</span>}
-                </div>
-                <div className="content">{msg.content}</div>
-                <div className="ts">{formatTs(msg.ts)}</div>
+              <div key={item.id} className="message user">
+                <div className="role">You</div>
+                <div className="content">{item.content}</div>
+                <div className="ts">{formatTs(item.ts)}</div>
               </div>
             );
           }
-          const ev = item.event;
-          const milestoneId =
-            typeof ev.data?.milestone_id === "string" ? ev.data.milestone_id : null;
+          if (item.kind === "system") {
+            return (
+              <div key={item.id} className="message system-message">
+                <div className="content">{item.content}</div>
+                <div className="ts">{formatTs(item.ts)}</div>
+              </div>
+            );
+          }
+          if (item.kind === "mission_summary") {
+            return (
+              <div key={item.id} className={`message mission-summary mission-${item.status}`}>
+                <div className="role persona-role">
+                  <span>Mission recap</span>
+                  <span className={`mission-status-badge status-${item.status}`}>
+                    {missionStatusLabel(item.status)}
+                  </span>
+                </div>
+                <pre className="mission-summary-body">{item.content}</pre>
+                <div className="ts">{formatTs(item.ts)}</div>
+              </div>
+            );
+          }
           return (
-            <div key={item.id} className="message event-message">
-              <div className="role">
-                {eventRole(ev.type)}
-                {milestoneId && <span className="run-chip">{milestoneId}</span>}
-              </div>
-              <div className="content">
-                <div className="event-title">{eventTitle(ev)}</div>
-                <div className="event-type-label">{ev.type}</div>
-                {shouldShowDetails(ev) && (
-                  <details className="event-details">
-                    <summary>details</summary>
-                    <pre>{JSON.stringify(ev.data, null, 2)}</pre>
-                  </details>
-                )}
-              </div>
-              <div className="ts">{formatTs(ev.ts)}</div>
-            </div>
+            <PersonaTurn
+              key={item.id}
+              turn={item}
+              contextLength={contextLength}
+            />
           );
         })}
         <div ref={messagesEndRef} />

@@ -42,6 +42,7 @@ from src.agents.test_scaffold_validator import (
     red_phase_contract,
     validate_test_scaffold_structure,
 )
+from src.agents.llm_stream_events import stream_context_for
 from src.agents.ui_validation import run_ui_smoke_contract
 from src.agents.validation_compiler import compile_validation_contract
 
@@ -55,6 +56,32 @@ _VALIDATOR_MD = (_CONFIG_DIR / "validator.md").read_text()
 
 MAX_TOKENS_VALIDATOR = int(os.getenv("MAX_TOKENS_VALIDATOR", "48000"))
 MAX_RETRY_CYCLES     = 3
+
+
+def _emit_validation_finished(
+    emitter: "EventEmitter | None",
+    ms_id: str,
+    verdict: dict[str, Any],
+    path: str,
+) -> None:
+    """Emit validation.finished with chat-friendly summary fields."""
+    if not emitter:
+        return
+    errors = verdict.get("errors")
+    if errors is not None and not isinstance(errors, list):
+        errors = [str(errors)]
+    payload: dict[str, Any] = {
+        "milestone_id": ms_id,
+        "verdict": verdict.get("verdict", "FAIL"),
+        "path": path,
+    }
+    for key in ("validation_details", "fix_guidance", "replan_guidance", "root_cause"):
+        val = verdict.get(key)
+        if val:
+            payload[key] = val
+    if errors:
+        payload["errors"] = [str(e) for e in errors[:10]]
+    emitter.emit("validation.finished", **payload)
 
 
 def _unauthorized_test_edits(worker_result: dict) -> list[str]:
@@ -134,8 +161,7 @@ def run_validator(
                 milestone_id=ms_id,
                 unauthorized_edits=unauthorized_edits,
             )
-            emitter.emit("validation.finished", milestone_id=ms_id, verdict="FAIL")
-        return {
+        spec_fail = {
             "verdict": "FAIL",
             "milestone_id": ms_id,
             "errors": [
@@ -155,6 +181,8 @@ def run_validator(
                 ms_id, command, f"spec gaming: {unauthorized_edits}", None
             ),
         }
+        _emit_validation_finished(emitter, ms_id, spec_fail, "spec_gaming")
+        return spec_fail
 
     boundary_fail = _target_file_boundary_fail(milestone, worker_result)
     if boundary_fail:
@@ -173,7 +201,7 @@ def run_validator(
                 unauthorized_edits=boundary_fail["out_of_scope_files"],
                 reason="out_of_scope_target_files",
             )
-            emitter.emit("validation.finished", milestone_id=ms_id, verdict="FAIL")
+        _emit_validation_finished(emitter, ms_id, boundary_fail, "out_of_scope")
         return boundary_fail
 
     contract_type = str(contract.get("type", "")).lower()
@@ -186,13 +214,7 @@ def run_validator(
                 contract_type="ui_smoke",
             )
         ui_verdict = run_ui_smoke_contract(contract)
-        if emitter:
-            emitter.emit(
-                "validation.finished",
-                milestone_id=ms_id,
-                verdict=ui_verdict.get("verdict", "FAIL"),
-                path="ui_smoke",
-            )
+        _emit_validation_finished(emitter, ms_id, ui_verdict, "ui_smoke")
         return ui_verdict
 
     if emitter:
@@ -250,26 +272,14 @@ def run_validator(
     )
     if policy_replan:
         print(f"    [Validator] Policy denial REPLAN: {policy_replan['replan_guidance'][:120]}…")
-        if emitter:
-            emitter.emit(
-                "validation.finished",
-                milestone_id=ms_id,
-                verdict="REPLAN",
-                path="policy_denied",
-            )
+        _emit_validation_finished(emitter, ms_id, policy_replan, "policy_denied")
         return _with_failure_context(policy_replan)
 
     # --- Deterministic REPLAN check ------------------------------------------
     replan = _detect_contract_replan(milestone, worker_result, contract_output, returncode)
     if replan:
         print(f"    [Validator] Deterministic REPLAN: {replan['replan_guidance']}")
-        if emitter:
-            emitter.emit(
-                "validation.finished",
-                milestone_id=ms_id,
-                verdict="REPLAN",
-                reason="deterministic",
-            )
+        _emit_validation_finished(emitter, ms_id, replan, "deterministic_replan")
         return _with_failure_context(replan)
 
     # --- TDD red-phase PASS (test-scaffolding milestone) ---------------------
@@ -278,13 +288,7 @@ def run_validator(
     )
     if tdd_pass:
         print(f"    [Validator] TDD red-phase PASS: {tdd_pass['validation_details']}")
-        if emitter:
-            emitter.emit(
-                "validation.finished",
-                milestone_id=ms_id,
-                verdict="PASS",
-                path="tdd_red",
-            )
+        _emit_validation_finished(emitter, ms_id, tdd_pass, "tdd_red")
         return tdd_pass
 
     # --- Spec-gaming: all tests skipped on scaffolding milestone -------------
@@ -293,13 +297,7 @@ def run_validator(
     )
     if skip_fail:
         print("    [Validator] Spec-gaming FAIL: all tests skipped")
-        if emitter:
-            emitter.emit(
-                "validation.finished",
-                milestone_id=ms_id,
-                verdict="FAIL",
-                path="all_skipped",
-            )
+        _emit_validation_finished(emitter, ms_id, skip_fail, "all_skipped")
         return _with_failure_context(skip_fail)
 
     # --- Collect-only PASS (test-scaffolding milestone) ----------------------
@@ -308,13 +306,7 @@ def run_validator(
     )
     if collect_pass:
         print(f"    [Validator] Collect-only PASS: {collect_pass['validation_details']}")
-        if emitter:
-            emitter.emit(
-                "validation.finished",
-                milestone_id=ms_id,
-                verdict="PASS",
-                path="collect_only",
-            )
+        _emit_validation_finished(emitter, ms_id, collect_pass, "collect_only")
         return collect_pass
 
     # --- Fast-path PASS (contract exited 0) ----------------------------------
@@ -328,18 +320,13 @@ def run_validator(
         if dep_fail:
             return _with_failure_context(dep_fail)
 
-        if emitter:
-            emitter.emit(
-                "validation.finished",
-                milestone_id=ms_id,
-                verdict="PASS",
-                path="fast_path",
-            )
-        return {
+        fast_pass = {
             "verdict": "PASS",
             "milestone_id": ms_id,
             "validation_details": "Contract command exited 0.",
         }
+        _emit_validation_finished(emitter, ms_id, fast_pass, "fast_path")
+        return fast_pass
 
     # --- LLM verdict for non-zero exit or commandless milestones -------------
     diff_block = _bounded_workspace_diff()
@@ -381,51 +368,32 @@ def run_validator(
         result = call_llm(
             prompt, model=model, max_tokens=MAX_TOKENS_VALIDATOR,
             json_mode=True, role="validator",
-        )
-
-    if emitter:
-        emitter.emit(
-            "llm.call",
-            role="validator",
-            milestone_id=ms_id,
-            model_used=result.model_used,
-            tokens_prompt=result.tokens_prompt,
-            tokens_generated=result.tokens_generated,
-            prefill_ms=result.prefill_ms,
-            decode_ms=result.decode_ms,
-            total_ms=result.total_ms,
-            thinking_level=result.thinking_level,
-            fallback_used=result.fallback_used,
+            stream_context=stream_context_for(
+                emitter,
+                "validator",
+                milestone_id=ms_id,
+                output_kind="json",
+            ),
         )
 
     parsed = parse_json_from_text(result.text)
     if parsed is None:
         if command and "returncode: 0" in contract_output:
-            if emitter:
-                emitter.emit(
-                    "validation.finished",
-                    milestone_id=ms_id,
-                    verdict="PASS",
-                    path="unparseable_contract_ok",
-                )
-            return {
+            unparseable_pass = {
                 "verdict": "PASS",
                 "milestone_id": ms_id,
                 "validation_details": "Contract command exited 0.",
             }
-        if emitter:
-            emitter.emit(
-                "validation.finished",
-                milestone_id=ms_id,
-                verdict="FAIL",
-                path="unparseable",
-            )
-        return _with_failure_context({
+            _emit_validation_finished(emitter, ms_id, unparseable_pass, "unparseable_contract_ok")
+            return unparseable_pass
+        unparseable_fail = {
             "verdict": "FAIL",
             "milestone_id": ms_id,
             "errors": ["Could not parse validator response."],
             "fix_guidance": result.text[:500],
-        })
+        }
+        _emit_validation_finished(emitter, ms_id, unparseable_fail, "unparseable")
+        return _with_failure_context(unparseable_fail)
 
     parsed = _normalize_validator_verdict(parsed, returncode=returncode)
     parsed = _block_infrastructure_replan(parsed, contract_output, returncode)
@@ -436,13 +404,7 @@ def run_validator(
         parsed["verdict"] = "PASS"
         parsed.setdefault("validation_details", "Contract command exited 0.")
 
-    if emitter:
-        emitter.emit(
-            "validation.finished",
-            milestone_id=ms_id,
-            verdict=parsed.get("verdict", "FAIL"),
-            path="llm",
-        )
+    _emit_validation_finished(emitter, ms_id, parsed, "llm")
 
     return _with_failure_context(parsed)
 
@@ -687,18 +649,7 @@ def _missing_dependency_fail(
     message = format_missing_dependency_message(report)
     print(f"    [Validator] REJECTED: {message}")
 
-    if emitter:
-        emitter.emit(
-            "dependency.missing",
-            milestone_id=ms_id,
-            packages=report.missing_packages,
-            imports=report.missing_imports,
-            checked_files=report.checked_files,
-            source="validator",
-        )
-        emitter.emit("validation.finished", milestone_id=ms_id, verdict="FAIL")
-
-    return {
+    dep_fail = {
         "verdict": "FAIL",
         "milestone_id": ms_id,
         "errors": [message, *report.errors],
@@ -712,6 +663,19 @@ def _missing_dependency_fail(
             "target files import successfully before signalling complete."
         ),
     }
+
+    if emitter:
+        emitter.emit(
+            "dependency.missing",
+            milestone_id=ms_id,
+            packages=report.missing_packages,
+            imports=report.missing_imports,
+            checked_files=report.checked_files,
+            source="validator",
+        )
+        _emit_validation_finished(emitter, ms_id, dep_fail, "missing_dependency")
+
+    return dep_fail
 
 
 def _target_file_boundary_fail(

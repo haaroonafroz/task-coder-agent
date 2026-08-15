@@ -167,6 +167,7 @@ class ModelInfo(BaseModel):
     error: Optional[str] = None
     models_by_role: dict[str, str] = Field(default_factory=dict)
     thinking_by_role: dict[str, str] = Field(default_factory=dict)
+    context_length: Optional[int] = None
 
 
 class ToolParamSchema(BaseModel):

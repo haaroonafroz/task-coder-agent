@@ -77,6 +77,7 @@ from src.agents import (
 )
 from src.agents.orchestrator import repair_plan_issues
 from src.agents.plan_lint import lint_plan
+from src.agents.mission_summary import build_mission_summary
 
 _CONFIG_DIR   = _ROOT / "config"
 _SKILLS_PATH  = _CONFIG_DIR / "skills.md"
@@ -173,6 +174,8 @@ class MissionResult:
     session_id: str
     run_kind: str = "new"
     plan_id: Optional[str] = None
+    summary_text: str = ""
+    failure_reason: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -651,6 +654,18 @@ class MissionsRuntime:
             plan_id=plan_id,
         )
 
+        summary = build_mission_summary(
+            title=title,
+            status=status,
+            milestones_passed=passed,
+            milestones_total=len(milestones),
+            total_elapsed_ms=result.total_elapsed_ms,
+            handoffs=handoffs,
+            incomplete_milestone_ids=incomplete_ids,
+        )
+        result.summary_text = summary["summary_text"]
+        result.failure_reason = summary.get("failure_reason", "")
+
         if self._emitter:
             self._emitter.emit(
                 "mission.complete",
@@ -660,6 +675,9 @@ class MissionsRuntime:
                 milestones_passed=passed,
                 milestones_total=len(milestones),
                 total_elapsed_ms=result.total_elapsed_ms,
+                summary_text=result.summary_text,
+                failure_reason=result.failure_reason,
+                files_modified=summary.get("files_modified", []),
             )
 
             # Phase 6 — optional auto-eval (default off via MISSIONS_AUTO_EVAL).

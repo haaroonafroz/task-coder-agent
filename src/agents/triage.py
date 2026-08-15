@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
+from src.agents.llm_stream_events import stream_context_for
 from src.agents.utils import parse_json_from_text
 from src.events import EventEmitter
 from src.llm_client import ModelChoice, call_llm, resolve_model_config
@@ -85,6 +86,11 @@ def run_triage(
                 max_tokens=_MAX_TOKENS_TRIAGE,
                 json_mode=True,
                 role="triage",
+                stream_context=stream_context_for(
+                    emitter,
+                    "triage",
+                    output_kind="json",
+                ),
             )
         result_text = result.text
         parsed = parse_json_from_text(result.text)
@@ -96,18 +102,6 @@ def run_triage(
                     "triage.completed",
                     confidence=report.get("confidence", "low"),
                     affected_files=report.get("affected_files", []),
-                )
-                emitter.emit(
-                    "llm.call",
-                    role="triage",
-                    model_used=result.model_used,
-                    tokens_prompt=result.tokens_prompt,
-                    tokens_generated=result.tokens_generated,
-                    prefill_ms=result.prefill_ms,
-                    decode_ms=result.decode_ms,
-                    total_ms=result.total_ms,
-                    thinking_level=result.thinking_level,
-                    fallback_used=result.fallback_used,
                 )
             return report
 

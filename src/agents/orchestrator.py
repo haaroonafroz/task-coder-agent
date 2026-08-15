@@ -29,6 +29,7 @@ from src.llm_client import call_llm, ModelChoice, resolve_model_config
 from src.telemetry import span_llm_call, TelemetryContext
 from src.agents.utils import parse_json_from_text
 from src.agents.plan_ops import apply_plan_patch, PlanPatchError
+from src.agents.llm_stream_events import stream_context_for
 from src.events import EventEmitter
 
 # ---------------------------------------------------------------------------
@@ -48,29 +49,6 @@ _JSON_CORRECTION_ATTEMPTS = 2
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
-
-def _emit_llm_metrics(
-    emitter: Optional[EventEmitter],
-    result: Any,
-    *,
-    phase: str,
-) -> None:
-    if emitter is None:
-        return
-    emitter.emit(
-        "llm.call",
-        role="orchestrator",
-        phase=phase,
-        model_used=result.model_used,
-        tokens_prompt=result.tokens_prompt,
-        tokens_generated=result.tokens_generated,
-        prefill_ms=result.prefill_ms,
-        decode_ms=result.decode_ms,
-        total_ms=result.total_ms,
-        thinking_level=result.thinking_level,
-        fallback_used=result.fallback_used,
-    )
-
 
 def _call_json_with_correction(
     initial_prompt: str,
@@ -108,8 +86,13 @@ def _call_json_with_correction(
             result = call_llm(
                 prompt, model=model, max_tokens=MAX_TOKENS_ORCHESTRATOR,
                 json_mode=True, role=role,  # type: ignore[arg-type]
+                stream_context=stream_context_for(
+                    emitter,
+                    "orchestrator",
+                    phase=span_name,
+                    output_kind="json",
+                ),
             )
-        _emit_llm_metrics(emitter, result, phase=span_name)
 
         parsed = parse_json_from_text(result.text)
         if parsed is None:

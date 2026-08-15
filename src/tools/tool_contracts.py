@@ -103,6 +103,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "text": str,
             "selector": str,
             "value": str,
+            "steps": list,
         },
     },
 }

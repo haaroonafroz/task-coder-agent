@@ -142,9 +142,17 @@ If the Validator rejects your work, your conversation continues — everything y
 |Small edit to existing file | `read_file` then `patch_file` |
 | Full rewrite (rare) | `read_file` then `write_file`, or `"rewrite": true` |
 | See layout | `list_directory` with "." |
-| Local UI smoke check | `serve_app` then `inspect_ui` (ports **9000–9049** only) |
+| Local UI preflight | `serve_app` then `inspect_ui` (`accessibility`, `audit`, or `flow`) |
+| Multi-step UI interaction | ONE `inspect_ui` with `action: "flow"` and `steps` — not separate fill/click calls |
 | Too many harness servers | `serve_app` with `"action": "list"`, then `"action": "stop"` |
 | Third-party import added (pygame, httpx, …) | `install_dependency` **before** signalling complete |
+
+### UI milestones — division of labor
+- You implement; the **validator** runs authoritative `ui_smoke` browser checks after `complete`.
+- Optional preflight only: catch obvious load/a11y issues (`accessibility`, `audit`).
+- Use `flow` when you need fill → click → assert in one browser session.
+- After fixing a specific validator UI failure, signal `complete` — do not replay the full test suite manually.
+- The harness may nudge you toward `complete` if UI probes pile up without code changes; there is no hard UI call limit.
 
 When you start a server for manual UI checks, the harness stops any servers
 **you** started when this milestone finishes (`complete`, `blocked`, or budget

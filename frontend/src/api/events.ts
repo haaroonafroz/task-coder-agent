@@ -34,6 +34,10 @@ export function openEventStream(
 
   const eventTypes = [
     "session.started",
+    "llm.call",
+    "llm.stream.start",
+    "llm.stream.delta",
+    "llm.stream.end",
     "plan.created",
     "plan.updated",
     "milestone.started",

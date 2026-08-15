@@ -85,6 +85,7 @@ export interface ModelInfo {
   error: string | null;
   models_by_role?: Record<string, string>;
   thinking_by_role?: Record<string, string>;
+  context_length?: number | null;
 }
 
 export interface ToolParam {
@@ -143,3 +144,60 @@ export interface SSEEvent {
   data: Record<string, unknown>;
   index?: number;
 }
+
+export type AgentRole = "orchestrator" | "worker" | "validator" | "triage";
+
+export interface LLMMetrics {
+  call_id: string;
+  role: AgentRole;
+  milestone_id?: string;
+  phase?: string;
+  model_used: string;
+  tokens_prompt: number;
+  tokens_generated: number;
+  prefill_ms: number;
+  decode_ms: number;
+  total_ms: number;
+  thinking_level?: string;
+  output_kind?: string;
+  thinking_preview?: string;
+  output_preview?: string;
+  thinking_chars?: number;
+  output_chars?: number;
+  fallback_used?: boolean;
+}
+
+export interface ToolCallEntry {
+  tool: string;
+  reasoning?: string;
+  ts: string;
+  milestone_id?: string;
+}
+
+export interface AgentTurn {
+  kind: "agent";
+  id: string;
+  call_id: string;
+  role: AgentRole;
+  milestone_id?: string;
+  phase?: string;
+  thinking: string;
+  output: string;
+  tools: ToolCallEntry[];
+  metrics?: LLMMetrics;
+  streaming: boolean;
+  ts: string;
+}
+
+export type ChatItem =
+  | { kind: "user"; id: string; ts: string; content: string }
+  | { kind: "system"; id: string; ts: string; content: string }
+  | {
+      kind: "mission_summary";
+      id: string;
+      ts: string;
+      status: string;
+      content: string;
+      failure_reason?: string;
+    }
+  | AgentTurn;

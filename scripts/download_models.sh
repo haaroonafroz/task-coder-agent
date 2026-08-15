@@ -97,6 +97,16 @@ case "$MODEL_ARG" in
         TARGET_FILE="mmproj-F16.gguf"
         MODEL_ALIAS="qwen3.6-35b-a3b-mmproj"
         ;;
+    --qwen3827b)
+        TARGET_REPO="unsloth/Qwen3.8-27B-GGUF"
+        TARGET_FILE="Qwen3.8-27B-UD-Q4_K_XL.gguf"
+        MODEL_ALIAS="qwen3.8-27b-mtp"
+        ;;
+    --qwen3827b-mmproj)
+        TARGET_REPO="unsloth/Qwen3.8-27B-GGUF"
+        TARGET_FILE="mmproj-F16.gguf"
+        MODEL_ALIAS="qwen3.8-27b-mmproj"
+        ;;
     --qwopus3627b|*)
         # Q8_0 (~4.3GB) — fits easily on a single 16GB V100
         TARGET_REPO="Jackrong/Qwopus3.6-27B-v2-MTP-GGUF"

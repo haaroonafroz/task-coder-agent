@@ -430,6 +430,8 @@ class RunQueue:
                     "session_id": result.session_id,
                     "run_kind": result.run_kind,
                     "plan_id": result.plan_id,
+                    "summary_text": result.summary_text,
+                    "failure_reason": result.failure_reason,
                 }
                 rec.status = result.status
         except RunCancelledError as exc:
@@ -460,8 +462,8 @@ class RunQueue:
             if rec.status == "cancelled":
                 pass
             elif rec.status not in ("error",) and rec.result:
-                summary = (
-                    f"Run finished - status: {rec.status}, "
+                summary = rec.result.get("summary_text") or (
+                    f"Run finished — status: {rec.status}, "
                     f"milestones {rec.result.get('milestones_passed', 0)}/"
                     f"{rec.result.get('milestones_total', 0)} passed, "
                     f"elapsed {rec.result.get('total_elapsed_ms', 0) / 1000:.1f}s."

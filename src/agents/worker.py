@@ -47,6 +47,7 @@ from src.agents.utils import (
 from src.sandbox.commands import execute_contract
 from src.sandbox.context import get_sandbox_context
 from src.sandbox.process_manager import stop_server
+from src.agents.llm_stream_events import stream_context_for
 from src.agents.validation_compiler import compile_validation_contract
 from src.sandbox.dependency_check import (
     check_target_file_dependencies,
@@ -79,6 +80,8 @@ MAX_CONSECUTIVE_TOOL_FAILURES = int(
     os.getenv("MAX_CONSECUTIVE_TOOL_FAILURES", "5")
 )
 _NON_JSON_RETRIES     = 3
+UI_NUDGE_AFTER = int(os.getenv("WORKER_UI_NUDGE_AFTER", "4"))
+UI_STRONG_NUDGE_AFTER = int(os.getenv("WORKER_UI_STRONG_NUDGE_AFTER", "8"))
 
 SEARCH_TOOLS_MD = """\
 ## Control tool: search_tools
@@ -154,6 +157,7 @@ def run_worker(
     target_files = ms.get("target_files", [])
     contract, _compile_error = compile_validation_contract(milestone)
     contract = contract or {}
+    is_ui_milestone = _is_ui_milestone(milestone, contract)
 
     active_tools = set(prior_active_tools or initial_tool_names or ())
     active_tools.add("search_tools")
@@ -186,6 +190,7 @@ def run_worker(
                 if error_feedback else ""
             )
             + f"\n## Available Tools\n{curated_tools_md}\n\n"
+            + (_ui_worker_guidance_block() if is_ui_milestone else "")
             + SEARCH_TOOLS_MD
             + "Start now. Emit ONE JSON object (a tool call, a batch of up to "
             f"{MAX_BATCH_CALLS} calls, complete, request_scope, or blocked)."
@@ -201,6 +206,8 @@ def run_worker(
     consecutive_failures = int(failure_state.get("consecutive", 0))
     breaker_reason: Optional[str] = None
     started_server_ids: set[str] = set()
+    ui_calls_since_write = 0
+    total_ui_inspect_calls = 0
 
     def _cleanup_started_servers() -> None:
         for server_id in list(started_server_ids):
@@ -246,21 +253,12 @@ def run_worker(
                 system_prompt=_WORKER_MD,
                 json_mode=True,
                 role="worker",
-            )
-
-        if emitter:
-            emitter.emit(
-                "llm.call",
-                role="worker",
-                milestone_id=ms_id,
-                model_used=llm_result.model_used,
-                tokens_prompt=llm_result.tokens_prompt,
-                tokens_generated=llm_result.tokens_generated,
-                prefill_ms=llm_result.prefill_ms,
-                decode_ms=llm_result.decode_ms,
-                total_ms=llm_result.total_ms,
-                thinking_level=llm_result.thinking_level,
-                fallback_used=llm_result.fallback_used,
+                stream_context=stream_context_for(
+                    emitter,
+                    "worker",
+                    milestone_id=ms_id,
+                    output_kind="json",
+                ),
             )
 
         raw = llm_result.text.strip()
@@ -553,32 +551,60 @@ def run_worker(
 
             if tool_name in ("write_file", "patch_file") and tool_result.get("success"):
                 wrote_files = True
+                ui_calls_since_write = 0
                 fpath = normalize_workspace_path(tool_args.get("file_path", ""))
                 if fpath:
                     files_modified.append(fpath)
 
+            if tool_name == "inspect_ui":
+                total_ui_inspect_calls += 1
+                ui_calls_since_write += 1
+
             result_text = compact_tool_result(tool_result)
+            hint = tool_result.get("hint")
+            if isinstance(hint, str) and hint.strip():
+                result_text += f"\n\nHint: {hint.strip()}"
             batch_results.append(
                 f"Tool result for `{tool_name}`:\n```json\n{result_text}\n```"
             )
 
-            if tool_result.get("success"):
+            handoff_failure = (
+                tool_name == "inspect_ui"
+                and not tool_result.get("success")
+                and tool_result.get("suggest_handoff")
+            )
+            if tool_result.get("success") or handoff_failure:
                 consecutive_failures = 0
-            else:
+            elif not handoff_failure:
                 signature = tool_failure_signature(tool_name, tool_args, tool_result)
                 failure_counts[signature] = failure_counts.get(signature, 0) + 1
                 consecutive_failures += 1
                 if failure_counts[signature] >= MAX_SAME_TOOL_FAILURES:
-                    breaker_reason = (
-                        f"Repeated identical tool failure ({signature}) for "
-                        f"`{tool_name}`. Do not retry the same call; use "
-                        "search_tools or change the arguments."
-                    )
+                    if handoff_failure:
+                        breaker_reason = None
+                    else:
+                        breaker_reason = (
+                            f"Repeated identical tool failure ({signature}) for "
+                            f"`{tool_name}`. Do not retry the same call; use "
+                            "search_tools or change the arguments."
+                        )
                 elif consecutive_failures >= MAX_CONSECUTIVE_TOOL_FAILURES:
-                    breaker_reason = (
-                        f"{MAX_CONSECUTIVE_TOOL_FAILURES} consecutive tool calls "
-                        "failed. Stop guessing and request clarification."
-                    )
+                    if handoff_failure:
+                        breaker_reason = None
+                    else:
+                        breaker_reason = (
+                            f"{MAX_CONSECUTIVE_TOOL_FAILURES} consecutive tool calls "
+                            "failed. Stop guessing and request clarification."
+                        )
+
+            if handoff_failure and is_ui_milestone:
+                batch_results.append(
+                    "## UI handoff\n"
+                    "This UI probe did not confirm the text/interaction. Prefer a "
+                    "targeted code fix if validator feedback is clear, otherwise "
+                    'signal `{"status": "complete", ...}` and let the validator run '
+                    "official browser smoke checks."
+                )
 
             if breaker_reason or tool_call_count >= MAX_WORKER_TOOL_CALLS:
                 break
@@ -612,6 +638,11 @@ def run_worker(
                     '\n\nAll required files exist. Signal {"status": "complete", ...} '
                     "if the work is done."
                 )
+
+        if is_ui_milestone:
+            ui_nudge = _ui_handoff_nudge(ui_calls_since_write, total_ui_inspect_calls)
+            if ui_nudge:
+                next_msg += f"\n\n{ui_nudge}"
 
         conversation.append({"role": "assistant", "content": raw})
         conversation.append({"role": "user", "content": next_msg})
@@ -847,8 +878,75 @@ def _worker_milestone_brief(ms: dict) -> str:
         "- Do NOT create `__init__.py` or other scaffolding unless listed above.\n"
         "- Ignore empty directories not listed above.\n"
         f"{red_phase_note}"
+        f"{_ui_milestone_rules(ms)}"
         "- Every response must be a single JSON object (tool call, batch, complete, or blocked).\n"
     )
+
+
+_UI_HINTS = ("ui", "html", "frontend", "react", "vite", "streamlit", "browser", "web")
+
+
+def _is_ui_milestone(milestone: dict, contract: dict) -> bool:
+    profile = str(milestone.get("validation_profile", "")).lower()
+    if profile == "ui":
+        return True
+    if str(contract.get("type", "")).lower() == "ui_smoke":
+        return True
+    text = " ".join(
+        [
+            str(milestone.get("title", "")),
+            str(milestone.get("description", "")),
+            " ".join(str(item) for item in milestone.get("acceptance_criteria", [])),
+        ]
+    ).lower()
+    targets = [str(path).lower() for path in milestone.get("target_files", [])]
+    return any(hint in text for hint in _UI_HINTS) or any(
+        path.endswith((".html", ".jsx", ".tsx", ".vue")) for path in targets
+    )
+
+
+def _ui_worker_guidance_block() -> str:
+    return (
+        "## UI milestone — division of labor\n"
+        "- You implement the UI; the **validator** runs authoritative `ui_smoke` "
+        "checks after you signal `complete`.\n"
+        "- Optional preflight: `serve_app` → `inspect_ui` with `accessibility` or "
+        "`audit` to catch obvious load/a11y issues.\n"
+        "- For multi-step interactions (fill → click → assert), use ONE "
+        '`inspect_ui` call with `action: "flow"` and a `steps` array.\n'
+        "- Separate `fill`/`click` calls do **not** share browser state.\n"
+        "- Do not loop on UI probes without a code change — fix the issue or "
+        "signal `complete` for validator smoke.\n\n"
+    )
+
+
+def _ui_milestone_rules(ms: dict) -> str:
+    if str(ms.get("validation_profile", "")).lower() != "ui":
+        return ""
+    return (
+        "- UI PROFILE: keep manual UI checks lightweight. Validator smoke is the "
+        "official test pass.\n"
+    )
+
+
+def _ui_handoff_nudge(calls_since_write: int, total_ui_calls: int) -> str:
+    if total_ui_calls < UI_NUDGE_AFTER:
+        return ""
+    if calls_since_write >= UI_STRONG_NUDGE_AFTER:
+        return (
+            "## UI handoff reminder\n"
+            "You have run many UI checks without changing code. Unless you are "
+            "fixing a specific validator failure, signal `complete` now — the "
+            "validator will run full browser smoke tests on its own server."
+        )
+    if calls_since_write >= UI_NUDGE_AFTER:
+        return (
+            "## UI handoff reminder\n"
+            "Prefer targeted code fixes over repeated UI probes. When deliverables "
+            "look ready (or after fixing validator feedback), signal `complete` "
+            "and let the validator run official smoke checks."
+        )
+    return ""
 
 
 def _memory_constraints_block(memory: Any, milestone: dict | None = None) -> str:

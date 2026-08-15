@@ -301,6 +301,196 @@ body.is-resizing {
   color: var(--text-secondary);
 }
 
+.message.agent-turn {
+  max-width: 96%;
+  margin-right: auto;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+}
+
+.message.system-message {
+  max-width: 100%;
+  margin: 0 auto 10px;
+  padding: 6px 10px;
+  text-align: center;
+  color: var(--text-subtle);
+  font-size: 12px;
+  background: transparent;
+  border: none;
+}
+
+.message.mission-summary {
+  max-width: 96%;
+  margin: 0 auto 12px;
+  padding: 12px 14px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+}
+
+.message.mission-summary.mission-completed {
+  border-left-color: #3ecf8e;
+}
+
+.message.mission-summary.mission-partial {
+  border-left-color: #f5a623;
+}
+
+.message.mission-summary.mission-failed {
+  border-left-color: #ff6b6b;
+}
+
+.mission-status-badge {
+  font-size: 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.mission-status-badge.status-completed {
+  color: #3ecf8e;
+  border-color: rgba(62, 207, 142, 0.35);
+}
+
+.mission-status-badge.status-partial {
+  color: #f5a623;
+  border-color: rgba(245, 166, 35, 0.35);
+}
+
+.mission-status-badge.status-failed {
+  color: #ff6b6b;
+  border-color: rgba(255, 107, 107, 0.35);
+}
+
+.mission-summary-body {
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.persona-role {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.streaming-badge {
+  font-size: 10px;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 6px;
+  text-transform: lowercase;
+}
+
+.thinking-block {
+  margin: 8px 0;
+  padding: 8px 12px;
+  border-left: 2px solid var(--border);
+  background: rgba(255, 255, 255, 0.03);
+  color: rgba(244, 244, 244, 0.55);
+  font-size: 12px;
+}
+
+.thinking-block summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+  user-select: none;
+}
+
+.thinking-block pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-mono);
+  line-height: 1.45;
+}
+
+.output-block {
+  margin-top: 8px;
+}
+
+.output-block pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.tool-call-list {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tool-call-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.tool-call-name {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.tool-call-reason {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.llm-stats-bar {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-subtle);
+}
+
+.llm-stats-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.llm-context-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.llm-context-track {
+  height: 4px;
+  background: var(--bg-tertiary);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.llm-context-fill {
+  height: 100%;
+  background: var(--border-strong);
+}
+
+.message.streaming {
+  border-color: var(--border-strong);
+}
+
 .message .role {
   font-size: 11px;
   color: var(--text-muted);

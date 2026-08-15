@@ -37,6 +37,7 @@ def _to_model_info(entry: dict) -> ModelInfo:
         error=err,
         models_by_role=entry.get("models_by_role", {}),
         thinking_by_role=entry.get("thinking_by_role", {}),
+        context_length=entry.get("context_length"),
     )
 
 
