@@ -4,6 +4,8 @@ export function stageFromEventType(eventType: string): string {
   const map: Record<string, string> = {
     "session.started": "Starting",
     "plan.created": "Orchestration",
+    "orchestrator.explore.started": "Orchestrator Exploring",
+    "orchestrator.explore.finished": "Orchestration",
     "plan.updated": "Replanning",
     "milestone.started": "Milestone Started",
     "milestone.skipped": "Milestone Skipped",

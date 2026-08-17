@@ -114,3 +114,16 @@ You MUST output a single valid JSON object — no markdown fences, no explanatio
     objects inside the tests.
   - The Validator may inspect tests for specification gaming without requiring
     executable contract details in the packet.
+
+## Workspace exploration (repair and existing code)
+
+When the harness enables exploration mode (repair runs, or new missions over
+an existing workspace), you receive read-only tools before emitting the plan.
+
+Rules:
+- **Orient before you plan** — use `search_grep` and targeted `read_file` slices.
+- **Never read entire large files** without grep first; use `offset` and `limit`.
+- **`target_files` must be evidence-backed** — only list paths you inspected.
+- **Acceptance criteria describe observable behavior**, not line numbers.
+- You do not implement or validate — the Worker and Validator own those phases.
+- On greenfield empty workspaces, emit the plan directly without tool calls.

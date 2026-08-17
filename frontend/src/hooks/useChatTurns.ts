@@ -110,6 +110,13 @@ function missionSummaryFallback(ev: SSEEvent): string {
   return `Mission ${status} — ${passed}/${total} milestones passed (${elapsed.toFixed(1)}s)`;
 }
 
+function findOrchestratorTurn(turns: Map<string, AgentTurn>): AgentTurn | undefined {
+  return [...turns.values()]
+    .sort((a, b) => a.ts.localeCompare(b.ts))
+    .reverse()
+    .find((turn) => turn.role === "orchestrator");
+}
+
 function findWorkerTurn(turns: Map<string, AgentTurn>, milestoneId?: string): AgentTurn | undefined {
   const all = [...turns.values()].sort((a, b) => a.ts.localeCompare(b.ts));
   if (milestoneId) {
@@ -260,16 +267,31 @@ export function buildChatItems(messages: Message[], events: SSEEvent[]): ChatIte
         ts: ev.ts,
         milestone_id: asString(data.milestone_id) || undefined,
       };
-      const workerTurn = findWorkerTurn(turns, entry.milestone_id);
-      if (workerTurn) {
-        workerTurn.tools.push(entry);
+      const toolRole = asString(data.role);
+      if (toolRole === "orchestrator") {
+        const orchestratorTurn = findOrchestratorTurn(turns);
+        if (orchestratorTurn) {
+          orchestratorTurn.tools.push(entry);
+        } else {
+          items.push({
+            kind: "system",
+            id: `tool-${ev.index ?? index}`,
+            ts: ev.ts,
+            content: `Orchestrator · ${entry.tool}${entry.reasoning ? `: ${entry.reasoning}` : ""}`,
+          });
+        }
       } else {
-        items.push({
-          kind: "system",
-          id: `tool-${ev.index ?? index}`,
-          ts: ev.ts,
-          content: `${entry.tool}${entry.reasoning ? `: ${entry.reasoning}` : ""}`,
-        });
+        const workerTurn = findWorkerTurn(turns, entry.milestone_id);
+        if (workerTurn) {
+          workerTurn.tools.push(entry);
+        } else {
+          items.push({
+            kind: "system",
+            id: `tool-${ev.index ?? index}`,
+            ts: ev.ts,
+            content: `${entry.tool}${entry.reasoning ? `: ${entry.reasoning}` : ""}`,
+          });
+        }
       }
       continue;
     }

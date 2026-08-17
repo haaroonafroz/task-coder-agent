@@ -114,6 +114,40 @@ def trim_conversation(conversation: list[dict], max_turns: int = 12) -> list[dic
     return [conversation[0]] + conversation[-(max_turns - 1):]
 
 
+def validate_plan_payload(parsed: dict) -> Optional[str]:
+    """Return an error string when a plan dict is invalid, else None."""
+    milestones = parsed.get("milestones")
+    if not isinstance(milestones, list) or not milestones:
+        return "plan must contain a non-empty 'milestones' list"
+    for i, ms in enumerate(milestones):
+        if not isinstance(ms, dict) or not ms.get("id"):
+            return f"milestone #{i + 1} is missing an 'id'"
+        if not ms.get("target_files"):
+            return f"milestone '{ms.get('id')}' must list 'target_files'"
+        criteria = ms.get("acceptance_criteria")
+        if (
+            not isinstance(criteria, list)
+            or not criteria
+            or any(not isinstance(item, str) or not item.strip() for item in criteria)
+        ):
+            return (
+                f"milestone '{ms.get('id')}' must include a non-empty "
+                "'acceptance_criteria' list of non-empty strings"
+            )
+        profile = str(ms.get("validation_profile", "auto")).lower()
+        if profile not in {"auto", "ui", "python", "lint", "structural"}:
+            return (
+                f"milestone '{ms.get('id')}' has unsupported "
+                f"validation_profile '{profile}'"
+            )
+        if "validation_contract" in ms:
+            return (
+                f"milestone '{ms.get('id')}' must not include "
+                "'validation_contract'; provide high-level intent only"
+            )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Failure fingerprinting (replan dedup / repeated-error circuit breaker)
 # ---------------------------------------------------------------------------

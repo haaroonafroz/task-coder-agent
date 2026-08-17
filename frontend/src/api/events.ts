@@ -60,7 +60,8 @@ export function openEventStream(
     "validation.contract_run",
     "validation.spec_gaming",
     "validation.finished",
-    "handoff.saved",
+    "orchestrator.explore.started",
+    "orchestrator.explore.finished",
     "mission.complete",
     "mission.cancelled",
   ];

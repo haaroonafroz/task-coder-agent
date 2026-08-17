@@ -27,9 +27,14 @@ from typing import Any, Callable, Optional
 
 from src.llm_client import call_llm, ModelChoice, resolve_model_config
 from src.telemetry import span_llm_call, TelemetryContext
-from src.agents.utils import parse_json_from_text
+from src.agents.utils import parse_json_from_text, validate_plan_payload
 from src.agents.plan_ops import apply_plan_patch, PlanPatchError
 from src.agents.llm_stream_events import stream_context_for
+from src.agents.orchestrator_explore import (
+    build_workspace_orientation,
+    run_orchestration_explore,
+    should_explore,
+)
 from src.events import EventEmitter
 
 # ---------------------------------------------------------------------------
@@ -133,6 +138,8 @@ def run_orchestration(
     run_kind: str = "auto",
     parent_plan_id: Optional[str] = None,
     triage_report: Optional[dict[str, Any]] = None,
+    previous_plan: Optional[dict[str, Any]] = None,
+    workspace_root: Optional[Path] = None,
     session: Optional[TelemetryContext] = None,
     emitter: Optional[EventEmitter] = None,
 ) -> dict:
@@ -180,62 +187,65 @@ def run_orchestration(
         else:
             print("  [Orchestrator] Empty plan.json ignored — generating new plan.")
 
-    prompt = (
-        f"{_ORCHESTRATOR_MD}\n\n"
-        f"---\n\n"
-        f"## Run Mode\n{run_kind}\n\n"
-        f"## Parent Plan\n{parent_plan_id or '(none)'}\n\n"
-        f"User Request:\n{user_request}\n\n"
-    )
-    if triage_report:
-        prompt += (
-            "## Read-only Triage Report\n"
-            f"```json\n{json.dumps(triage_report, indent=2)[:12000]}\n```\n\n"
+    explore, explore_mode = should_explore(run_kind, workspace_root)
+    orientation_block = ""
+    if explore and workspace_root is not None:
+        orientation_block = build_workspace_orientation(
+            workspace_root,
+            user_request,
+            previous_plan,
         )
-    prompt += "Output the JSON plan now:"
 
-    def _validate_plan(parsed: dict) -> Optional[str]:
-        milestones = parsed.get("milestones")
-        if not isinstance(milestones, list) or not milestones:
-            return "plan must contain a non-empty 'milestones' list"
-        for i, ms in enumerate(milestones):
-            if not isinstance(ms, dict) or not ms.get("id"):
-                return f"milestone #{i + 1} is missing an 'id'"
-            if not ms.get("target_files"):
-                return f"milestone '{ms.get('id')}' must list 'target_files'"
-            criteria = ms.get("acceptance_criteria")
-            if (
-                not isinstance(criteria, list)
-                or not criteria
-                or any(not isinstance(item, str) or not item.strip() for item in criteria)
-            ):
-                return (
-                    f"milestone '{ms.get('id')}' must include a non-empty "
-                    "'acceptance_criteria' list of non-empty strings"
-                )
-            profile = str(ms.get("validation_profile", "auto")).lower()
-            if profile not in {"auto", "ui", "python", "lint", "structural"}:
-                return (
-                    f"milestone '{ms.get('id')}' has unsupported "
-                    f"validation_profile '{profile}'"
-                )
-            if "validation_contract" in ms:
-                return (
-                    f"milestone '{ms.get('id')}' must not include "
-                    "'validation_contract'; provide high-level intent only"
-                )
-        return None
+    if explore:
+        try:
+            plan = run_orchestration_explore(
+                user_request=user_request,
+                run_kind=run_kind,
+                parent_plan_id=parent_plan_id,
+                previous_plan=previous_plan,
+                orientation_block=orientation_block,
+                triage_report=triage_report,
+                orchestrator_md=_ORCHESTRATOR_MD,
+                model=model,
+                explore_mode=explore_mode,
+                session=session,
+                emitter=emitter,
+            )
+        except RuntimeError as exc:
+            print(f"  [Orchestrator] Exploration failed ({exc}) — single-shot fallback.")
+            if emitter:
+                emitter.emit("orchestrator.explore.finished", tool_calls=-1, mode=explore_mode, fallback=True)
+            explore = False
+    if not explore:
+        prompt = (
+            f"{_ORCHESTRATOR_MD}\n\n"
+            f"---\n\n"
+            f"## Run Mode\n{run_kind}\n\n"
+            f"## Parent Plan\n{parent_plan_id or '(none)'}\n\n"
+            f"User Request:\n{user_request}\n\n"
+        )
+        if orientation_block:
+            prompt += f"{orientation_block}\n\n"
+        if triage_report:
+            prompt += (
+                "## Read-only Triage Report\n"
+                f"```json\n{json.dumps(triage_report, indent=2)[:12000]}\n```\n\n"
+            )
+        prompt += "Output the JSON plan now:"
 
-    plan = _call_json_with_correction(
-        prompt,
-        model=model,
-        role="orchestrator",
-        span_name="orchestrator",
-        span_label="init",
-        session=session,
-        emitter=emitter,
-        validate=_validate_plan,
-    )
+        def _validate_plan(parsed: dict) -> Optional[str]:
+            return validate_plan_payload(parsed)
+
+        plan = _call_json_with_correction(
+            prompt,
+            model=model,
+            role="orchestrator",
+            span_name="orchestrator",
+            span_label="init",
+            session=session,
+            emitter=emitter,
+            validate=_validate_plan,
+        )
 
     old_plan: Optional[dict[str, Any]] = None
     if plan_path.exists() and run_kind not in ("auto", "resume"):

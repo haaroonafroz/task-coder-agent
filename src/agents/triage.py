@@ -7,8 +7,9 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-from src.agents.llm_stream_events import stream_context_for
+from src.agents.orchestrator_explore import build_workspace_orientation
 from src.agents.utils import parse_json_from_text
+from src.agents.llm_stream_events import stream_context_for
 from src.events import EventEmitter
 from src.llm_client import ModelChoice, call_llm, resolve_model_config
 from src.telemetry import TelemetryContext, span_llm_call
@@ -152,7 +153,7 @@ def _build_prompt(
         f"## Recent Session Events\n```\n"
         f"{_read_recent_events(session_root)}\n```\n\n"
         f"## Current Workspace Snapshot\n"
-        f"{_workspace_snapshot(workspace_root, previous_plan, user_request)}\n\n"
+        f"{build_workspace_orientation(workspace_root, user_request, previous_plan)}\n\n"
         "Produce the triage JSON now."
     )
 

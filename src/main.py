@@ -431,6 +431,8 @@ class MissionsRuntime:
                 run_kind=run_kind,
                 parent_plan_id=parent_plan_id,
                 triage_report=triage_report,
+                previous_plan=previous_plan,
+                workspace_root=session.workspace_root,
                 session=telemetry_ctx,
                 emitter=self._emitter,
             )
