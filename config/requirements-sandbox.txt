@@ -1,0 +1,5 @@
+# Harness dev toolchain — installed into each session .venv at sandbox activation.
+# Mission-specific packages are installed later via install_dependency.
+pytest>=8.0,<9
+flake8>=7.0,<8
+black>=24.0,<25

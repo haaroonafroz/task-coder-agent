@@ -4,6 +4,8 @@
 - **Keywords:** read, file, content, inspect
 - **Parameters:**
   - `file_path` (string): Workspace-relative path of the file to read (e.g. `src/utils.py`).
+-  - `offset` (integer, optional): One-based line number to start from.
+-  - `limit` (integer, optional): Maximum number of lines to return.
 - **Returns:** String content of the file or an error message if the file does not exist.
 - **When to use:** Before any write or patch operation; when validating that a file was correctly written; when debugging unexpected behaviour.
 - **Example:**
@@ -12,13 +14,102 @@
   ```
 <!-- SKILL_END -->
 
+<!-- SKILL_START: serve_app -->
+## Skill Name: serve_app
+- **Description:** Starts and manages a local development server inside the session jail.
+- **Keywords:** serve, start, streamlit, vite, react, fastapi, uvicorn, localhost, app
+- **Parameters:**
+  - `action` (string): `start`, `list`, `status`, `logs`, or `stop`.
+  - `kind` (string, optional): `vite`, `streamlit`, `fastapi`, or `generic`.
+  - `port` (integer, optional): Session port in the harness allowlist (9000–9049).
+  - `app_path` (string, optional): Streamlit entry point.
+  - `module` (string, optional): ASGI module, such as `app:app`.
+  - `command` (array, optional): Allowlisted argv for a generic server.
+  - `server_id` (string, optional): Existing server identifier for status/logs/stop.
+- **Returns:** Managed server identifier, readiness, bounded logs, lifecycle status,
+  and (for `list` / errors) the active server registry plus `allowed_ports`.
+- **When to use:** Before inspecting a React/Vite, Streamlit, FastAPI, or other local UI.
+  Call `list` when the harness reports too many active servers, then `stop` stale ones.
+- **Example:**
+  ```json
+  {"tool": "serve_app", "args": {"action": "start", "kind": "streamlit", "app_path": "app.py", "port": 9000}, "reasoning": "Start the app for local UI checks."}
+  ```
+  ```json
+  {"tool": "serve_app", "args": {"action": "list"}, "reasoning": "See which harness-managed servers are still running."}
+  ```
+<!-- SKILL_END -->
+
+<!-- SKILL_START: inspect_ui -->
+## Skill Name: inspect_ui
+- **Description:** Checks a running managed local UI using loopback-only requests
+  and the harness-wide Playwright browser backend.
+- **Keywords:** inspect, ui, browser, frontend, streamlit, react, visible, assert
+- **Parameters:**
+  - `server_id` (string): Identifier returned by `serve_app`.
+  - `action` (string, optional): `navigate`, `snapshot`, `assert_text`, `flow`,
+    `screenshot`, `accessibility`, `audit`, `click`, or `fill`.
+  - `path` (string, optional): Local URL path.
+  - `text` (string, optional): Text that must be visible for `assert_text`.
+  - `selector` (string, optional): Browser locator for `click` or `fill`.
+  - `value` (string, optional): Value for `fill`.
+  - `steps` (array, optional): Ordered steps for `flow` — each step is an object
+    with `action` (`fill`, `click`, `assert_text`, `assert_visible`, `snapshot`,
+    `wait`), plus `selector`, `value`, `text`, or `ms` as needed.
+- **Returns:** HTTP status, title, bounded visible text, assertion result,
+  browser console/page errors, failed requests, accessibility issues, flow step
+  results, actionable hints, and sandbox artifact paths when applicable.
+- **When to use:** Optional worker preflight after `serve_app`. Use `flow` for
+  multi-step interactions in **one** browser session. The validator runs official
+  smoke checks after you signal `complete`.
+- **Example:**
+  ```json
+  {"tool": "inspect_ui", "args": {"server_id": "server-1234", "action": "accessibility"}, "reasoning": "Quick a11y preflight before complete."}
+  ```
+  ```json
+  {"tool": "inspect_ui", "args": {"server_id": "server-1234", "action": "flow", "steps": [{"action": "fill", "selector": "#name", "value": "Exercise"}, {"action": "click", "selector": "#add-btn"}, {"action": "assert_text", "text": "Exercise"}]}, "reasoning": "Verify add-habit interaction in one browser session."}
+  ```
+<!-- SKILL_END -->
+
+<!-- SKILL_START: project_info -->
+## Skill Name: project_info
+- **Description:** Reports detected project ecosystems, manifests, toolchains, workspace entries, and active sandbox capabilities.
+- **Keywords:** project, ecosystem, manifest, package, toolchain, workspace, environment
+- **Parameters:**
+  - `max_entries` (integer, optional): Maximum bounded workspace entries to return.
+- **Returns:** Structured project metadata and a bounded file list.
+- **When to use:** At the start of a task or when deciding which test/build capability is appropriate.
+- **Example:**
+  ```json
+  {"tool": "project_info", "args": {}, "reasoning": "Detect the project stack before choosing checks."}
+  ```
+<!-- SKILL_END -->
+
+<!-- SKILL_START: run_checks -->
+## Skill Name: run_checks
+- **Description:** Runs bounded test, lint, typecheck, or build checks using the detected project ecosystem.
+- **Keywords:** test, build, lint, typecheck, pytest, npm, vitest, go, cargo, maven, gradle
+- **Parameters:**
+  - `ecosystem` (string, optional): `auto`, `python`, `node`, `go`, `rust`, `jvm`, or `generic`.
+  - `checks` (array, optional): Any of `test`, `lint`, `typecheck`, or `build`.
+  - `target` (string, optional): Workspace-relative target, default `.`.
+  - `args` (array, optional): Additional argv tokens.
+  - `timeout` (integer, optional): Maximum duration in seconds.
+- **Returns:** Structured result for each check, including argv, return code, output, and policy status.
+- **When to use:** After edits, before completion, and whenever the project is not Python-only.
+- **Example:**
+  ```json
+  {"tool": "run_checks", "args": {"ecosystem": "auto", "checks": ["test", "build"]}, "reasoning": "Verify behavior and compilation."}
+  ```
+<!-- SKILL_END -->
+
 <!-- SKILL_START: write_file -->
 ## Skill Name: write_file
-- **Description:** Creates a completely new file or replaces the entire content of an existing file. Use only for new files or complete rewrites — prefer `patch_file` for targeted edits.
+- **Description:** Creates a completely new file or replaces the entire content of an existing file. Use only for new files or complete rewrites — prefer `patch_file` for targeted edits. Full rewrites of existing files larger than ~60 lines are rejected unless the file was read first this milestone or `rewrite` is true.
 - **Keywords:** write, create, file, new
 - **Parameters:**
-  - `file_path` (string): Workspace-relative destination path.
+  - `file_path` (string): Workspace-relative destination path. Must be one of the milestone's target files — other paths are rejected.
   - `content` (string): Full file content to write.
+  - `rewrite` (boolean, optional): Set true to force a full rewrite of a large existing file without a prior read. Escape hatch — prefer read_file + patch_file.
 - **Returns:** Confirmation message with the written byte count.
 - **When to use:** Creating new Python modules, config files, or test files from scratch.
 - **Example:**
@@ -32,7 +123,7 @@
 - **Description:** Performs a precise search-and-replace inside an existing file without touching surrounding code. Safer than write_file for incremental changes.
 - **Keywords:** patch, edit, replace, modify
 - **Parameters:**
-  - `file_path` (string): Workspace-relative path to the file.
+  - `file_path` (string): Workspace-relative path to the file. Must be one of the milestone's target files — other paths are rejected.
   - `search_string` (string): Exact text to find (must be unique in the file).
   - `replace_string` (string): Text to substitute in place of `search_string`.
 - **Returns:** Success confirmation or error if `search_string` was not found.
@@ -132,13 +223,16 @@
 
 <!-- SKILL_START: install_dependency -->
 ## Skill Name: install_dependency
-- **Description:** Installs a Python package into the local runtime environment via pip. Also appends the package to `requirements.txt` if it exists.
-- **Keywords:** install, pip, package, dependency
+- **Description:** Installs a Python package into the session venv via pip. Also appends the package to `requirements.txt` if it exists. **Required before complete** when target files import third-party libraries.
+- **Keywords:** install, pip, package, dependency, pygame, flask, httpx, requirements, third-party, runtime
 - **Parameters:**
-  - `package_name` (string): Package identifier, optionally with version pin (e.g. `httpx>=0.27.0`).
+  - `package_name` (string): Package identifier, optionally with version pin (e.g. `httpx>=0.27.0`, `pygame`).
 - **Returns:** pip install stdout/stderr and success flag.
-- **When to use:** When the implementation requires a library that is not already installed.
+- **When to use:** Before signalling `complete` whenever you add a non-stdlib third-party import (e.g. `import pygame`) in a target file. The session venv only includes pytest, flake8, and black by default.
 - **Example:**
+  ```json
+  {"tool": "install_dependency", "args": {"package_name": "pygame"}, "reasoning": "main.py imports pygame; install before complete."}
+  ```
   ```json
   {"tool": "install_dependency", "args": {"package_name": "httpx>=0.27.0"}, "reasoning": "Need httpx for async HTTP client in the new module."}
   ```
@@ -158,11 +252,9 @@
   ```
 <!-- SKILL_END -->
 
-
-
 <!-- SKILL_START: run_shellscript -->
 ## Skill Name: run_shellscript
-- **Description:** Executes an arbitrary shell script or command inside the workspace directory with a configurable timeout. Useful for build steps, data generation, or environment checks that don't map to a dedicated tool.
+- **Description:** Executes an arbitrary shell script or command inside the workspace directory with a configurable timeout. Do not run `cd workspace`; tool calls already start at the workspace root. Useful for build steps, data generation, or environment checks that don't map to a dedicated tool.
 - **Keywords:** shell, bash, script, execute
 - **Parameters:**
   - `script` (string): The shell command or multi-line bash script to run.
@@ -171,6 +263,7 @@
 - **When to use:** Running build scripts, initialising a database schema, generating fixtures, or any bespoke validation step not covered by run_pytest or run_linter.
 - **Example:**
   ```json
-  {"tool": "run_shellscript", "args": {"script": "cd workspace && python -c 'import src.app; print(src.app.VERSION)'", "timeout": 10}, "reasoning": "Quick smoke-test that the module is importable."}
+  {
+  "tool": "run_shellscript", "args": {"script": "python -c 'import app; print(app.VERSION)'", "timeout": 10},"reasoning": "Check that the local app module imports successfully."}
   ```
 <!-- SKILL_END -->

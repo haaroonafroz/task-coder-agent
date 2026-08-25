@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="760" viewBox="0 0 1280 760" role="img" aria-labelledby="title desc">
+  <title id="title">Run inspector detail</title>
+  <desc id="desc">Static demo visualization of milestone accordions, scoped event rows, and session file browsing.</desc>
+  <rect width="1280" height="760" fill="#030303"/>
+  <rect x="42" y="32" width="1196" height="696" rx="18" fill="#080808" stroke="#282828"/>
+
+  <text x="76" y="78" fill="#f4f4f4" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="800">Run Inspector</text>
+  <text x="76" y="108" fill="#858585" font-family="Inter, Arial, sans-serif" font-size="15">Milestones open into the events that belong to that milestone only.</text>
+
+  <rect x="76" y="142" width="530" height="532" rx="14" fill="#050505" stroke="#282828"/>
+  <text x="106" y="184" fill="#858585" font-family="Inter, Arial, sans-serif" font-size="12">CURRENT STAGE</text>
+  <text x="106" y="218" fill="#f4f4f4" font-family="Inter, Arial, sans-serif" font-size="28" font-weight="800">Validation</text>
+  <text x="106" y="246" fill="#c8c8c8" font-family="Inter, Arial, sans-serif" font-size="14">2 / 3 milestones passed</text>
+
+  <rect x="106" y="294" width="470" height="72" rx="10" fill="#111111" stroke="#383838"/>
+  <text x="128" y="324" fill="#f4f4f4" font-family="JetBrains Mono, monospace" font-size="14">- M1</text>
+  <text x="128" y="348" fill="#c8c8c8" font-family="Inter, Arial, sans-serif" font-size="15">Test specification and scaffolding</text>
+  <rect x="496" y="312" width="58" height="22" rx="11" fill="#202020" stroke="#383838"/>
+  <text x="508" y="327" fill="#f4f4f4" font-family="Inter, Arial, sans-serif" font-size="11">passed</text>
+
+  <rect x="106" y="384" width="470" height="176" rx="10" fill="#111111" stroke="#f4f4f4"/>
+  <text x="128" y="416" fill="#f4f4f4" font-family="JetBrains Mono, monospace" font-size="14">- M2</text>
+  <text x="128" y="440" fill="#f4f4f4" font-family="Inter, Arial, sans-serif" font-size="15">Core email validator implementation</text>
+  <rect x="486" y="404" width="68" height="22" rx="11" fill="#f4f4f4"/>
+  <text x="498" y="419" fill="#030303" font-family="Inter, Arial, sans-serif" font-size="11">running</text>
+  <line x1="128" y1="466" x2="552" y2="466" stroke="#282828"/>
+  <text x="128" y="494" fill="#858585" font-family="JetBrains Mono, monospace" font-size="13">15:49:02</text>
+  <text x="208" y="494" fill="#f4f4f4" font-family="JetBrains Mono, monospace" font-size="13">tool.called</text>
+  <text x="332" y="494" fill="#858585" font-family="Inter, Arial, sans-serif" font-size="13">write_file</text>
+  <text x="128" y="524" fill="#858585" font-family="JetBrains Mono, monospace" font-size="13">15:49:18</text>
+  <text x="208" y="524" fill="#f4f4f4" font-family="JetBrains Mono, monospace" font-size="13">validation.started</text>
+  <text x="128" y="548" fill="#858585" font-family="JetBrains Mono, monospace" font-size="13">15:49:37</text>
+  <text x="208" y="548" fill="#f4f4f4" font-family="JetBrains Mono, monospace" font-size="13">milestone.passed</text>
+
+  <rect x="106" y="582" width="470" height="56" rx="10" fill="#111111" stroke="#383838"/>
+  <text x="128" y="616" fill="#858585" font-family="JetBrains Mono, monospace" font-size="14">+ M3</text>
+  <text x="196" y="616" fill="#c8c8c8" font-family="Inter, Arial, sans-serif" font-size="15">Advanced and differential tests</text>
+
+  <rect x="642" y="142" width="562" height="532" rx="14" fill="#050505" stroke="#282828"/>
+  <text x="674" y="184" fill="#f4f4f4" font-family="Inter, Arial, sans-serif" font-size="20" font-weight="800">Session File Browser</text>
+  <text x="674" y="212" fill="#858585" font-family="Inter, Arial, sans-serif" font-size="14">Rooted at sessions/&lt;session-id&gt;, not only workspace/.</text>
+
+  <rect x="674" y="250" width="236" height="374" rx="10" fill="#0d0d0d" stroke="#282828"/>
+  <text x="696" y="286" fill="#858585" font-family="JetBrains Mono, monospace" font-size="13">[+] .venv</text>
+  <text x="696" y="316" fill="#f4f4f4" font-family="JetBrains Mono, monospace" font-size="13">    events.jsonl</text>
+  <text x="696" y="346" fill="#f4f4f4" font-family="JetBrains Mono, monospace" font-size="13">    plan.json</text>
+  <text x="696" y="376" fill="#c8c8c8" font-family="JetBrains Mono, monospace" font-size="13">[-] handoffs</text>
+  <text x="720" y="406" fill="#f4f4f4" font-family="JetBrains Mono, monospace" font-size="13">    M1.json</text>
+  <text x="720" y="436" fill="#f4f4f4" font-family="JetBrains Mono, monospace" font-size="13">    M2.json</text>
+  <text x="696" y="466" fill="#c8c8c8" font-family="JetBrains Mono, monospace" font-size="13">[-] workspace</text>
+  <text x="720" y="496" fill="#f4f4f4" font-family="JetBrains Mono, monospace" font-size="13">    email_validator.py</text>
+  <text x="720" y="526" fill="#f4f4f4" font-family="JetBrains Mono, monospace" font-size="13">    tests/</text>
+
+  <rect x="934" y="250" width="238" height="374" rx="10" fill="#0a0a0a" stroke="#282828"/>
+  <rect x="934" y="250" width="238" height="44" rx="10" fill="#111111"/>
+  <text x="956" y="278" fill="#c8c8c8" font-family="JetBrains Mono, monospace" font-size="13">plan.json</text>
+  <text x="956" y="326" fill="#858585" font-family="JetBrains Mono, monospace" font-size="13">{</text>
+  <text x="976" y="354" fill="#f4f4f4" font-family="JetBrains Mono, monospace" font-size="13">"title": "Email validator",</text>
+  <text x="976" y="382" fill="#f4f4f4" font-family="JetBrains Mono, monospace" font-size="13">"milestones": [</text>
+  <text x="996" y="410" fill="#c8c8c8" font-family="JetBrains Mono, monospace" font-size="13">"M1", "M2", "M3"</text>
+  <text x="976" y="438" fill="#f4f4f4" font-family="JetBrains Mono, monospace" font-size="13">]</text>
+  <text x="956" y="466" fill="#858585" font-family="JetBrains Mono, monospace" font-size="13">}</text>
+
+  <rect x="674" y="646" width="498" height="32" rx="16" fill="#141414" stroke="#383838"/>
+  <text x="696" y="667" fill="#c8c8c8" font-family="Inter, Arial, sans-serif" font-size="13">Runtime folders are hidden by default and can be toggled on.</text>
+</svg>

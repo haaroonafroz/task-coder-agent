@@ -26,22 +26,32 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import os
 import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
 
-_MEMORY_FILE = Path(__file__).parent.parent / "active_mission" / "memory_store.json"
+_LEGACY_MEMORY_FILE = Path(__file__).parent.parent / "active_mission" / "memory_store.json"
 
 # ---------------------------------------------------------------------------
 # Optional Cognee import
+#
+# Cognee is OPT-IN: it performs cloud-LLM graph extraction on every write,
+# which blocks the serial pipeline for tens of seconds per milestone and adds
+# token cost. The JSON store serves every read path in the runtime, so the
+# default backend is "json". Set MISSIONS_MEMORY_BACKEND=cognee to re-enable.
 # ---------------------------------------------------------------------------
+_MEMORY_BACKEND = os.getenv("MISSIONS_MEMORY_BACKEND", "json").strip().lower()
+
 try:
     import cognee
-    _COGNEE_AVAILABLE = True
+    _COGNEE_INSTALLED = True
 except ImportError:
     cognee = None  # type: ignore
-    _COGNEE_AVAILABLE = False
+    _COGNEE_INSTALLED = False
+
+_COGNEE_AVAILABLE = _COGNEE_INSTALLED and _MEMORY_BACKEND == "cognee"
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +85,23 @@ class _AsyncRunner:
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return future.result(timeout=timeout)
 
+    def submit(self, coro) -> None:
+        """Schedule a coroutine fire-and-forget; never blocks the caller.
+
+        Memory writes are not on the critical path of the serial pipeline —
+        the JSON store is written synchronously for durability, so a dropped
+        or slow Cognee write must never stall milestone execution.
+        """
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+        def _swallow(fut: concurrent.futures.Future) -> None:
+            try:
+                fut.result()
+            except Exception as exc:
+                print(f"[Memory] Background Cognee write failed: {exc}")
+
+        future.add_done_callback(_swallow)
+
 
 _async_runner: Optional[_AsyncRunner] = None
 _runner_lock = threading.Lock()
@@ -95,6 +122,11 @@ def _run_async(coro, timeout: float = 30) -> Any:
     return _get_runner().run(coro, timeout=timeout)
 
 
+def _submit_async(coro) -> None:
+    """Schedule a coroutine without blocking the serial runtime thread."""
+    _get_runner().submit(coro)
+
+
 # ---------------------------------------------------------------------------
 # MissionMemory
 # ---------------------------------------------------------------------------
@@ -105,7 +137,8 @@ class MissionMemory:
     a local JSON file store otherwise.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, memory_file_path: Optional[Path] = None) -> None:
+        self._memory_file = memory_file_path if memory_file_path is not None else _LEGACY_MEMORY_FILE
         if _COGNEE_AVAILABLE:
             self._backend = "cognee"
             print("[Memory] Cognee knowledge graph backend active.")
@@ -119,7 +152,11 @@ class MissionMemory:
     # ------------------------------------------------------------------
 
     def log_milestone_state(
-        self, milestone_id: str, plan_meta: dict, current_status: str
+        self,
+        milestone_id: str,
+        plan_meta: dict,
+        current_status: str,
+        plan_id: Optional[str] = None,
     ) -> None:
         """
         Persist the current state of a milestone into the memory backend.
@@ -128,28 +165,43 @@ class MissionMemory:
             milestone_id:   Milestone identifier (e.g. "M2").
             plan_meta:      Full handoff dict for this milestone.
             current_status: "pending" | "in_progress" | "completed" | "failed".
+            plan_id: Stable plan identity used to isolate crash recovery from
+                later repair plans. When omitted, the legacy milestone store is
+                used for backward compatibility only.
         """
+        plan_id = plan_id or str(plan_meta.get("plan_id") or plan_meta.get("mission_id") or "")
         payload = (
-            f"Milestone: {milestone_id}. "
+            f"Plan: {plan_id or 'legacy'}. Milestone: {milestone_id}. "
             f"Status: {current_status}. "
             f"Metadata: {json.dumps(plan_meta)[:800]}."
         )
         if _COGNEE_AVAILABLE:
             try:
-                _run_async(self._cognee_add_and_cognify(payload))
+                _submit_async(self._cognee_add_and_cognify(payload))
             except Exception as exc:
-                print(f"[Memory] Cognee write failed: {exc}; falling back to JSON.")
+                print(f"[Memory] Cognee write scheduling failed: {exc}")
 
         # Always write to the JSON store for durability
-        self._json_write(milestone_id, current_status, plan_meta)
+        self._json_write(plan_id, milestone_id, current_status, plan_meta)
 
-    def check_resume_point(self, milestone_id: str) -> Optional[dict]:
+    def check_resume_point(
+        self,
+        milestone_id: str,
+        plan_id: Optional[str] = None,
+    ) -> Optional[dict]:
         """
         Check whether a milestone was previously completed.
 
         Returns the stored state dict if found, or None.
         """
         store = self._load_store()
+        if plan_id:
+            return (
+                store.get("plans", {})
+                .get(plan_id, {})
+                .get("milestones", {})
+                .get(milestone_id)
+            )
         return store.get("milestones", {}).get(milestone_id)
 
     # ------------------------------------------------------------------
@@ -170,10 +222,13 @@ class MissionMemory:
         """
         if _COGNEE_AVAILABLE:
             try:
-                result = _run_async(self._cognee_search(
-                    f"What are the parameters, file locations, and dependencies "
-                    f"related to {target_class_or_feature}?"
-                ))
+                result = _run_async(
+                    self._cognee_search(
+                        f"What are the parameters, file locations, and dependencies "
+                        f"related to {target_class_or_feature}?"
+                    ),
+                    timeout=10,
+                )
                 if result:
                     return str(result)[:2000]
             except Exception as exc:
@@ -210,9 +265,9 @@ class MissionMemory:
         )
         if _COGNEE_AVAILABLE:
             try:
-                _run_async(self._cognee_add_and_cognify(payload))
+                _submit_async(self._cognee_add_and_cognify(payload))
             except Exception as exc:
-                print(f"[Memory] Cognee error-log write failed: {exc}")
+                print(f"[Memory] Cognee error-log scheduling failed: {exc}")
 
         store = self._load_store()
         store.setdefault("error_log", []).append({
@@ -275,24 +330,44 @@ class MissionMemory:
     # ------------------------------------------------------------------
 
     def _ensure_store(self) -> None:
-        _MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        if not _MEMORY_FILE.exists():
-            self._save_store({"milestones": {}, "error_log": []})
+        self._memory_file.parent.mkdir(parents=True, exist_ok=True)
+        if not self._memory_file.exists():
+            self._save_store({"plans": {}, "milestones": {}, "error_log": []})
+            return
+        # Preserve pre-plan-namespace stores, but never use their milestone
+        # entries for a new plan. They remain available to older callers.
+        store = self._load_store()
+        if "plans" not in store:
+            store["plans"] = {}
+            self._save_store(store)
 
     def _load_store(self) -> dict:
         try:
-            return json.loads(_MEMORY_FILE.read_text(encoding="utf-8"))
+            return json.loads(self._memory_file.read_text(encoding="utf-8"))
         except Exception:
             return {"milestones": {}, "error_log": []}
 
     def _save_store(self, data: dict) -> None:
-        _MEMORY_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        self._memory_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-    def _json_write(self, milestone_id: str, status: str, meta: dict) -> None:
+    def _json_write(
+        self,
+        plan_id: str,
+        milestone_id: str,
+        status: str,
+        meta: dict,
+    ) -> None:
         store = self._load_store()
-        store.setdefault("milestones", {})[milestone_id] = {
+        entry = {
             "status": status,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             **{k: v for k, v in meta.items() if k != "error_log"},
         }
+        if plan_id:
+            plan = store.setdefault("plans", {}).setdefault(
+                plan_id, {"milestones": {}}
+            )
+            plan.setdefault("milestones", {})[milestone_id] = entry
+        else:
+            store.setdefault("milestones", {})[milestone_id] = entry
         self._save_store(store)

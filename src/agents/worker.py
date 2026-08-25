@@ -1,30 +1,64 @@
 """
 Worker Agent — Phase 3.
 
-Runs a multi-turn tool-call conversation loop until the worker signals
-"complete" or "blocked", or the per-milestone tool call budget is exhausted.
+    Runs a multi-turn tool-call conversation loop until the worker signals
+"complete", "blocked", or "request_scope", or the per-milestone tool call
+budget is exhausted.
 
-The worker receives a curated tool set from the skill router (Phase 2),
-executes tool calls, and accumulates file modifications for the Validator.
+Protocol notes (small-model optimised):
+
+  - Native chat messages are sent to the LLM (system + alternating
+    user/assistant), never a flattened single-turn blob. This preserves role
+    semantics and keeps the rendered prompt append-only so llama.cpp's
+    prefix cache stays hot across turns.
+  - json_mode is ON: llama.cpp applies a GBNF grammar so every response is
+    guaranteed parseable JSON, eliminating the invalid-JSON retry class.
+  - The worker may emit a BATCH of up to MAX_BATCH_CALLS tool calls per turn
+    ({"calls": [...]}) — one LLM round trip instead of three.
+  - After every successful write/patch the HARNESS auto-runs the milestone's
+    validation contract and appends the result, so test feedback costs zero
+    LLM turns.
+  - On validator FAIL the conversation is RESUMED (not restarted cold): the
+    worker keeps everything it already learned and only receives the new
+    failure feedback.
 """
 
 from __future__ import annotations
 
-import json
 import os
+import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
-from src.llm_client import call_llm, ModelChoice
-from src.telemetry import span_llm_call, span_tool_call
+from src.llm_client import AgentRole, call_llm, ModelChoice, resolve_model_config
+from src.telemetry import span_llm_call, span_tool_call, TelemetryContext
 from src.tools import dispatch
-from src.tools.paths import normalize_workspace_path, normalize_shell_command
+from src.tools.file_ops import get_created_files
+from src.tools.tool_contracts import validate_tool_call
+from src.tools.paths import normalize_workspace_path, get_workspace_root
+from src.events import EventEmitter
+from src.run_control import RunCancelledError, ensure_not_cancelled
 from src.agents.utils import (
+    parse_agent_turn,
     parse_json_from_text,
-    flatten_conversation,
     trim_conversation,
     target_files_exist,
     _looks_like_tool_call_attempt,
+)
+from src.sandbox.commands import execute_contract
+from src.sandbox.context import get_sandbox_context
+from src.sandbox.process_manager import stop_server
+from src.agents.llm_stream_events import stream_context_for
+from src.agents.validation_compiler import compile_validation_contract
+from src.sandbox.dependency_check import (
+    check_target_file_dependencies,
+    format_missing_dependency_message,
+    planned_module_names,
+)
+from src.agents.tool_diagnostics import (
+    compact_tool_result,
+    event_diagnostics,
+    tool_failure_signature,
 )
 
 # ---------------------------------------------------------------------------
@@ -32,13 +66,34 @@ from src.agents.utils import (
 # ---------------------------------------------------------------------------
 _ROOT = Path(__file__).parent.parent.parent
 _CONFIG_DIR = _ROOT / "config"
-_WORKSPACE_DIR = _ROOT / "workspace"
 
 _WORKER_MD = (_CONFIG_DIR / "worker.md").read_text()
 
-MAX_TOKENS_WORKER    = int(os.getenv("MAX_TOKENS_WORKER", "5120"))
-MAX_WORKER_TOOL_CALLS = 20
+MAX_TOKENS_WORKER     = int(os.getenv("MAX_TOKENS_WORKER", "12288"))
+MAX_WORKER_TOOL_CALLS = int(os.getenv("MAX_WORKER_TOOL_CALLS", "20"))
+MAX_BATCH_CALLS       = int(os.getenv("MAX_WORKER_BATCH_CALLS", "3"))
+MAX_HISTORY_TURNS     = int(os.getenv("MAX_WORKER_HISTORY_TURNS", "16"))
+AUTORUN_MAX           = int(os.getenv("WORKER_CONTRACT_AUTORUN_MAX", "8"))
+AUTORUN_STDOUT_CHARS  = int(os.getenv("WORKER_AUTORUN_STDOUT_CHARS", "600"))
+AUTORUN_STDERR_CHARS  = int(os.getenv("WORKER_AUTORUN_STDERR_CHARS", "400"))
+MAX_SAME_TOOL_FAILURES = int(os.getenv("MAX_SAME_TOOL_FAILURES", "2"))
+MAX_CONSECUTIVE_TOOL_FAILURES = int(
+    os.getenv("MAX_CONSECUTIVE_TOOL_FAILURES", "5")
+)
 _NON_JSON_RETRIES     = 3
+UI_NUDGE_AFTER = int(os.getenv("WORKER_UI_NUDGE_AFTER", "4"))
+UI_STRONG_NUDGE_AFTER = int(os.getenv("WORKER_UI_STRONG_NUDGE_AFTER", "8"))
+
+SEARCH_TOOLS_MD = """\
+## Control tool: search_tools
+Use this when the currently available operational tools do not cover the next
+action. Retrieval is deterministic and returns up to 3 additional tools.
+Newly discovered tools become callable on the NEXT turn, not in the same batch.
+```json
+{"tool": "search_tools", "args": {"query": "<capability needed>", "limit": 3},
+ "reasoning": "The current tool set does not include this capability."}
+```
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -53,13 +108,26 @@ def run_worker(
     retry_count: int,
     model: ModelChoice,
     memory: Any,
+    emitter: Optional[EventEmitter] = None,
+    session: Optional[TelemetryContext] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    prior_conversation: Optional[list[dict]] = None,
+    initial_tool_names: Optional[set[str]] = None,
+    prior_active_tools: Optional[set[str]] = None,
+    tool_searcher: Optional[Callable[[str, int], dict[str, Any]]] = None,
+    prior_failure_state: Optional[dict[str, Any]] = None,
+    agent_role: AgentRole = "worker",
+    system_prompt: Optional[str] = None,
+    max_tool_calls: Optional[int] = None,
+    max_tokens: Optional[int] = None,
 ) -> dict[str, Any]:
     """
     Execute the worker agent loop for a single milestone.
 
     The worker is given the milestone brief, workspace context, curated tools,
     and (on retries) error feedback from the Validator. It emits JSON tool
-    calls one at a time until it signals complete/blocked or exhausts its budget.
+    calls (single or batched) until it signals complete, request_scope,
+    blocked, or exhausts its budget.
 
     Args:
         milestone:        The milestone dict from the plan.
@@ -69,72 +137,168 @@ def run_worker(
         retry_count:      Current retry attempt (0-indexed).
         model:            LLM backend to use.
         memory:           MissionMemory instance, or None if disabled.
+        emitter:          Optional EventEmitter for streaming tool/worker events.
+        session:          Optional telemetry context used to bind LLM/tool spans
+                          to a Phoenix session (Phase 5).
+        cancel_check:     Optional callable returning True when the run should stop.
+        prior_conversation: Conversation from the previous attempt of THIS
+                          milestone. When provided, the worker resumes its own
+                          thread instead of re-deriving context from scratch.
+        initial_tool_names: Tools selected for the first Worker turn.
+        prior_active_tools: Discovered/active tools preserved across retries.
+        tool_searcher: Deterministic callback used by the search_tools meta-tool.
+        prior_failure_state: Failure counts preserved across Worker retries.
 
     Returns:
-        dict with keys: status, summary, files_modified, tool_calls.
+        dict with keys: status, summary, files_modified, tool_calls, conversation.
     """
     ms_id = milestone.get("id", "?")
-    print(f"\n  [Phase 3] WORKER — milestone {ms_id} (attempt {retry_count + 1})")
+    role_label = agent_role.upper()
+    tool_budget = max_tool_calls or MAX_WORKER_TOOL_CALLS
+    token_budget = max_tokens or MAX_TOKENS_WORKER
+    profile_prompt = system_prompt or _WORKER_MD
+    print(
+        f"\n  [Phase 3] {role_label} — milestone {ms_id} "
+        f"(attempt {retry_count + 1})"
+    )
+
+    if emitter and agent_role == "worker":
+        emitter.emit(
+            "worker.started",
+            milestone_id=ms_id,
+            retry=retry_count,
+            role=agent_role,
+        )
 
     ms = _normalize_milestone_for_worker(milestone)
     target_files = ms.get("target_files", [])
+    contract, _compile_error = compile_validation_contract(milestone)
+    contract = contract or {}
+    is_ui_milestone = _is_ui_milestone(milestone, contract)
 
-    grounding = _fetch_memory_grounding(memory, milestone)
-    memory_constraints = _memory_constraints_block(memory, milestone)
-    if memory_constraints.strip():
-        print("    [Worker] Injecting memory constraints from prior failures.")
+    active_tools = set(prior_active_tools or initial_tool_names or ())
+    active_tools.add("search_tools")
+    discovered_tools: set[str] = set(active_tools) - {"search_tools"}
 
-    user_turn = (
-        f"{_workspace_context_block(target_files)}\n"
-        f"{_worker_milestone_brief(ms)}\n"
-        f"## Current Mission\n{plan.get('title', '')}\n\n"
-        f"## Milestone to Implement\n"
-        f"**ID**: {ms_id}\n"
-        f"**Title**: {milestone.get('title', '')}\n"
-        f"**Description**: {milestone.get('description', '')}\n"
-        f"{grounding}"
-        f"{memory_constraints}"
-        + (
-            f"\n## Error Feedback from Validator (latest retry)\n{error_feedback}\n"
-            if error_feedback else ""
+    if prior_conversation:
+        conversation: list[dict] = list(prior_conversation)
+        conversation.append({
+            "role": "user",
+            "content": _retry_entry_message(error_feedback, memory, milestone, target_files),
+        })
+    else:
+        grounding = _fetch_memory_grounding(memory, milestone)
+        memory_constraints = _memory_constraints_block(memory, milestone)
+        if memory_constraints.strip():
+            print("    [Worker] Injecting memory constraints from prior failures.")
+
+        user_turn = (
+            f"{_workspace_context_block(target_files)}\n"
+            f"{_worker_milestone_brief(ms)}\n"
+            f"## Current Mission\n{plan.get('title', '')}\n\n"
+            f"## Milestone to Implement\n"
+            f"**ID**: {ms_id}\n"
+            f"**Title**: {milestone.get('title', '')}\n"
+            f"**Description**: {milestone.get('description', '')}\n"
+            f"{grounding}"
+            f"{memory_constraints}"
+            + (
+                f"\n## Error Feedback from Validator (latest retry)\n{error_feedback}\n"
+                if error_feedback else ""
+            )
+            + f"\n## Available Tools\n{curated_tools_md}\n\n"
+            + (_ui_worker_guidance_block() if is_ui_milestone else "")
+            + SEARCH_TOOLS_MD
+            + "Start now. Emit ONE JSON object (a tool call, a batch of up to "
+            f"{MAX_BATCH_CALLS} calls, complete, request_scope, or blocked)."
         )
-        + f"\n## Available Tools\n{curated_tools_md}\n\n"
-        "Start now. Emit ONE JSON tool call for the first required step."
-    )
+        conversation = [{"role": "user", "content": user_turn}]
 
-    conversation: list[dict] = [{"role": "user", "content": user_turn}]
     tool_call_count = 0
     non_json_retries = 0
+    autorun_count = 0
     files_modified: list[str] = []
+    failure_state = prior_failure_state or {}
+    failure_counts: dict[str, int] = dict(failure_state.get("counts", {}))
+    consecutive_failures = int(failure_state.get("consecutive", 0))
+    breaker_reason: Optional[str] = None
+    started_server_ids: set[str] = set()
+    ui_calls_since_write = 0
+    total_ui_inspect_calls = 0
 
-    while tool_call_count < MAX_WORKER_TOOL_CALLS:
-        trimmed = trim_conversation(conversation, max_turns=12)
-        prompt = (
-            trimmed[-1]["content"]
-            if len(trimmed) == 1
-            else flatten_conversation(trimmed)
+    def _cleanup_started_servers() -> None:
+        for server_id in list(started_server_ids):
+            stop_server(server_id)
+            started_server_ids.discard(server_id)
+
+    def _finish(result: dict) -> dict:
+        _cleanup_started_servers()
+        result["conversation"] = conversation
+        result["created_files"] = get_created_files()
+        result["active_tools"] = sorted(active_tools)
+        result["discovered_tools"] = sorted(discovered_tools)
+        result["failure_state"] = {
+            "counts": failure_counts,
+            "consecutive": consecutive_failures,
+        }
+        return result
+
+    while tool_call_count < tool_budget:
+        try:
+            ensure_not_cancelled(cancel_check)
+        except RunCancelledError:
+            if emitter:
+                emitter.emit("worker.cancelled", milestone_id=ms_id)
+            return _finish({
+                "status": "cancelled", "summary": "Run cancelled",
+                "tool_calls": tool_call_count,
+            })
+
+        # Safety valve only — the common path never trims, keeping the
+        # rendered prompt append-only (prefix-cache friendly).
+        messages = trim_conversation(conversation, max_turns=MAX_HISTORY_TURNS)
+
+        span_model = (
+            resolve_model_config(model, agent_role).model_name
+            if model != "auto" else model
         )
-
-        with span_llm_call("worker", ms_id, model):
+        with span_llm_call(agent_role, ms_id, span_model, session=session):
             llm_result = call_llm(
-                prompt=prompt,
+                messages=messages,
                 model=model,
-                max_tokens=MAX_TOKENS_WORKER,
-                system_prompt=_WORKER_MD,
+                max_tokens=token_budget,
+                system_prompt=profile_prompt,
+                json_mode=True,
+                role=agent_role,
+                stream_context=stream_context_for(
+                    emitter,
+                    agent_role,
+                    milestone_id=ms_id,
+                    output_kind="json",
+                ),
             )
 
         raw = llm_result.text.strip()
-        parsed = parse_json_from_text(raw)
+        parsed = parse_agent_turn(raw)
 
         if parsed is None:
             non_json_retries += 1
             print(f"    [Worker] Non-JSON response ({non_json_retries}/{_NON_JSON_RETRIES}).")
+            if emitter:
+                emitter.emit(
+                    "worker.invalid_json",
+                    milestone_id=ms_id,
+                    attempt=non_json_retries,
+                    max_attempts=_NON_JSON_RETRIES,
+                )
             if non_json_retries >= _NON_JSON_RETRIES:
-                return {
+                if emitter:
+                    emitter.emit("worker.blocked", milestone_id=ms_id, reason="invalid_json")
+                return _finish({
                     "status": "blocked",
                     "reason": f"Worker failed to emit valid JSON after {_NON_JSON_RETRIES} attempts.",
                     "tool_calls": tool_call_count,
-                }
+                })
             conversation.append({"role": "assistant", "content": raw})
             conversation.append({
                 "role": "user",
@@ -145,12 +309,40 @@ def run_worker(
         non_json_retries = 0
         status = parsed.get("status")
 
+        if status == "request_scope":
+            requested = parsed.get("requested_paths", parsed.get("requested_files", []))
+            if not isinstance(requested, list):
+                requested = []
+            reason = str(parsed.get("reason", "Additional workspace scope is required."))
+            print(f"    [Worker] REQUEST_SCOPE after {tool_call_count} tool call(s).")
+            if emitter:
+                emitter.emit(
+                    "worker.request_scope",
+                    milestone_id=ms_id,
+                    reason=reason,
+                    requested_paths=[str(path) for path in requested],
+                    tool_calls=tool_call_count,
+                )
+            return _finish({
+                "status": "request_scope",
+                "reason": reason,
+                "requested_paths": [str(path) for path in requested],
+                "requested_capabilities": parsed.get("requested_capabilities", []),
+                "tool_calls": tool_call_count,
+            })
+
         if status == "complete":
             files_modified.extend(parsed.get("files_modified", []))
             print(f"    [Worker] Signalled COMPLETE after {tool_call_count} tool call(s).")
             ok, missing = target_files_exist(target_files)
             if target_files and not ok:
                 print(f"    [Worker] Rejected premature COMPLETE — missing: {missing}")
+                if emitter:
+                    emitter.emit(
+                        "worker.complete_rejected",
+                        milestone_id=ms_id,
+                        missing=missing,
+                    )
                 conversation.append({"role": "assistant", "content": raw})
                 conversation.append({
                     "role": "user",
@@ -160,12 +352,59 @@ def run_worker(
                     ),
                 })
                 continue
-            return {
+
+            dep_report = check_target_file_dependencies(
+                target_files,
+                planned_modules=planned_module_names(plan),
+                phase=(
+                    "test_scaffold"
+                    if str(contract.get("type", "")).lower() == "test_scaffold"
+                    else "implementation"
+                ),
+            )
+            if not dep_report.ok:
+                message = format_missing_dependency_message(dep_report)
+                print(f"    [Worker] Rejected COMPLETE — {message}")
+                if emitter:
+                    emitter.emit(
+                        "dependency.missing",
+                        milestone_id=ms_id,
+                        packages=dep_report.missing_packages,
+                        imports=dep_report.missing_imports,
+                        checked_files=dep_report.checked_files,
+                        source="worker",
+                    )
+                    emitter.emit(
+                        "worker.complete_rejected",
+                        milestone_id=ms_id,
+                        reason="missing_dependencies",
+                        packages=dep_report.missing_packages,
+                    )
+                conversation.append({"role": "assistant", "content": raw})
+                conversation.append({
+                    "role": "user",
+                    "content": (
+                        f"REJECTED. {message} "
+                        'Use install_dependency, e.g. '
+                        '{"tool": "install_dependency", "args": {"package_name": "pygame"}, '
+                        '"reasoning": "Required by main.py imports."}'
+                    ),
+                })
+                continue
+
+            if emitter:
+                emitter.emit(
+                    "worker.complete",
+                    milestone_id=ms_id,
+                    tool_calls=tool_call_count,
+                    files_modified=list(set(files_modified)),
+                )
+            return _finish({
                 "status": "complete",
                 "summary": parsed.get("summary", ""),
                 "files_modified": list(set(files_modified)),
                 "tool_calls": tool_call_count,
-            }
+            })
 
         if status == "blocked":
             reason = parsed.get("reason", "Unknown block")
@@ -174,76 +413,409 @@ def run_worker(
             print(f"    [Worker] Reason: {reason}")
             if clarification:
                 print(f"    [Worker] Needs clarification: {clarification}")
-            return {"status": "blocked", "reason": reason, "tool_calls": tool_call_count}
-
-        # Tool call
-        tool_name = parsed.get("tool", "")
-        tool_args = parsed.get("args", {}) or {}
-        reasoning = parsed.get("reasoning", "")
-
-        if not tool_name:
-            conversation.append({"role": "assistant", "content": raw})
-            conversation.append({
-                "role": "user",
-                "content": 'Missing "tool" key. Emit a valid tool call JSON.',
+            if emitter:
+                emitter.emit(
+                    "worker.blocked",
+                    milestone_id=ms_id,
+                    reason=reason,
+                    clarification=clarification,
+                    tool_calls=tool_call_count,
+                )
+            return _finish({
+                "status": "blocked", "reason": reason,
+                "clarification": clarification,
+                "tool_calls": tool_call_count,
             })
+
+        # --- Tool calls: single object or batch ------------------------------
+        calls, call_error, call_note = _extract_tool_calls(parsed)
+        if call_error:
+            conversation.append({"role": "assistant", "content": raw})
+            conversation.append({"role": "user", "content": call_error})
             continue
 
-        print(
-            f"    [Worker] tool_call[{tool_call_count + 1}]: "
-            f"{tool_name}({list(tool_args.keys())}) — {reasoning}"
-        )
+        batch_results: list[str] = []
+        wrote_files = False
+        discovery_in_batch = False
+        for call in calls:
+            tool_name = call.get("tool", "")
+            if not isinstance(tool_name, str):
+                tool_name = repr(tool_name)
+            tool_args = call.get("args", {}) or {}
+            reasoning = call.get("reasoning", "")
 
-        with span_tool_call(tool_name, ms_id):
-            tool_result = dispatch(tool_name, tool_args)
+            if not tool_name:
+                batch_results.append("Missing \"tool\" key in one call — skipped.")
+                continue
 
-        tool_call_count += 1
+            if discovery_in_batch:
+                batch_results.append(
+                    f"Tool `{tool_name}` was not executed because search_tools "
+                    "must complete before newly discovered tools can be called."
+                )
+                continue
 
-        if tool_name in ("write_file", "patch_file") and tool_result.get("success"):
-            fpath = normalize_workspace_path(tool_args.get("file_path", ""))
-            if fpath:
-                files_modified.append(fpath)
+            contract_error = validate_tool_call(
+                tool_name,
+                tool_args,
+                active_tools=active_tools,
+            )
+            if contract_error:
+                tool_result = contract_error
+                tool_call_count += 1
+                batch_results.append(
+                    f"Tool result for `{tool_name}`:\n```json\n"
+                    f"{compact_tool_result(tool_result)}\n```"
+                )
+                if emitter:
+                    emitter.emit(
+                        "tool.result",
+                        milestone_id=ms_id,
+                        tool=tool_name,
+                        success=False,
+                        call_index=tool_call_count,
+                        role=agent_role,
+                        **event_diagnostics(tool_name, tool_args, tool_result, 0.0),
+                    )
+                signature = tool_failure_signature(tool_name, tool_args, tool_result)
+                failure_counts[signature] = failure_counts.get(signature, 0) + 1
+                consecutive_failures += 1
+                if failure_counts[signature] >= MAX_SAME_TOOL_FAILURES:
+                    breaker_reason = (
+                        f"Repeated identical tool failure ({signature}) for "
+                        f"`{tool_name}`. Do not retry the same call; use "
+                        "search_tools or change the arguments."
+                    )
+                    break
+                if consecutive_failures >= MAX_CONSECUTIVE_TOOL_FAILURES:
+                    breaker_reason = (
+                        f"{MAX_CONSECUTIVE_TOOL_FAILURES} consecutive tool calls "
+                        "failed. Stop guessing and request clarification."
+                    )
+                    break
+                continue
 
-        result_text = json.dumps(tool_result, indent=2)[:4000]
-        next_msg = (
-            f"Tool result for `{tool_name}`:\n```json\n{result_text}\n```\n\n"
-            "Continue toward the required deliverables."
-        )
+            print(
+                f"    [Worker] tool_call[{tool_call_count + 1}]: "
+                f"{tool_name}({list(tool_args.keys())}) — {reasoning}"
+            )
 
-        if tool_name in ("write_file", "patch_file") and target_files:
-            written = normalize_workspace_path(tool_args.get("file_path", ""))
-            if written and written not in target_files:
-                next_msg += (
-                    f"\n\nWARNING: `{written}` is NOT in Required deliverables: {target_files}. "
-                    "Do not add scaffolding. Create/edit only the required files next."
+            if emitter:
+                emitter.emit(
+                    "tool.called",
+                    milestone_id=ms_id,
+                    tool=tool_name,
+                    args_keys=list(tool_args.keys()),
+                    reasoning=reasoning,
+                    call_index=tool_call_count + 1,
+                    role=agent_role,
                 )
 
-        ok, missing = target_files_exist(target_files)
-        if missing:
-            next_msg += f"\n\nStill missing: {missing}"
-        else:
-            next_msg += (
-                '\n\nAll required files exist. Signal {"status": "complete", ...} if the work is done.'
+            started = time.perf_counter()
+            if tool_name == "search_tools":
+                limit = int(tool_args.get("limit", 3))
+                if tool_searcher is None:
+                    tool_result = {
+                        "success": False,
+                        "error_category": "tool_discovery_unavailable",
+                        "error": "Tool discovery is unavailable for this run.",
+                    }
+                else:
+                    with span_tool_call(tool_name, ms_id, session=session):
+                        tool_result = tool_searcher(
+                            str(tool_args["query"]),
+                            max(1, min(limit, 5)),
+                        )
+                    discovery_in_batch = True
+                    new_tools = set(tool_result.get("tools", []))
+                    active_tools.update(new_tools)
+                    discovered_tools.update(new_tools)
+                    if emitter:
+                        emitter.emit(
+                            "tool.discovery",
+                            milestone_id=ms_id,
+                            query=tool_args["query"],
+                            tools=sorted(new_tools),
+                            count=len(new_tools),
+                        )
+            else:
+                with span_tool_call(tool_name, ms_id, session=session):
+                    tool_result = dispatch(tool_name, tool_args)
+
+            if tool_name == "serve_app":
+                action = str(tool_args.get("action", "start")).lower().strip()
+                if tool_result.get("success"):
+                    if action == "start":
+                        server_id = str(tool_result.get("server_id", "")).strip()
+                        if server_id:
+                            started_server_ids.add(server_id)
+                    elif action == "stop":
+                        server_id = str(tool_args.get("server_id", "")).strip()
+                        started_server_ids.discard(server_id)
+
+            tool_call_count += 1
+            duration_ms = (time.perf_counter() - started) * 1000.0
+
+            if emitter:
+                emitter.emit(
+                    "tool.result",
+                    milestone_id=ms_id,
+                    tool=tool_name,
+                    success=tool_result.get("success", False),
+                    call_index=tool_call_count,
+                    role=agent_role,
+                    **event_diagnostics(
+                        tool_name, tool_args, tool_result, duration_ms
+                    ),
+                )
+
+            if tool_name in ("write_file", "patch_file") and tool_result.get("success"):
+                wrote_files = True
+                ui_calls_since_write = 0
+                fpath = normalize_workspace_path(tool_args.get("file_path", ""))
+                if fpath:
+                    files_modified.append(fpath)
+
+            if tool_name == "inspect_ui":
+                total_ui_inspect_calls += 1
+                ui_calls_since_write += 1
+
+            result_text = compact_tool_result(tool_result)
+            hint = tool_result.get("hint")
+            if isinstance(hint, str) and hint.strip():
+                result_text += f"\n\nHint: {hint.strip()}"
+            batch_results.append(
+                f"Tool result for `{tool_name}`:\n```json\n{result_text}\n```"
             )
+
+            handoff_failure = (
+                tool_name == "inspect_ui"
+                and not tool_result.get("success")
+                and tool_result.get("suggest_handoff")
+            )
+            if tool_result.get("success") or handoff_failure:
+                consecutive_failures = 0
+            elif not handoff_failure:
+                signature = tool_failure_signature(tool_name, tool_args, tool_result)
+                failure_counts[signature] = failure_counts.get(signature, 0) + 1
+                consecutive_failures += 1
+                if failure_counts[signature] >= MAX_SAME_TOOL_FAILURES:
+                    if handoff_failure:
+                        breaker_reason = None
+                    else:
+                        breaker_reason = (
+                            f"Repeated identical tool failure ({signature}) for "
+                            f"`{tool_name}`. Do not retry the same call; use "
+                            "search_tools or change the arguments."
+                        )
+                elif consecutive_failures >= MAX_CONSECUTIVE_TOOL_FAILURES:
+                    if handoff_failure:
+                        breaker_reason = None
+                    else:
+                        breaker_reason = (
+                            f"{MAX_CONSECUTIVE_TOOL_FAILURES} consecutive tool calls "
+                            "failed. Stop guessing and request clarification."
+                        )
+
+            if handoff_failure and is_ui_milestone:
+                batch_results.append(
+                    "## UI handoff\n"
+                    "This UI probe did not confirm the text/interaction. Prefer a "
+                    "targeted code fix if validator feedback is clear, otherwise "
+                    'signal `{"status": "complete", ...}` and let the validator run '
+                    "official browser smoke checks."
+                )
+
+            if breaker_reason or tool_call_count >= tool_budget:
+                break
+
+        next_msg = "\n\n".join(batch_results) if batch_results else "(no tool calls executed)"
+        if call_note:
+            next_msg += f"\n\n{call_note}"
+        if breaker_reason:
+            next_msg += (
+                f"\n\n## TOOL FAILURE CIRCUIT BREAKER\n{breaker_reason}\n"
+                "Do not repeat the failed operation. If another capability is "
+                "needed, call search_tools; otherwise signal blocked with a "
+                "specific clarification request."
+            )
+
+        # Harness-side contract auto-run: test feedback with zero LLM turns.
+        if wrote_files and autorun_count < AUTORUN_MAX:
+            auto = _autorun_contract(contract, ms_id, emitter)
+            if auto:
+                autorun_count += 1
+                next_msg += f"\n\n{auto}"
+
+        next_msg += "\n\nContinue toward the required deliverables."
+
+        if target_files:
+            ok, missing = target_files_exist(target_files)
+            if missing:
+                next_msg += f"\n\nStill missing: {missing}"
+            else:
+                next_msg += (
+                    '\n\nAll required files exist. Signal {"status": "complete", ...} '
+                    "if the work is done."
+                )
+
+        if is_ui_milestone:
+            ui_nudge = _ui_handoff_nudge(ui_calls_since_write, total_ui_inspect_calls)
+            if ui_nudge:
+                next_msg += f"\n\n{ui_nudge}"
 
         conversation.append({"role": "assistant", "content": raw})
         conversation.append({"role": "user", "content": next_msg})
 
+        if breaker_reason:
+            if emitter:
+                emitter.emit(
+                    "worker.tool_failure_breaker",
+                    milestone_id=ms_id,
+                    reason=breaker_reason,
+                    consecutive_failures=consecutive_failures,
+                    distinct_failures=len(failure_counts),
+                )
+            return _finish({
+                "status": "blocked",
+                "reason": breaker_reason,
+                "needs_clarification": (
+                    "Choose a different available tool or provide the missing "
+                    "workspace/contract information."
+                ),
+                "tool_calls": tool_call_count,
+            })
+
     # Budget exhausted
     ok, missing = target_files_exist(target_files)
     if target_files and not ok:
-        return {
+        if emitter:
+            emitter.emit(
+                "worker.blocked",
+                milestone_id=ms_id,
+                reason=f"Tool budget exhausted. Missing deliverables: {missing}",
+                tool_calls=tool_call_count,
+            )
+        return _finish({
             "status": "blocked",
             "reason": f"Tool budget exhausted. Missing deliverables: {missing}",
             "files_modified": list(set(files_modified)),
             "tool_calls": tool_call_count,
-        }
-    return {
+        })
+    if emitter:
+        emitter.emit(
+            "worker.complete",
+            milestone_id=ms_id,
+            tool_calls=tool_call_count,
+            files_modified=list(set(files_modified)),
+        )
+    return _finish({
         "status": "complete",
-        "summary": f"Tool call budget exhausted after {MAX_WORKER_TOOL_CALLS} calls.",
+        "summary": f"Tool call budget exhausted after {tool_budget} calls.",
         "files_modified": list(set(files_modified)),
         "tool_calls": tool_call_count,
-    }
+    })
+
+
+# ---------------------------------------------------------------------------
+# Batch parsing + contract auto-run
+# ---------------------------------------------------------------------------
+
+def _extract_tool_calls(parsed: dict) -> tuple[list[dict], Optional[str], Optional[str]]:
+    """
+    Normalise a worker response into a list of tool-call dicts.
+
+    Accepts either a single call object ({"tool": ..., "args": ...}) or a
+    batch ({"calls": [...]}). Batches are capped at MAX_BATCH_CALLS.
+    Returns (calls, error_message, note) — error_message is set when neither
+    shape is present; note carries non-fatal warnings (e.g. truncation).
+    """
+    raw_calls = parsed.get("calls")
+    if isinstance(raw_calls, list) and raw_calls:
+        calls = [c for c in raw_calls if isinstance(c, dict)]
+        if not calls:
+            return [], 'The "calls" array must contain objects with "tool" and "args".', None
+        if len(calls) > MAX_BATCH_CALLS:
+            return calls[:MAX_BATCH_CALLS], None, (
+                f"NOTE: batch truncated to {MAX_BATCH_CALLS} calls — "
+                "emit the remaining calls next turn."
+            )
+        return calls, None, None
+
+    if parsed.get("tool"):
+        return [parsed], None, None
+
+    return [], (
+        'Missing "tool" key. Emit a tool call {"tool": "<name>", "args": {...}, '
+        '"reasoning": "..."}, a batch {"calls": [...]}, or a status object '
+        '("complete" / "blocked").'
+    ), None
+
+
+def _autorun_contract(
+    contract: dict,
+    ms_id: str,
+    emitter: Optional[EventEmitter],
+) -> str:
+    """
+    Run the milestone validation contract harness-side after a file write.
+
+    Returns a compact feedback block for the worker's next turn, or "" when
+    auto-run is not possible (no command / no sandbox).
+    """
+    command = str(contract.get("command", "")).strip()
+    if (
+        not command
+        or str(contract.get("type", "")).lower() == "ui_smoke"
+        or get_sandbox_context() is None
+    ):
+        return ""
+
+    result = execute_contract(contract, timeout=60, profile="validation")
+    returncode = result.get("returncode", -1)
+
+    if emitter:
+        emitter.emit(
+            "worker.contract_autorun",
+            milestone_id=ms_id,
+            returncode=returncode,
+            execution_mode=result.get("execution_mode", "unknown"),
+            policy_denied=result.get("policy_denied", False),
+        )
+
+    stdout_tail = (result.get("stdout", "") or "")[-AUTORUN_STDOUT_CHARS:]
+    stderr_tail = (result.get("stderr", "") or "")[-AUTORUN_STDERR_CHARS:]
+    status_line = "PASS (exit 0)" if returncode == 0 else f"FAILING (exit {returncode})"
+    return (
+        f"## Auto-run of validation contract (harness, free feedback)\n"
+        f"Command: `{command}`\n"
+        f"Result: {status_line}\n"
+        f"```\nstdout (tail):\n{stdout_tail}\nstderr (tail):\n{stderr_tail}\n```"
+    )
+
+
+def _retry_entry_message(
+    error_feedback: Optional[str],
+    memory: Any,
+    milestone: dict,
+    target_files: list[str],
+) -> str:
+    """Build the user turn that resumes the worker's thread after a FAIL."""
+    parts = [
+        "## RETRY — the Validator rejected your previous attempt.",
+        "Your full conversation above shows everything you already did. "
+        "Do NOT redo completed work; apply a MINIMAL fix with patch_file.",
+    ]
+    if error_feedback:
+        parts.append(f"\n### Validator failure report\n{error_feedback}")
+    constraints = _memory_constraints_block(memory, milestone)
+    if constraints.strip():
+        parts.append(constraints)
+    _, missing = target_files_exist(target_files)
+    if missing:
+        parts.append(f"\nFiles still missing on disk: {missing}")
+    parts.append("\nEmit your next JSON object now.")
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -256,10 +828,11 @@ def _normalize_milestone_for_worker(milestone: dict) -> dict:
     ms["target_files"] = [
         normalize_workspace_path(p) for p in milestone.get("target_files", [])
     ]
-    contract = dict(milestone.get("validation_contract", {}))
-    if contract.get("command"):
-        contract["command"] = normalize_shell_command(contract["command"])
-    ms["validation_contract"] = contract
+    ms["acceptance_criteria"] = [
+        str(item).strip()
+        for item in milestone.get("acceptance_criteria", [])
+        if str(item).strip()
+    ]
     return ms
 
 
@@ -276,11 +849,12 @@ def _workspace_context_block(target_files: list[str] | None = None) -> str:
         targets_note = (
             "\n- Required files for this milestone: "
             + ", ".join(f"`{p}`" for p in target_files)
-            + "\n- Other files/dirs in the tree are context only — do not edit them unless listed above.\n"
+            + "\n- Other files/dirs in the tree are context only — the harness "
+              "REJECTS writes to files not listed above.\n"
         )
     return (
         "## Workspace Context\n"
-        f"- Project root (your cwd): `{_WORKSPACE_DIR}`\n"
+        f"- Project root (your cwd): `{get_workspace_root()}`\n"
         "- All tool paths are relative to this directory.\n"
         "- Do NOT prefix paths with `workspace/`.\n"
         f"{targets_note}\n"
@@ -296,19 +870,103 @@ def _worker_milestone_brief(ms: dict) -> str:
         if target_files
         else "- (none listed)"
     )
-    contract = ms.get("validation_contract", {})
+    red_phase_note = ""
+    is_scaffold = str(ms.get("validation_profile", "")).lower() == "test_scaffold" or (
+        target_files
+        and all(
+            p.startswith("tests/") or p.startswith("test_") or "/test_" in p
+            for p in target_files
+        )
+    )
+    if is_scaffold:
+        red_phase_note = (
+            "- TDD RED PHASE: this is a test-scaffolding milestone. The module under "
+            "test does NOT exist yet BY DESIGN. Collection errors / ModuleNotFoundError "
+            "for it in the auto-run output are EXPECTED — do not try to fix them. "
+            "Write the tests, then signal complete.\n"
+        )
+
     return (
         "## REQUIRED deliverables (must all exist before complete)\n"
         f"{targets_md}\n\n"
-        "## Validation command (your code must pass this)\n"
-        f"```\n{contract.get('command', '(none)')}\n```\n"
-        f"Pass criteria: {contract.get('pass_criteria', '(none)')}\n\n"
+        "## Acceptance criteria (the Validator will compile the checks)\n"
+        + "\n".join(f"- {item}" for item in ms.get("acceptance_criteria", []))
+        + "\n\n"
+        f"Validation profile: {ms.get('validation_profile', 'auto')}\n\n"
         "## Rules for this milestone\n"
-        "- Work ONLY on the required deliverables above.\n"
+        "- Work ONLY on the required deliverables above — writes to other files are rejected.\n"
         "- Do NOT create `__init__.py` or other scaffolding unless listed above.\n"
         "- Ignore empty directories not listed above.\n"
-        "- Every response must be a single JSON object (tool call, complete, or blocked).\n"
+        f"{red_phase_note}"
+        f"{_ui_milestone_rules(ms)}"
+        "- Every response must be a single JSON object (tool call, batch, complete, or blocked).\n"
     )
+
+
+_UI_HINTS = ("ui", "html", "frontend", "react", "vite", "streamlit", "browser", "web")
+
+
+def _is_ui_milestone(milestone: dict, contract: dict) -> bool:
+    profile = str(milestone.get("validation_profile", "")).lower()
+    if profile == "ui":
+        return True
+    if str(contract.get("type", "")).lower() == "ui_smoke":
+        return True
+    text = " ".join(
+        [
+            str(milestone.get("title", "")),
+            str(milestone.get("description", "")),
+            " ".join(str(item) for item in milestone.get("acceptance_criteria", [])),
+        ]
+    ).lower()
+    targets = [str(path).lower() for path in milestone.get("target_files", [])]
+    return any(hint in text for hint in _UI_HINTS) or any(
+        path.endswith((".html", ".jsx", ".tsx", ".vue")) for path in targets
+    )
+
+
+def _ui_worker_guidance_block() -> str:
+    return (
+        "## UI milestone — division of labor\n"
+        "- You implement the UI; the **validator** runs authoritative `ui_smoke` "
+        "checks after you signal `complete`.\n"
+        "- Optional preflight: `serve_app` → `inspect_ui` with `accessibility` or "
+        "`audit` to catch obvious load/a11y issues.\n"
+        "- For multi-step interactions (fill → click → assert), use ONE "
+        '`inspect_ui` call with `action: "flow"` and a `steps` array.\n'
+        "- Separate `fill`/`click` calls do **not** share browser state.\n"
+        "- Do not loop on UI probes without a code change — fix the issue or "
+        "signal `complete` for validator smoke.\n\n"
+    )
+
+
+def _ui_milestone_rules(ms: dict) -> str:
+    if str(ms.get("validation_profile", "")).lower() != "ui":
+        return ""
+    return (
+        "- UI PROFILE: keep manual UI checks lightweight. Validator smoke is the "
+        "official test pass.\n"
+    )
+
+
+def _ui_handoff_nudge(calls_since_write: int, total_ui_calls: int) -> str:
+    if total_ui_calls < UI_NUDGE_AFTER:
+        return ""
+    if calls_since_write >= UI_STRONG_NUDGE_AFTER:
+        return (
+            "## UI handoff reminder\n"
+            "You have run many UI checks without changing code. Unless you are "
+            "fixing a specific validator failure, signal `complete` now — the "
+            "validator will run full browser smoke tests on its own server."
+        )
+    if calls_since_write >= UI_NUDGE_AFTER:
+        return (
+            "## UI handoff reminder\n"
+            "Prefer targeted code fixes over repeated UI probes. When deliverables "
+            "look ready (or after fixing validator feedback), signal `complete` "
+            "and let the validator run official smoke checks."
+        )
+    return ""
 
 
 def _memory_constraints_block(memory: Any, milestone: dict | None = None) -> str:
@@ -375,6 +1033,8 @@ def _worker_invalid_json_message(raw: str, target_files: list[str]) -> str:
         "No markdown fences, no prose before or after the JSON.\n\n"
         "Tool call:\n"
         '{"tool": "<name>", "args": {...}, "reasoning": "<one sentence>"}\n\n'
+        "Batch (up to 3 calls):\n"
+        '{"calls": [{"tool": "<name>", "args": {...}, "reasoning": "..."}, ...]}\n\n'
         "Done:\n"
         '{"status": "complete", "summary": "...", "files_modified": ["..."]}\n\n'
         f"{missing_line}"

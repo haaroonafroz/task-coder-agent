@@ -25,15 +25,15 @@ if [ -f "$ENV_FILE" ]; then
     set +a
 fi
 
-TARGET_FILE="${TARGET_MODEL_GGUF:-$REPO_ROOT/models/gemma-4-E4B-it-Q8_0.gguf}"
-# DRAFT_FILE="${DRAFT_MODEL_GGUF:-$REPO_ROOT/models/gemma-4-E4B-it-assistant-F16.gguf}"
-MODEL_ALIAS="${MODEL_ALIAS:-gemma-4-e4b-it}"
-CONTEXT_LEN="${CONTEXT_LEN:-16384}"
+TARGET_FILE="${TARGET_MODEL_GGUF:-$REPO_ROOT/models/Qwen3.8-27B-UD-Q4_K_XL.gguf}"
+MMPROJ_FILE="${MMPROJ_FILE:-$REPO_ROOT/models/mmproj-F16.gguf}"
+MODEL_ALIAS="${MODEL_ALIAS:-Qwen3.8-27B-MTP}"
+CONTEXT_LEN="${CONTEXT_LEN:-128000}"
 N_GPU_LAYERS="${N_GPU_LAYERS:--1}"
 NUM_DRAFT_TOKENS="${NUM_DRAFT_TOKENS:-2}"
 PORT=8001
 LOG_FILE="$REPO_ROOT/experiments/logs/speculative_server.log"
-
+CHAT_TEMPLATE_KWARGS="${LLAMA_ARG_CHAT_TEMPLATE_KWARGS:-{\"reasoning_effort\":\"medium\"}}"
 mkdir -p "$REPO_ROOT/experiments/logs"
 
 # -----------------------------------------------------------------------
@@ -89,6 +89,8 @@ llama-server \
     --model "$TARGET_FILE" \
     --alias "$MODEL_ALIAS" \
     --ctx-size "$CONTEXT_LEN" \
+    --jinja \
+    --chat-template-kwargs "$CHAT_TEMPLATE_KWARGS" \
     --n-gpu-layers "$N_GPU_LAYERS" \
     --device CUDA0,CUDA1 \
     --split-mode layer \
@@ -99,6 +101,7 @@ llama-server \
     --cont-batching \
     --spec-type draft-mtp \
     --spec-draft-n-max "$NUM_DRAFT_TOKENS" \
+    --mmproj "$MMPROJ_FILE" \
     --port "$PORT" \
     --host 127.0.0.1 \
     --log-file "$LOG_FILE" \
