@@ -29,6 +29,7 @@ async def create_run(
         body.request,
         model=body.model,
         run_kind=body.run_kind,
+        execution_route=body.execution_route,
     )
     return RunResponse(**rec.to_dict())
 

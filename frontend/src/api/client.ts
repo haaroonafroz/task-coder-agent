@@ -14,6 +14,7 @@ import type {
   WorkspaceEntry,
   WorkspaceFile,
   Upload,
+  ExecutionRoute,
   ModelChoice,
   RunKind,
   WorkspaceScope,
@@ -81,6 +82,7 @@ export const api = {
       trigger_run?: boolean;
       model?: ModelChoice;
       run_kind?: RunKind;
+      execution_route?: ExecutionRoute;
     }
   ): Promise<Message> {
     return req(`/sessions/${sid}/messages`, {

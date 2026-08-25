@@ -9,12 +9,16 @@ Agent phase implementations for the Missions Runtime.
 """
 
 from src.agents.orchestrator import run_orchestration, replan_mission
+from src.agents.code_review import run_code_review
+from src.agents.hotfix import run_hotfix
 from src.agents.triage import run_triage
 from src.agents.worker import run_worker
 from src.agents.validator import run_validator
 
 __all__ = [
     "run_triage",
+    "run_code_review",
+    "run_hotfix",
     "run_orchestration",
     "replan_mission",
     "run_worker",

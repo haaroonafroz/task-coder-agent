@@ -36,10 +36,12 @@ async def create_message(
             body.content,
             model=body.model,
             run_kind=body.run_kind,
+            execution_route=body.execution_route,
         )
         run_id = rec.run_id
     msg = message_store.append(ctx, "user", body.content, run_id=run_id)
     msg["run_kind"] = body.run_kind
+    msg["execution_route"] = body.execution_route
     return MessageResponse(**msg)
 
 

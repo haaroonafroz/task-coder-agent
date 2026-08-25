@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from src.agents.tool_diagnostics import compact_tool_result, event_diagnostics
-from src.agents.utils import parse_json_from_text, trim_conversation, validate_plan_payload
+from src.agents.utils import parse_agent_turn, validate_plan_payload, trim_conversation
 from src.events import EventEmitter
 from src.llm_client import ModelChoice, call_llm, resolve_model_config
 from src.telemetry import span_llm_call, span_tool_call, TelemetryContext
@@ -243,7 +243,7 @@ def run_orchestration_explore(
             )
 
         raw = llm_result.text.strip()
-        parsed = parse_json_from_text(raw)
+        parsed = parse_agent_turn(raw)
         if parsed is None:
             non_json_retries += 1
             if non_json_retries >= _NON_JSON_RETRIES:

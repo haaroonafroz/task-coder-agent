@@ -1,6 +1,9 @@
 # Missions Architecture — Self-Improving Multi-Agent Coding Runtime
 
-A serial multi-agent system for building software with **small local LLMs**. The runtime decomposes a user request into concise work packets, routes a minimal tool set per step, implements code in an isolated workspace, and has the Validator compile and run checks from each packet's acceptance criteria. Failed milestones retry with grounded error feedback; incomplete packets trigger negotiated replanning with the Orchestrator.
+A serial multi-agent system for building software with **small local LLMs**. A
+focused Triage router selects the full Mission pipeline, a scoped Hotfix
+profile, or a read-only Code Review profile. Changed code always passes through
+the Validator; broad review findings escalate to the Orchestrator.
 
 This repo is a proof of concept: the architecture (not raw model scale) is what makes local 27B-class models usable for non-trivial coding tasks.
 
@@ -12,7 +15,7 @@ Large cloud models tolerate sloppy agent design. Small local models do not. This
 
 | Principle | How it is enforced |
 |---|---|
-| **Separation of concerns** | Orchestrator plans; Worker implements; Validator adversarially checks. No role shares another role's prompt or tools. |
+| **Separation of concerns** | Triage routes; Orchestrator plans; Worker builds; Hotfix patches locally; Code Review inspects read-only; Validator adversarially checks. Each role has a focused prompt and permissions. |
 | **Acceptance-first delivery** | Every milestone ships with observable acceptance criteria and a validation profile. The Validator compiles executable checks; low-level commands never burden the planning model. |
 | **Negotiation through packets** | Validator can emit `REPLAN` when packet intent is incomplete or contradictory. Orchestrator emits a small patch op-list (`update_milestone` / `insert` / `remove`) applied deterministically — the whole plan is never regenerated. |
 | **Anti spec-gaming** | Harness-owned acceptance tests remain protected, while agent-owned tests may be part of a coherent implementation slice. Workspace writes remain jailed, with `request_scope` available when a packet is incomplete. |
@@ -26,7 +29,10 @@ Large cloud models tolerate sloppy agent design. Small local models do not. This
 ## Execution flow
 
 ```
-User request
+User request → lifecycle resolution → Triage route
+     ├── hotfix → Hotfix → Validator
+     ├── review → Code Review → report, Hotfix, or Mission
+     └── mission
      │
      ▼
 ┌─────────────────────────────────────────┐
@@ -82,8 +88,11 @@ On **PASS**, the runtime commits workspace changes and writes handoff JSON under
 
 ```
 config/
+  triage.md            # Request routing among mission/hotfix/review
   orchestrator.md      # Planning persona + contract rules + patch-ops format
   worker.md            # Implementation persona + batched tool-call format
+  hotfix.md            # Localized minimal-patch persona
+  code_review.md       # Read-only evidence-backed review persona
   validator.md        # Adversarial QA persona + diff review
   skills.md            # Tool capabilities (chunked for Qdrant indexing)
 
@@ -95,6 +104,10 @@ src/
   telemetry.py         # Arize Phoenix OpenTelemetry
   api/                 # FastAPI control plane for sessions, runs, events, files
   agents/
+    contracts.py       # Route, Hotfix packet, and Review report contracts
+    triage.py          # Focused execution-route selection
+    hotfix.py          # Scoped profile using hardened Worker loop mechanics
+    code_review.py     # Read-only inspection and finding classification
     orchestrator.py    # Phase 1 + 1.5: plan + patch-based replan + corrective JSON
     worker.py          # Phase 3: json_mode, batched calls, contract auto-run, resume
     validator.py       # Phase 4: diff injection, failure signatures, raw output

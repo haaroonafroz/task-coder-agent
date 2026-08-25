@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from src.llm_client import call_llm, ModelChoice, resolve_model_config
+from src.llm_client import AgentRole, call_llm, ModelChoice, resolve_model_config
 from src.telemetry import span_llm_call, span_tool_call, TelemetryContext
 from src.tools import dispatch
 from src.tools.file_ops import get_created_files
@@ -39,6 +39,7 @@ from src.tools.paths import normalize_workspace_path, get_workspace_root
 from src.events import EventEmitter
 from src.run_control import RunCancelledError, ensure_not_cancelled
 from src.agents.utils import (
+    parse_agent_turn,
     parse_json_from_text,
     trim_conversation,
     target_files_exist,
@@ -115,6 +116,10 @@ def run_worker(
     prior_active_tools: Optional[set[str]] = None,
     tool_searcher: Optional[Callable[[str, int], dict[str, Any]]] = None,
     prior_failure_state: Optional[dict[str, Any]] = None,
+    agent_role: AgentRole = "worker",
+    system_prompt: Optional[str] = None,
+    max_tool_calls: Optional[int] = None,
+    max_tokens: Optional[int] = None,
 ) -> dict[str, Any]:
     """
     Execute the worker agent loop for a single milestone.
@@ -148,10 +153,22 @@ def run_worker(
         dict with keys: status, summary, files_modified, tool_calls, conversation.
     """
     ms_id = milestone.get("id", "?")
-    print(f"\n  [Phase 3] WORKER — milestone {ms_id} (attempt {retry_count + 1})")
+    role_label = agent_role.upper()
+    tool_budget = max_tool_calls or MAX_WORKER_TOOL_CALLS
+    token_budget = max_tokens or MAX_TOKENS_WORKER
+    profile_prompt = system_prompt or _WORKER_MD
+    print(
+        f"\n  [Phase 3] {role_label} — milestone {ms_id} "
+        f"(attempt {retry_count + 1})"
+    )
 
-    if emitter:
-        emitter.emit("worker.started", milestone_id=ms_id, retry=retry_count)
+    if emitter and agent_role == "worker":
+        emitter.emit(
+            "worker.started",
+            milestone_id=ms_id,
+            retry=retry_count,
+            role=agent_role,
+        )
 
     ms = _normalize_milestone_for_worker(milestone)
     target_files = ms.get("target_files", [])
@@ -226,7 +243,7 @@ def run_worker(
         }
         return result
 
-    while tool_call_count < MAX_WORKER_TOOL_CALLS:
+    while tool_call_count < tool_budget:
         try:
             ensure_not_cancelled(cancel_check)
         except RunCancelledError:
@@ -242,27 +259,27 @@ def run_worker(
         messages = trim_conversation(conversation, max_turns=MAX_HISTORY_TURNS)
 
         span_model = (
-            resolve_model_config(model, "worker").model_name
+            resolve_model_config(model, agent_role).model_name
             if model != "auto" else model
         )
-        with span_llm_call("worker", ms_id, span_model, session=session):
+        with span_llm_call(agent_role, ms_id, span_model, session=session):
             llm_result = call_llm(
                 messages=messages,
                 model=model,
-                max_tokens=MAX_TOKENS_WORKER,
-                system_prompt=_WORKER_MD,
+                max_tokens=token_budget,
+                system_prompt=profile_prompt,
                 json_mode=True,
-                role="worker",
+                role=agent_role,
                 stream_context=stream_context_for(
                     emitter,
-                    "worker",
+                    agent_role,
                     milestone_id=ms_id,
                     output_kind="json",
                 ),
             )
 
         raw = llm_result.text.strip()
-        parsed = parse_json_from_text(raw)
+        parsed = parse_agent_turn(raw)
 
         if parsed is None:
             non_json_retries += 1
@@ -457,6 +474,7 @@ def run_worker(
                         tool=tool_name,
                         success=False,
                         call_index=tool_call_count,
+                        role=agent_role,
                         **event_diagnostics(tool_name, tool_args, tool_result, 0.0),
                     )
                 signature = tool_failure_signature(tool_name, tool_args, tool_result)
@@ -490,6 +508,7 @@ def run_worker(
                     args_keys=list(tool_args.keys()),
                     reasoning=reasoning,
                     call_index=tool_call_count + 1,
+                    role=agent_role,
                 )
 
             started = time.perf_counter()
@@ -544,6 +563,7 @@ def run_worker(
                     tool=tool_name,
                     success=tool_result.get("success", False),
                     call_index=tool_call_count,
+                    role=agent_role,
                     **event_diagnostics(
                         tool_name, tool_args, tool_result, duration_ms
                     ),
@@ -606,7 +626,7 @@ def run_worker(
                     "official browser smoke checks."
                 )
 
-            if breaker_reason or tool_call_count >= MAX_WORKER_TOOL_CALLS:
+            if breaker_reason or tool_call_count >= tool_budget:
                 break
 
         next_msg = "\n\n".join(batch_results) if batch_results else "(no tool calls executed)"
@@ -691,7 +711,7 @@ def run_worker(
         )
     return _finish({
         "status": "complete",
-        "summary": f"Tool call budget exhausted after {MAX_WORKER_TOOL_CALLS} calls.",
+        "summary": f"Tool call budget exhausted after {tool_budget} calls.",
         "files_modified": list(set(files_modified)),
         "tool_calls": tool_call_count,
     })

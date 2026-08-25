@@ -70,10 +70,18 @@ from src.run_control import RunCancelledError, ensure_not_cancelled
 from src.events import EventEmitter, emitter_for_session, register_emitter, unregister_emitter
 from src.agents import (
     replan_mission,
+    run_code_review,
+    run_hotfix,
     run_orchestration,
     run_triage,
     run_validator,
     run_worker,
+)
+from src.agents.contracts import (
+    RouteDecision,
+    hotfix_milestone_from_review,
+    hotfix_milestone_from_route,
+    normalize_route_decision,
 )
 from src.agents.orchestrator import repair_plan_issues
 from src.agents.plan_lint import lint_plan
@@ -95,7 +103,7 @@ _CORE_WORKER_TOOLS = (
     "project_info",
     "run_checks",
 )
-_UI_HINTS = ("ui", "frontend", "react", "vite", "streamlit", "browser", "web app")
+_UI_HINTS = ("frontend", "react", "vite", "streamlit", "browser", "web app")
 
 _PYTEST_INI = """\
 [pytest]
@@ -124,6 +132,22 @@ def _ensure_session_workspace(ctx: SessionContext) -> None:
     set_workspace_root(ctx.workspace_root)
 
 
+def _workspace_has_user_files(workspace_root: Path) -> bool:
+    """Return True when the workspace contains code beyond bootstrap files."""
+    ignored_names = {".gitkeep", "pytest.ini"}
+    ignored_dirs = {
+        ".git", ".pytest_cache", ".venv", "__pycache__", "node_modules", "target"
+    }
+    for path in workspace_root.rglob("*"):
+        if (
+            path.is_file()
+            and path.name not in ignored_names
+            and not any(part in ignored_dirs for part in path.parts)
+        ):
+            return True
+    return False
+
+
 def _is_test_milestone(milestone: dict) -> bool:
     """True when a milestone is explicitly a test/spec writing phase.
 
@@ -140,6 +164,47 @@ def _is_test_milestone(milestone: dict) -> bool:
         f.startswith("tests/") or f.startswith("test_") or "/test_" in f
         for f in target_files
     )
+
+
+def _format_review_summary(
+    report: dict[str, Any],
+    *,
+    handoff: Optional["MilestoneHandoff"] = None,
+    verification: Optional[dict[str, Any]] = None,
+) -> str:
+    findings = report.get("findings", []) if isinstance(report, dict) else []
+    lines = [
+        "Code review",
+        f"Verdict: {report.get('verdict', 'unknown')}",
+        str(report.get("summary", "")).strip(),
+    ]
+    if findings:
+        lines.extend(["", "Findings:"])
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            lines.append(
+                f"- [{str(finding.get('severity', 'risk')).upper()}] "
+                f"{finding.get('title', 'Untitled finding')}: "
+                f"{finding.get('issue', '')}"
+            )
+    if handoff is not None:
+        lines.extend([
+            "",
+            "Fix outcome:",
+            f"- {handoff.verdict}: {handoff.worker_summary}",
+        ])
+    if verification is not None:
+        if verification.get("error"):
+            lines.extend(["", f"Verification unavailable: {verification['error']}"])
+        else:
+            lines.extend([
+                "",
+                "Post-fix review:",
+                f"- {verification.get('verdict', 'unknown')}: "
+                f"{verification.get('summary', '')}",
+            ])
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +241,7 @@ class MissionResult:
     plan_id: Optional[str] = None
     summary_text: str = ""
     failure_reason: str = ""
+    execution_route: str = "mission"
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +277,8 @@ class MissionsRuntime:
         self._telemetry_ctx = None  # set per-run in run() (Phase 5)
         self._cancel_check: Optional[Callable[[], bool]] = None
         self._active_run_kind = "new"
+        self._active_execution_route = "mission"
+        self._active_run_id: Optional[str] = None
 
     def _check_cancelled(self) -> None:
         """Raise if the active run received a cancel request."""
@@ -226,6 +294,8 @@ class MissionsRuntime:
         session: Optional[SessionContext] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
         run_kind: str = "auto",
+        execution_route: str = "auto",
+        run_id: Optional[str] = None,
     ) -> MissionResult:
         """
         Execute a full mission from a user request inside a session.
@@ -247,6 +317,7 @@ class MissionsRuntime:
         """
         t_mission_start = time.perf_counter()
         self._cancel_check = cancel_check
+        self._active_run_id = run_id
 
         # Resolve or create the session
         if session is None:
@@ -307,6 +378,7 @@ class MissionsRuntime:
                     run_kind=effective_run_kind,
                     parent_plan_id=parent_plan_id,
                     previous_plan=previous_plan,
+                    requested_route=execution_route,
                 )
             except RunCancelledError:
                 return self._finish_cancelled(session, t_mission_start)
@@ -314,6 +386,7 @@ class MissionsRuntime:
                 clear_milestone_write_policy()
                 deactivate_sandbox()
                 self._cancel_check = None
+                self._active_run_id = None
 
     def _finish_cancelled(
         self,
@@ -358,6 +431,7 @@ class MissionsRuntime:
             session_id=session.session_id,
             run_kind=getattr(self, "_active_run_kind", "new"),
             plan_id=plan.get("plan_id") or plan.get("mission_id"),
+            execution_route=getattr(self, "_active_execution_route", "mission"),
         )
 
     @staticmethod
@@ -397,6 +471,7 @@ class MissionsRuntime:
         run_kind: str,
         parent_plan_id: Optional[str],
         previous_plan: dict[str, Any],
+        requested_route: str,
     ) -> MissionResult:
         """Run orchestration + the milestone loop + summary inside a span."""
         self._check_cancelled()
@@ -404,23 +479,105 @@ class MissionsRuntime:
         self._active_run_kind = run_kind
         triage_report: Optional[dict[str, Any]] = None
 
-        # Repair runs get a read-only diagnosis before planning. A triage
-        # failure is non-fatal: the Orchestrator can still use the request and
-        # current workspace snapshot.
-        if run_kind == "repair":
-            try:
-                triage_report = run_triage(
-                    user_request,
-                    workspace_root=session.workspace_root,
-                    session_root=session.root,
-                    model=self.model,
-                    previous_plan=previous_plan,
-                    session=telemetry_ctx,
-                    emitter=self._emitter,
-                )
-            except Exception as exc:
-                print(f"  [Triage] Triage failed (non-fatal): {exc}")
-                self._emitter.emit("triage.failed", error=str(exc), fatal=False)
+        # Lifecycle and execution intent are orthogonal. Crash recovery always
+        # resumes the current mission; other requests are routed by a focused
+        # triage profile (or an explicit API override).
+        if run_kind == "resume":
+            route_decision = RouteDecision(
+                route="mission",
+                confidence="high",
+                rationale="Pending milestones require crash-safe resume.",
+                source="lifecycle",
+            )
+        else:
+            deterministic_route = requested_route
+            request_lower = user_request.strip().lower()
+            if requested_route == "auto" and (
+                request_lower.startswith(("review ", "review:", "audit ", "audit:"))
+                or "code review" in request_lower
+            ):
+                deterministic_route = "review"
+            if (
+                deterministic_route == "auto"
+                and run_kind == "new"
+                and not _workspace_has_user_files(session.workspace_root)
+            ):
+                deterministic_route = "mission"
+
+            if deterministic_route in {"auto", "hotfix"}:
+                try:
+                    triage_report = run_triage(
+                        user_request,
+                        workspace_root=session.workspace_root,
+                        session_root=session.root,
+                        model=self.model,
+                        previous_plan=previous_plan,
+                        session=telemetry_ctx,
+                        emitter=self._emitter,
+                    )
+                except Exception as exc:
+                    print(f"  [Triage] Routing failed — mission fallback: {exc}")
+                    self._emitter.emit(
+                        "triage.failed", error=str(exc), fatal=False
+                    )
+
+            route_decision = normalize_route_decision(
+                triage_report,
+                workspace_root=session.workspace_root,
+                requested_route=deterministic_route,
+            )
+
+        self._active_execution_route = route_decision.route
+        self._emitter.emit(
+            "triage.route.selected",
+            execution_route=route_decision.route,
+            confidence=route_decision.confidence,
+            rationale=route_decision.rationale,
+            source=route_decision.source,
+            candidate_files=route_decision.candidate_files,
+        )
+        self._persist_run_artifact(
+            session,
+            "route",
+            {
+                "decision": route_decision.to_dict(),
+                "run_id": self._active_run_id,
+                "session_id": session.session_id,
+                "run_kind": run_kind,
+                "parent_plan_id": parent_plan_id,
+            },
+        )
+
+        if route_decision.route == "hotfix":
+            focused = self._run_hotfix_route(
+                user_request,
+                route_decision,
+                session,
+                previous_plan,
+                t_mission_start,
+            )
+            if focused is not None:
+                return focused
+            # A scope/replan handoff escalates once to the full mission path.
+            self._active_execution_route = "mission"
+
+        if route_decision.route == "review":
+            focused, review_report = self._run_review_route(
+                user_request,
+                route_decision,
+                session,
+                previous_plan,
+                t_mission_start,
+            )
+            if focused is not None:
+                return focused
+            triage_report = {
+                **(triage_report or {}),
+                "route": "mission",
+                "summary": "Code review found broad changes requiring a planned mission.",
+                "review_report": review_report or {},
+            }
+            self._active_execution_route = "mission"
 
         # Phase 1 — Orchestration (graceful failure: no uncaught tracebacks)
         try:
@@ -467,6 +624,7 @@ class MissionsRuntime:
             title=title,
             run_kind=run_kind,
             plan_id=plan_id,
+            execution_route=self._active_execution_route,
             parent_plan_id=parent_plan_id,
             milestones_total=len(milestones),
             milestone_ids=[m.get("id", "?") for m in milestones],
@@ -677,6 +835,7 @@ class MissionsRuntime:
                 milestones_passed=passed,
                 milestones_total=len(milestones),
                 total_elapsed_ms=result.total_elapsed_ms,
+                execution_route=self._active_execution_route,
                 summary_text=result.summary_text,
                 failure_reason=result.failure_reason,
                 files_modified=summary.get("files_modified", []),
@@ -760,11 +919,313 @@ class MissionsRuntime:
         return plan
 
     # ------------------------------------------------------------------
+    # Focused execution routes
+    # ------------------------------------------------------------------
+
+    def _run_hotfix_route(
+        self,
+        user_request: str,
+        decision: RouteDecision,
+        session: SessionContext,
+        previous_plan: dict[str, Any],
+        started_at: float,
+    ) -> Optional[MissionResult]:
+        """Run one scoped Hotfix packet, or return None to escalate to mission."""
+        if not decision.candidate_files or len(decision.candidate_files) > 3:
+            self._emitter.emit(
+                "hotfix.escalated",
+                reason="scope_not_local",
+                candidate_files=decision.candidate_files,
+            )
+            return None
+
+        milestone = hotfix_milestone_from_route(decision, user_request)
+        plan = {
+            "mission_id": f"hotfix-{uuid.uuid4().hex[:10]}",
+            "plan_id": previous_plan.get("plan_id"),
+            "title": "Focused hotfix",
+            "run_kind": self._active_run_kind,
+            "execution_route": "hotfix",
+            "milestones": [milestone],
+        }
+        self._persist_run_artifact(session, "hotfix_packet", milestone)
+        handoff = self._execute_milestone(
+            milestone, plan, session, agent_profile="hotfix"
+        )
+        self._persist_run_artifact(session, "hotfix_handoff", asdict(handoff))
+
+        if handoff.verdict in {"REPLAN", "BLOCKED"}:
+            self._emitter.emit(
+                "hotfix.escalated",
+                reason=handoff.verdict.lower(),
+                errors=handoff.error_log[-2:],
+            )
+            return None
+
+        return self._finish_focused_result(
+            session=session,
+            started_at=started_at,
+            title="Focused hotfix",
+            execution_route="hotfix",
+            handoffs=[handoff],
+            plan_id=previous_plan.get("plan_id"),
+        )
+
+    def _run_review_route(
+        self,
+        user_request: str,
+        decision: RouteDecision,
+        session: SessionContext,
+        previous_plan: dict[str, Any],
+        started_at: float,
+    ) -> tuple[Optional[MissionResult], Optional[dict[str, Any]]]:
+        """Run read-only review and conditionally dispatch actionable findings."""
+        try:
+            report = run_code_review(
+                user_request=(
+                    f"{user_request}\n\nRequested review scope: {decision.review_scope}"
+                ),
+                workspace_root=session.workspace_root,
+                model=self.model,
+                previous_plan=previous_plan,
+                emitter=self._emitter,
+                session=self._telemetry_ctx,
+                cancel_check=self._cancel_check,
+            )
+        except RunCancelledError:
+            raise
+        except Exception as exc:
+            summary = f"Code review failed before producing a report: {exc}"
+            return (
+                self._finish_focused_result(
+                    session=session,
+                    started_at=started_at,
+                    title="Code review",
+                    execution_route="review",
+                    handoffs=[],
+                    plan_id=previous_plan.get("plan_id"),
+                    status_override="failed",
+                    summary_override=summary,
+                    failure_reason=summary,
+                ),
+                None,
+            )
+
+        report_dict = report.to_dict()
+        self._persist_run_artifact(session, "review_report", report_dict)
+        actionable = report.actionable_findings
+        if not actionable:
+            summary = _format_review_summary(report_dict)
+            return (
+                self._finish_focused_result(
+                    session=session,
+                    started_at=started_at,
+                    title="Code review",
+                    execution_route="review",
+                    handoffs=[],
+                    plan_id=previous_plan.get("plan_id"),
+                    summary_override=summary,
+                ),
+                report_dict,
+            )
+
+        milestone = hotfix_milestone_from_review(report)
+        if not milestone.get("target_files") or len(milestone["target_files"]) > 3:
+            self._emitter.emit(
+                "review.escalated",
+                reason="broad_findings",
+                affected_files=milestone.get("target_files", []),
+            )
+            return None, report_dict
+
+        self._persist_run_artifact(session, "review_fix_packet", milestone)
+        plan = {
+            "mission_id": f"review-fix-{uuid.uuid4().hex[:10]}",
+            "plan_id": previous_plan.get("plan_id"),
+            "title": "Review-driven fix",
+            "run_kind": self._active_run_kind,
+            "execution_route": "review",
+            "milestones": [milestone],
+        }
+        handoff = self._execute_milestone(
+            milestone, plan, session, agent_profile="hotfix"
+        )
+        if handoff.verdict in {"REPLAN", "BLOCKED"}:
+            self._emitter.emit(
+                "review.escalated",
+                reason=handoff.verdict.lower(),
+                affected_files=milestone.get("target_files", []),
+            )
+            return None, report_dict
+
+        verification: Optional[dict[str, Any]] = None
+        status_override: Optional[str] = None
+        failure_reason = ""
+        if handoff.verdict == "PASS":
+            try:
+                verified = run_code_review(
+                    user_request="Verify the attempted fixes from the prior review.",
+                    workspace_root=session.workspace_root,
+                    model=self.model,
+                    previous_plan=previous_plan,
+                    verification_of=report_dict,
+                    emitter=self._emitter,
+                    session=self._telemetry_ctx,
+                    cancel_check=self._cancel_check,
+                )
+                verification = verified.to_dict()
+                self._persist_run_artifact(
+                    session, "review_verification", verification
+                )
+                if verified.actionable_findings:
+                    status_override = "partial"
+                    failure_reason = (
+                        "The implementation passed validation, but reviewer "
+                        "verification still found actionable defects."
+                    )
+            except RunCancelledError:
+                raise
+            except Exception as exc:
+                verification = {"error": str(exc)}
+                self._persist_run_artifact(
+                    session, "review_verification", verification
+                )
+
+        summary = _format_review_summary(
+            report_dict,
+            handoff=handoff,
+            verification=verification,
+        )
+        return (
+            self._finish_focused_result(
+                session=session,
+                started_at=started_at,
+                title="Code review",
+                execution_route="review",
+                handoffs=[handoff],
+                plan_id=previous_plan.get("plan_id"),
+                status_override=status_override,
+                summary_override=summary,
+                failure_reason=failure_reason,
+            ),
+            report_dict,
+        )
+
+    def _finish_focused_result(
+        self,
+        *,
+        session: SessionContext,
+        started_at: float,
+        title: str,
+        execution_route: str,
+        handoffs: list[MilestoneHandoff],
+        plan_id: Optional[str],
+        status_override: Optional[str] = None,
+        summary_override: Optional[str] = None,
+        failure_reason: str = "",
+    ) -> MissionResult:
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
+        passed = sum(1 for handoff in handoffs if handoff.verdict == "PASS")
+        total = len(handoffs)
+        status = status_override or (
+            "completed" if passed == total else ("partial" if passed else "failed")
+        )
+        if total == 0 and status_override is None:
+            status = "completed"
+        result = MissionResult(
+            mission_id=f"{execution_route}-{uuid.uuid4().hex[:10]}",
+            title=title,
+            status=status,
+            milestones_passed=passed,
+            milestones_total=total,
+            handoffs=handoffs,
+            total_elapsed_ms=elapsed_ms,
+            model_used=self.model,
+            session_id=session.session_id,
+            run_kind=self._active_run_kind,
+            plan_id=plan_id,
+            execution_route=execution_route,
+        )
+        if summary_override is not None:
+            result.summary_text = summary_override
+            result.failure_reason = failure_reason
+        else:
+            recap = build_mission_summary(
+                title=title,
+                status=status,
+                milestones_passed=passed,
+                milestones_total=total,
+                total_elapsed_ms=elapsed_ms,
+                handoffs=handoffs,
+            )
+            result.summary_text = recap["summary_text"]
+            result.failure_reason = recap.get("failure_reason", "")
+
+        self._session_manager.update_status(session, status)
+        self._emitter.emit(
+            "mission.audit",
+            passed=status == "completed",
+            incomplete_milestones=(
+                [] if status == "completed" else [
+                    handoff.milestone_id
+                    for handoff in handoffs
+                    if handoff.verdict != "PASS"
+                ]
+            ),
+            run_kind=self._active_run_kind,
+            execution_route=execution_route,
+            plan_id=plan_id,
+        )
+        self._emitter.emit(
+            "mission.complete",
+            status=status,
+            run_kind=self._active_run_kind,
+            execution_route=execution_route,
+            plan_id=plan_id,
+            milestones_passed=passed,
+            milestones_total=total,
+            total_elapsed_ms=elapsed_ms,
+            summary_text=result.summary_text,
+            failure_reason=result.failure_reason,
+            files_modified=sorted({
+                path for handoff in handoffs for path in handoff.files_modified
+            }),
+        )
+        unregister_emitter(session.session_id)
+        self._telemetry_ctx = None
+        self._print_summary(result)
+        return result
+
+    def _persist_run_artifact(
+        self,
+        session: SessionContext,
+        name: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Persist immutable routing/profile evidence beside the run record."""
+        if not self._active_run_id:
+            return
+        directory = session.root / "runs" / f"{self._active_run_id}.artifacts"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / f"{name}.json").write_text(
+                json.dumps(payload, indent=2, default=str),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            print(f"  [Runtime] Could not persist {name} artifact: {exc}")
+
+    # ------------------------------------------------------------------
     # Milestone execution loop (glue: Phase 2 → 3 → 4)
     # ------------------------------------------------------------------
 
     def _execute_milestone(
-        self, milestone: dict, plan: dict, session: SessionContext
+        self,
+        milestone: dict,
+        plan: dict,
+        session: SessionContext,
+        *,
+        agent_profile: str = "worker",
     ) -> MilestoneHandoff:
         """
         Run the full Phase 2 → 3 → 4 loop for a single milestone.
@@ -856,6 +1317,7 @@ class MissionsRuntime:
             count=len(active_tools),
             routed_tools=sorted(initial_discovery.get("tools", [])),
             core_tools=list(_CORE_WORKER_TOOLS),
+            role="hotfix" if agent_profile == "hotfix" else "worker",
         )
         if milestone_suggests_dependencies(milestone, plan):
             install_skill = self._router.get_skill_by_name("install_dependency")
@@ -871,8 +1333,11 @@ class MissionsRuntime:
         while retry_count < MAX_RETRY_CYCLES:
             self._check_cancelled()
 
-            # Phase 3 — Worker implementation
-            worker_result = run_worker(
+            # Phase 3 — focused implementation profile
+            implementation_runner = (
+                run_hotfix if agent_profile == "hotfix" else run_worker
+            )
+            worker_result = implementation_runner(
                 milestone=milestone,
                 plan=plan,
                 curated_tools_md=curated_tools_md,
@@ -910,7 +1375,7 @@ class MissionsRuntime:
                         "can continue."
                     )
                 error_log.append(f"Worker blocked: {reason}")
-                print(f"  [Runtime] Worker BLOCKED: {reason}")
+                print(f"  [Runtime] {agent_profile} BLOCKED: {reason}")
                 elapsed_ms = (time.perf_counter() - t_start) * 1000.0
                 if self._emitter:
                     self._emitter.emit(
@@ -966,7 +1431,8 @@ class MissionsRuntime:
             verdict = verdict_data.get("verdict", "FAIL")
 
             if verdict == "PASS":
-                commit_msg    = f"feat({ms_id}): {ms_title}"
+                commit_prefix = "fix" if agent_profile == "hotfix" else "feat"
+                commit_msg    = f"{commit_prefix}({ms_id}): {ms_title}"
                 commit_result = dispatch("git_commit", {"message": commit_msg})
                 commit_hash   = commit_result.get("commit_hash", "")
                 elapsed_ms    = (time.perf_counter() - t_start) * 1000.0
@@ -1135,11 +1601,16 @@ class MissionsRuntime:
         if session.plan_path.exists():
             try:
                 plan = json.loads(session.plan_path.read_text(encoding="utf-8"))
+                updated = False
                 for m in plan.get("milestones", []):
                     if m.get("id") == ms_id:
                         m["status"] = "completed"
+                        updated = True
                         break
-                session.plan_path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
+                if updated:
+                    session.plan_path.write_text(
+                        json.dumps(plan, indent=2), encoding="utf-8"
+                    )
             except (json.JSONDecodeError, OSError) as exc:
                 print(f"  [Runtime] Could not update plan.json: {exc}")
 
@@ -1209,6 +1680,12 @@ def main() -> None:
         help="Run lifecycle mode (default: auto; repair reuses the current workspace)",
     )
     parser.add_argument(
+        "--execution-route",
+        choices=["auto", "mission", "hotfix", "review"],
+        default="auto",
+        help="Agent profile route (default: auto, selected by triage)",
+    )
+    parser.add_argument(
         "--list-sessions",
         action="store_true",
         help="List existing sessions and exit",
@@ -1276,7 +1753,12 @@ def main() -> None:
             sys.exit(1)
         print(f"[Runtime] Resuming session {session.session_id} ({session.title}).")
 
-    result = runtime.run(request, session=session, run_kind=args.run_kind)
+    result = runtime.run(
+        request,
+        session=session,
+        run_kind=args.run_kind,
+        execution_route=args.execution_route,
+    )
     sys.exit(0 if result.status == "completed" else 1)
 
 

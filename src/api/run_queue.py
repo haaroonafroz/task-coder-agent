@@ -56,6 +56,7 @@ class RunRecord:
     model: str
     queued_at: str
     run_kind: str = "auto"
+    execution_route: str = "auto"
     plan_id: Optional[str] = None
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
@@ -116,6 +117,7 @@ class RunRegistry:
         request: str,
         model: str,
         run_kind: str = "auto",
+        execution_route: str = "auto",
     ) -> RunRecord:
         run_id = uuid.uuid4().hex[:12]
         rec = RunRecord(
@@ -126,6 +128,7 @@ class RunRegistry:
             model=model,
             queued_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
             run_kind=run_kind,
+            execution_route=execution_route,
         )
         with self._lock:
             self._runs[run_id] = rec
@@ -277,6 +280,7 @@ class RunQueue:
         request: str,
         model: Optional[ModelChoice] = None,
         run_kind: str = "auto",
+        execution_route: str = "auto",
     ) -> RunRecord:
         """Create a run record and submit it to the serial worker."""
         chosen_model = model or ctx.selected_model or "auto"
@@ -285,6 +289,7 @@ class RunQueue:
             request,
             str(chosen_model),
             run_kind=run_kind,
+            execution_route=execution_route,
         )
         self._queue.put((rec, ctx, chosen_model))
         return rec
@@ -391,9 +396,12 @@ class RunQueue:
                 session=fresh,
                 cancel_check=cancel_check,
                 run_kind=rec.run_kind,
+                execution_route=rec.execution_route,
+                run_id=rec.run_id,
             )
             rec.plan_id = result.plan_id or rec.plan_id or result.mission_id
             rec.run_kind = result.run_kind
+            rec.execution_route = result.execution_route
             if result.status == "cancelled" or self._cancellation.is_cancelled(rec.run_id):
                 rec.status = "cancelled"
                 rec.error = "Run cancelled by user"
@@ -407,6 +415,7 @@ class RunQueue:
                     "model_used": result.model_used,
                     "session_id": result.session_id,
                     "run_kind": result.run_kind,
+                    "execution_route": result.execution_route,
                     "plan_id": result.plan_id,
                 }
                 try:
@@ -429,6 +438,7 @@ class RunQueue:
                     "model_used": result.model_used,
                     "session_id": result.session_id,
                     "run_kind": result.run_kind,
+                    "execution_route": result.execution_route,
                     "plan_id": result.plan_id,
                     "summary_text": result.summary_text,
                     "failure_reason": result.failure_reason,

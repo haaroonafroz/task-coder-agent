@@ -101,8 +101,10 @@ def run_triage(
             if emitter:
                 emitter.emit(
                     "triage.completed",
+                    route=report.get("route", "mission"),
+                    rationale=report.get("rationale", ""),
                     confidence=report.get("confidence", "low"),
-                    affected_files=report.get("affected_files", []),
+                    candidate_files=report.get("candidate_files", []),
                 )
             return report
 
@@ -125,12 +127,18 @@ def _validate_report(parsed: Optional[dict[str, Any]]) -> Optional[str]:
         return "response was not a JSON object"
     if not isinstance(parsed.get("summary"), str) or not parsed["summary"].strip():
         return "summary must be a non-empty string"
+    if parsed.get("route") not in {"mission", "hotfix", "review"}:
+        return "route must be mission, hotfix, or review"
+    if not isinstance(parsed.get("rationale"), str) or not parsed["rationale"].strip():
+        return "rationale must be a non-empty string"
     if not isinstance(parsed.get("evidence"), list):
         return "evidence must be a list"
-    if not isinstance(parsed.get("affected_files"), list):
-        return "affected_files must be a list"
-    if not isinstance(parsed.get("regression_requirements"), list):
-        return "regression_requirements must be a list"
+    if not isinstance(parsed.get("candidate_files"), list):
+        return "candidate_files must be a list"
+    if not isinstance(parsed.get("constraints"), list):
+        return "constraints must be a list"
+    if not isinstance(parsed.get("validation_intent"), list):
+        return "validation_intent must be a list"
     if parsed.get("confidence") not in {"high", "medium", "low"}:
         return "confidence must be high, medium, or low"
     return None
@@ -145,7 +153,7 @@ def _build_prompt(
 ) -> str:
     return (
         f"{_TRIAGE_MD}\n\n---\n\n"
-        f"## User's Repair Request\n{user_request}\n\n"
+        f"## Incoming User Request\n{user_request}\n\n"
         f"## Session Conversation\n```\n"
         f"{_read_messages(session_root)}\n```\n\n"
         f"## Previous Plan\n```json\n"

@@ -25,7 +25,140 @@ def _looks_like_tool_call_attempt(text: str) -> bool:
         or '"write_file"' in lowered
         or '"patch_file"' in lowered
         or '"read_file"' in lowered
+        or "<tool_call>" in lowered
+        or "<function=" in lowered
     )
+
+
+def _strip_thinking_markers(text: str) -> str:
+    """Remove leaked Qwen thinking blocks before parsing agent output."""
+    cleaned = re.sub(
+        r"<(?:think|redacted_reasoning)>.*?</(?:think|redacted_reasoning)>",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    return cleaned.strip()
+
+
+def _normalize_tool_call_dict(
+    tool: str,
+    args: Any,
+    *,
+    reasoning: str = "",
+) -> dict[str, Any]:
+    return {
+        "tool": tool.strip(),
+        "args": args if isinstance(args, dict) else {},
+        "reasoning": reasoning.strip(),
+    }
+
+
+def _parse_xml_parameters(inner: str) -> dict[str, Any]:
+    args: dict[str, Any] = {}
+    if not inner:
+        return args
+    for match in re.finditer(
+        r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>",
+        inner,
+        flags=re.DOTALL | re.IGNORECASE,
+    ):
+        args[match.group(1).strip()] = match.group(2).strip()
+    if args:
+        return args
+    stripped = inner.strip()
+    if stripped.startswith("{"):
+        payload = _load_json_candidate(stripped, repair=True)
+        if isinstance(payload, dict):
+            value = payload.get("arguments", payload.get("args", payload))
+            return value if isinstance(value, dict) else {}
+    return args
+
+
+def parse_xml_tool_calls(text: str) -> Optional[dict[str, Any]]:
+    """
+    Parse Qwen-style XML tool blocks into the harness JSON tool-call shape.
+
+    Supports:
+      - ``<tool_call><function=git_diff></function></tool_call>``
+      - ``<tool_call>{"name":"read_file","arguments":{...}}</tool_call>``
+      - ``<tool_call><function=read_file><parameter=file_path>app.py</parameter></function></tool_call>``
+    """
+    calls: list[dict[str, Any]] = []
+    blocks = re.findall(
+        r"<tool_call>\s*(.*?)\s*</tool_call>",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if blocks:
+        for block in blocks:
+            block = block.strip()
+            if not block:
+                continue
+            if block.startswith("{"):
+                payload = _load_json_candidate(block, repair=True)
+                if isinstance(payload, dict):
+                    tool = payload.get("tool") or payload.get("name")
+                    args = payload.get("args", payload.get("arguments", {}))
+                    if tool:
+                        calls.append(
+                            _normalize_tool_call_dict(
+                                str(tool),
+                                args,
+                            )
+                        )
+                        continue
+            fn_match = re.search(
+                r"<function=([^>\s/]+)(?:\s[^>]*)?>\s*(.*?)\s*</function>",
+                block,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            if fn_match:
+                calls.append(
+                    _normalize_tool_call_dict(
+                        fn_match.group(1),
+                        _parse_xml_parameters(fn_match.group(2)),
+                    )
+                )
+                continue
+            bare = re.match(r"<function=([^>/\s]+)\s*/?>", block, re.IGNORECASE)
+            if bare:
+                calls.append(_normalize_tool_call_dict(bare.group(1), {}))
+    else:
+        for match in re.finditer(
+            r"<function=([^>\s/]+)(?:\s[^>]*)?>\s*(.*?)\s*</function>",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        ):
+            calls.append(
+                _normalize_tool_call_dict(
+                    match.group(1),
+                    _parse_xml_parameters(match.group(2)),
+                )
+            )
+
+    if not calls:
+        return None
+    if len(calls) == 1:
+        return calls[0]
+    return {"calls": calls}
+
+
+def parse_agent_turn(text: str) -> Optional[dict]:
+    """
+    Parse one agent turn from JSON or local-model XML tool-call output.
+
+    Tries strict/recovered JSON first, then Qwen-style ``<tool_call>`` blocks.
+    """
+    cleaned = _strip_thinking_markers(text)
+    parsed = parse_json_from_text(cleaned)
+    if parsed is not None:
+        return parsed
+    xml_parsed = parse_xml_tool_calls(cleaned)
+    if xml_parsed is not None:
+        print("    [Parser] Recovered XML/Qwen tool-call format.")
+        return xml_parsed
+    return None
 
 
 def _load_json_candidate(text: str, *, repair: bool = False) -> Optional[Any]:

@@ -20,7 +20,14 @@ function asNumber(value: unknown): number {
 
 function asRole(value: unknown): AgentRole {
   const role = asString(value);
-  if (role === "orchestrator" || role === "worker" || role === "validator" || role === "triage") {
+  if (
+    role === "orchestrator" ||
+    role === "worker" ||
+    role === "hotfix" ||
+    role === "reviewer" ||
+    role === "validator" ||
+    role === "triage"
+  ) {
     return role;
   }
   return "worker";
@@ -115,6 +122,16 @@ function findOrchestratorTurn(turns: Map<string, AgentTurn>): AgentTurn | undefi
     .sort((a, b) => a.ts.localeCompare(b.ts))
     .reverse()
     .find((turn) => turn.role === "orchestrator");
+}
+
+function findRoleTurn(
+  turns: Map<string, AgentTurn>,
+  role: AgentRole,
+): AgentTurn | undefined {
+  return [...turns.values()]
+    .sort((a, b) => a.ts.localeCompare(b.ts))
+    .reverse()
+    .find((turn) => turn.role === role);
 }
 
 function findWorkerTurn(turns: Map<string, AgentTurn>, milestoneId?: string): AgentTurn | undefined {
@@ -268,16 +285,22 @@ export function buildChatItems(messages: Message[], events: SSEEvent[]): ChatIte
         milestone_id: asString(data.milestone_id) || undefined,
       };
       const toolRole = asString(data.role);
-      if (toolRole === "orchestrator") {
-        const orchestratorTurn = findOrchestratorTurn(turns);
-        if (orchestratorTurn) {
-          orchestratorTurn.tools.push(entry);
+      if (toolRole === "orchestrator" || toolRole === "reviewer" || toolRole === "hotfix") {
+        const role = asRole(toolRole);
+        const roleTurn = role === "orchestrator"
+          ? findOrchestratorTurn(turns)
+          : findRoleTurn(turns, role);
+        if (roleTurn) {
+          roleTurn.tools.push(entry);
         } else {
           items.push({
             kind: "system",
             id: `tool-${ev.index ?? index}`,
             ts: ev.ts,
-            content: `Orchestrator · ${entry.tool}${entry.reasoning ? `: ${entry.reasoning}` : ""}`,
+            content: `${personaLabel({
+              role,
+              milestone_id: entry.milestone_id,
+            } as AgentTurn)} · ${entry.tool}${entry.reasoning ? `: ${entry.reasoning}` : ""}`,
           });
         }
       } else {
@@ -329,6 +352,8 @@ export function personaLabel(turn: AgentTurn): string {
   const roleLabels: Record<AgentRole, string> = {
     orchestrator: "Orchestrator",
     worker: "Worker",
+    hotfix: "Hotfix",
+    reviewer: "Code Review",
     validator: "Validator",
     triage: "Triage",
   };

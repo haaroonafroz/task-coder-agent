@@ -2,6 +2,7 @@
 
 export type ModelChoice = "auto" | "local" | "gemini" | "gpt4o";
 export type RunKind = "auto" | "new" | "resume" | "repair";
+export type ExecutionRoute = "auto" | "mission" | "hotfix" | "review";
 
 export interface Session {
   session_id: string;
@@ -24,6 +25,7 @@ export interface Message {
   ts: string;
   run_id: string | null;
   run_kind?: RunKind;
+  execution_route?: ExecutionRoute;
 }
 
 export interface Run {
@@ -38,6 +40,7 @@ export interface Run {
   result: Record<string, unknown> | null;
   error: string | null;
   run_kind: RunKind;
+  execution_route?: ExecutionRoute;
   plan_id: string | null;
 }
 
@@ -145,7 +148,13 @@ export interface SSEEvent {
   index?: number;
 }
 
-export type AgentRole = "orchestrator" | "worker" | "validator" | "triage";
+export type AgentRole =
+  | "orchestrator"
+  | "worker"
+  | "hotfix"
+  | "reviewer"
+  | "validator"
+  | "triage";
 
 export interface LLMMetrics {
   call_id: string;

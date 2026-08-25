@@ -34,6 +34,7 @@ export function openEventStream(
 
   const eventTypes = [
     "session.started",
+    "triage.route.selected",
     "llm.call",
     "llm.stream.start",
     "llm.stream.delta",
@@ -54,6 +55,12 @@ export function openEventStream(
     "worker.complete_rejected",
     "worker.blocked",
     "worker.cancelled",
+    "hotfix.started",
+    "hotfix.finished",
+    "hotfix.escalated",
+    "review.started",
+    "review.completed",
+    "review.escalated",
     "tool.called",
     "tool.result",
     "validation.started",

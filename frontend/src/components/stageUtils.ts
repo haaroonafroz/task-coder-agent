@@ -3,6 +3,7 @@
 export function stageFromEventType(eventType: string): string {
   const map: Record<string, string> = {
     "session.started": "Starting",
+    "triage.route.selected": "Routing",
     "plan.created": "Orchestration",
     "orchestrator.explore.started": "Orchestrator Exploring",
     "orchestrator.explore.finished": "Orchestration",
@@ -10,6 +11,12 @@ export function stageFromEventType(eventType: string): string {
     "milestone.started": "Milestone Started",
     "milestone.skipped": "Milestone Skipped",
     "worker.started": "Worker",
+    "hotfix.started": "Hotfix",
+    "hotfix.finished": "Hotfix Complete",
+    "hotfix.escalated": "Escalating Hotfix",
+    "review.started": "Code Review",
+    "review.completed": "Review Complete",
+    "review.escalated": "Escalating Review",
     "tool.called": "Tool Execution",
     "tool.result": "Tool Execution",
     "validation.started": "Validation",

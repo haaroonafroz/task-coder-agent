@@ -12,7 +12,7 @@ Each agent role resolves to a concrete model + thinking profile via the registry
 
   Backend   Orchestrator / Validator     Worker
   --------  -------------------------     ------
-  local     TARGET_MODEL, thinking=medium TARGET_MODEL, thinking=off (/no_think)
+  local     TARGET_MODEL, per-role Qwen3.8 effort
   gemini    GEMINI_MODEL, thinking=max   GEMINI_MODEL, thinking=default
   gpt4o     OPENAI_LLM_MODEL             OPENAI_LLM_MODEL_ENRICHMENT
 
@@ -23,6 +23,7 @@ Environment variables (can be set in .env):
   GEMINI_THINKING_LEVEL_DEFAULT, GEMINI_THINKING_LEVEL_MAX
   OPENAI_API_KEY, OPENAI_LLM_MODEL, OPENAI_LLM_MODEL_ENRICHMENT
   LLM_TEMPERATURE, LLM_TEMPERATURE_<ROLE>, LLM_TOP_P, LLM_TOP_P_<ROLE>, LLM_SEED
+  LOCAL_REASONING_EFFORT_<ROLE>, LOCAL_ENABLE_THINKING_<ROLE>
 """
 
 from __future__ import annotations
@@ -45,8 +46,10 @@ except ImportError:
 # Types
 # ---------------------------------------------------------------------------
 ModelChoice = Literal["local", "gemini", "gpt4o", "auto"]
-AgentRole = Literal["triage", "orchestrator", "worker", "validator"]
-ThinkingLevel = Literal["off", "minimal", "low", "medium", "high"]
+AgentRole = Literal[
+    "triage", "orchestrator", "worker", "hotfix", "reviewer", "validator"
+]
+ThinkingLevel = Literal["off", "minimal", "low", "medium", "high", "xhigh"]
 
 # Parameters not accepted by each backend's OpenAI-compatible endpoint.
 _UNSUPPORTED_PARAMS: dict[str, set[str]] = {
@@ -91,6 +94,88 @@ def _role_temperature(role: AgentRole) -> float:
 
 def _role_top_p(role: AgentRole) -> float:
     return _role_sampling(role, "LLM_TOP_P")
+
+
+_LOCAL_DEFAULT_EFFORT: dict[AgentRole, str] = {
+    "triage": "medium",
+    "orchestrator": "medium",
+    "worker": "low",
+    "hotfix": "low",
+    "reviewer": "medium",
+    "validator": "medium",
+}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Resolve a boolean environment variable with an explicit error on typos."""
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise RuntimeError(
+        f"Invalid boolean in {name}={raw!r}; use true or false"
+    )
+
+
+def _local_thinking_level(role: AgentRole) -> ThinkingLevel:
+    """Resolve Qwen3.8 thinking for one role from the environment.
+
+    The split ``LOCAL_REASONING_EFFORT_*`` /
+    ``LOCAL_ENABLE_THINKING_*`` form is preferred because it maps directly to
+    Qwen3.8's request parameters.  The compact ``LOCAL_THINKING_*`` form is
+    also accepted as an atomic compatibility fallback.
+    """
+    role_name = role.upper()
+    effort_name = f"LOCAL_REASONING_EFFORT_{role_name}"
+    enabled_name = f"LOCAL_ENABLE_THINKING_{role_name}"
+    compact_name = f"LOCAL_THINKING_{role_name}"
+    legacy_name = f"LOCAL_THINKING_LEVEL_{role_name}"
+
+    split_configured = bool(
+        os.getenv(effort_name, "").strip()
+        or os.getenv(enabled_name, "").strip()
+    )
+    if split_configured:
+        effort = os.getenv(
+            effort_name, _LOCAL_DEFAULT_EFFORT[role]
+        ).strip().lower()
+        enabled = _env_bool(
+            enabled_name,
+            default=(role != "worker"),
+        )
+    else:
+        compact = os.getenv(compact_name, "").strip().lower()
+        if not compact:
+            compact = os.getenv(legacy_name, "").strip().lower()
+        if not compact:
+            compact = _LOCAL_DEFAULT_EFFORT[role]
+        effort = compact
+        enabled = effort != "off"
+
+    if effort == "off":
+        if split_configured and enabled:
+            raise RuntimeError(
+                f"Invalid Qwen3.8 thinking configuration: {effort_name}=off "
+                f"but {enabled_name} enables thinking"
+            )
+        return "off"
+
+    # Map old generic labels to the nearest Qwen3.8 value.  Do not pass these
+    # aliases to the model: Qwen3.8 accepts only low, medium, and xhigh.
+    effort = {
+        "minimal": "low",
+        "high": "xhigh",
+        "max": "xhigh",
+    }.get(effort, effort)
+    if effort not in ("low", "medium", "xhigh"):
+        raise RuntimeError(
+            f"Invalid Qwen3.8 reasoning effort in {effort_name}={effort!r}; "
+            "use low, medium, or xhigh"
+        )
+    return effort if enabled else "off"  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -157,29 +242,22 @@ def _role_thinking_level(backend: str, role: AgentRole) -> ThinkingLevel:
 
     Gemini reads GEMINI_THINKING_LEVEL_DEFAULT (worker) and
     GEMINI_THINKING_LEVEL_MAX (orchestrator/validator).
-    Local uses medium for triage/planning/validation, off for worker (/no_think).
+    Local uses per-role Qwen3.8 environment settings.  The split form is
+    LOCAL_REASONING_EFFORT_<ROLE> plus LOCAL_ENABLE_THINKING_<ROLE>.
     GPT has no thinking knob — level is always off (model choice handles capability).
     """
     if backend == "gemini":
-        if role == "worker":
+        if role in {"worker", "hotfix"}:
             raw = os.getenv("GEMINI_THINKING_LEVEL_DEFAULT", "minimal")
         else:
             raw = os.getenv("GEMINI_THINKING_LEVEL_MAX", "medium")
         level = raw.strip().lower()
         if level in ("off", "minimal", "low", "medium", "high"):
             return level  # type: ignore[return-value]
-        return "minimal" if role == "worker" else "medium"
+        return "minimal" if role in {"worker", "hotfix"} else "medium"
 
     if backend == "local":
-        if role == "worker":
-            return "off"
-        # llama.cpp templates only understand thinking on/off; any non-"off"
-        # level means enabled. Measured: orchestrator medium thinking is the
-        # dominant mission cost (~80%), so these are env-tunable.
-        raw = os.getenv(f"LOCAL_THINKING_LEVEL_{role.upper()}", "medium").strip().lower()
-        if raw in ("off", "minimal", "low", "medium", "high"):
-            return raw  # type: ignore[return-value]
-        return "medium"
+        return _local_thinking_level(role)
 
     return "off"
 
@@ -187,11 +265,11 @@ def _role_thinking_level(backend: str, role: AgentRole) -> ThinkingLevel:
 def _role_model_name(backend: str, role: AgentRole) -> str:
     """Resolve the concrete model name for a backend + role."""
     if backend == "local":
-        return os.getenv("TARGET_MODEL", "qwen3-27b")
+        return os.getenv("TARGET_MODEL", "qwen3.8-27b-mtp")
     if backend == "gemini":
         return os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
     if backend == "gpt4o":
-        if role == "worker":
+        if role in {"worker", "hotfix"}:
             return os.getenv("OPENAI_LLM_MODEL_ENRICHMENT", "gpt-4o-mini")
         return os.getenv("OPENAI_LLM_MODEL", "gpt-4o")
     raise KeyError(f"Unknown backend: {backend}")
@@ -203,7 +281,8 @@ def resolve_model_config(backend: str, role: AgentRole) -> ResolvedModelConfig:
 
     Args:
         backend: ``local`` | ``gemini`` | ``gpt4o`` (not ``auto``).
-        role:    ``triage`` | ``orchestrator`` | ``worker`` | ``validator``.
+        role:    ``triage`` | ``orchestrator`` | ``worker`` | ``hotfix`` |
+                 ``reviewer`` | ``validator``.
 
     Returns:
         A :class:`ResolvedModelConfig` with everything needed for one LLM call.
@@ -231,11 +310,15 @@ def get_model_catalog() -> list[dict[str, Any]]:
         meta = _endpoint_meta(key)
         models_by_role = {
             role: _role_model_name(key, role)
-            for role in ("triage", "orchestrator", "worker", "validator")
+            for role in (
+                "triage", "orchestrator", "worker", "hotfix", "reviewer", "validator"
+            )
         }
         thinking_by_role = {
             role: _role_thinking_level(key, role)
-            for role in ("triage", "orchestrator", "worker", "validator")
+            for role in (
+                "triage", "orchestrator", "worker", "hotfix", "reviewer", "validator"
+            )
         }
         entries.append({
             "key": key,
@@ -254,12 +337,16 @@ def get_model_catalog() -> list[dict[str, Any]]:
             "triage": "(fallback chain)",
             "orchestrator": "(fallback chain)",
             "worker": "(fallback chain)",
+            "hotfix": "(fallback chain)",
+            "reviewer": "(fallback chain)",
             "validator": "(fallback chain)",
         },
         "thinking_by_role": {
             "triage": "per-backend",
             "orchestrator": "per-backend",
             "worker": "per-backend",
+            "hotfix": "per-backend",
+            "reviewer": "per-backend",
             "validator": "per-backend",
         },
         "context_length": get_context_length(),
@@ -281,31 +368,6 @@ def _build_legacy_endpoints() -> dict[str, dict]:
 
 
 _ENDPOINTS: dict[str, dict] = _build_legacy_endpoints()
-
-
-# ---------------------------------------------------------------------------
-# Provider-specific thinking adapters
-# ---------------------------------------------------------------------------
-
-def _local_user_content(
-    prompt: Any,
-    thinking_level: ThinkingLevel,
-) -> Any:
-    """Add the local thinking directive without corrupting image parts."""
-    if thinking_level in ("off", "minimal"):
-        if isinstance(prompt, str):
-            return "/no_think\n\n" + prompt
-        if isinstance(prompt, list):
-            parts = [
-                dict(part) if isinstance(part, dict) else part
-                for part in prompt
-            ]
-            for part in parts:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    part["text"] = "/no_think\n\n" + str(part.get("text", ""))
-                    break
-            return parts
-    return prompt
 
 
 def _gemini_extra_body(thinking_level: ThinkingLevel) -> dict[str, Any]:
@@ -441,12 +503,6 @@ def _call_single(
     else:
         chat_messages.append({"role": "user", "content": prompt or ""})
 
-    if model_key == "local" and thinking_level in ("off", "minimal"):
-        for msg in chat_messages:
-            if msg["role"] == "user":
-                msg["content"] = _local_user_content(msg["content"], thinking_level)
-                break
-
     kwargs: dict[str, Any] = dict(
         model=cfg.model_name,
         messages=chat_messages,
@@ -460,12 +516,17 @@ def _call_single(
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
 
-    # llama.cpp: /no_think prompt prefixes are NOT honoured by Qwen jinja
-    # chat templates — the model still emits hidden reasoning_content that
-    # consumes the completion budget (~270 tokens for a 7-token answer in
-    # measurement). enable_thinking must be set as a chat template kwarg.
-    if model_key == "local" and thinking_level == "off":
-        kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+    # Qwen3.8 reads both controls in the Jinja template.  These are request-
+    # scoped, so different roles can share one llama-server instance.  Keep
+    # reasoning_effort nested: llama.cpp's top-level OpenAI-compatible field
+    # only gives special treatment to reasoning_effort="none".
+    if model_key == "local":
+        template_kwargs: dict[str, Any] = {
+            "enable_thinking": thinking_level != "off",
+        }
+        if thinking_level != "off":
+            template_kwargs["reasoning_effort"] = thinking_level
+        kwargs["extra_body"] = {"chat_template_kwargs": template_kwargs}
 
     if model_key == "gemini" and thinking_level not in ("off",):
         kwargs["extra_body"] = _gemini_extra_body(thinking_level)

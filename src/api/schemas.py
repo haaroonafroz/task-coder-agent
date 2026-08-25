@@ -15,6 +15,8 @@ from pydantic import BaseModel, Field
 
 from src.llm_client import ModelChoice
 
+ExecutionRoute = Literal["auto", "mission", "hotfix", "review"]
+
 
 # ---------------------------------------------------------------------------
 # Session
@@ -57,6 +59,7 @@ class MessageCreate(BaseModel):
     trigger_run: bool = True
     model: Optional[ModelChoice] = None
     run_kind: Literal["auto", "new", "resume", "repair"] = "auto"
+    execution_route: ExecutionRoute = "auto"
 
 
 class MessageResponse(BaseModel):
@@ -66,6 +69,7 @@ class MessageResponse(BaseModel):
     ts: str
     run_id: Optional[str] = None
     run_kind: Optional[str] = None
+    execution_route: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +80,7 @@ class RunCreate(BaseModel):
     request: str = Field(..., min_length=1)
     model: Optional[ModelChoice] = None
     run_kind: Literal["auto", "new", "resume", "repair"] = "auto"
+    execution_route: ExecutionRoute = "auto"
 
 
 class RunResponse(BaseModel):
@@ -90,6 +95,7 @@ class RunResponse(BaseModel):
     result: Optional[dict[str, Any]] = None
     error: Optional[str] = None
     run_kind: str = "auto"
+    execution_route: str = "auto"
     plan_id: Optional[str] = None
 
 
