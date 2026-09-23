@@ -13,6 +13,7 @@ from src.api.run_queue import RunQueue, RunRegistry
 from src.api.messages import MessageStore
 from src.run_control import RunCancelledError, ensure_not_cancelled
 from src.session import SessionContext
+from src.workspace.models import WorkspaceBinding
 
 
 def test_run_cancellation_request_and_clear() -> None:
@@ -40,8 +41,8 @@ def _session(tmp_path: Path) -> SessionContext:
     return SessionContext(
         session_id=sid,
         title="cancel test",
-        root=root,
-        workspace_root=ws,
+        state_root=root,
+        workspace=WorkspaceBinding(kind="managed", root=ws),
         plan_path=root / "plan.json",
         handoffs_dir=root / "handoffs",
         memory_store_path=root / "memory_store.json",

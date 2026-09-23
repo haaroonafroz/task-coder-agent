@@ -50,6 +50,8 @@ def build_sandbox_env(
     if use_venv and ctx.venv_python.exists():
         env["VIRTUAL_ENV"] = str(ctx.venv_path)
         env["MISSIONS_PYTHON"] = str(ctx.venv_python.resolve())
+    else:
+        env["MISSIONS_PYTHON"] = resolve_python(ctx)
 
     # Preserve only safe, non-secret host vars needed for toolchains.
     safe_passthrough = ("SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY")

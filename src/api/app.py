@@ -23,11 +23,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.api.run_queue import RunQueue, RunRegistry
 from src.api.messages import MessageStore
 from src.main import MissionsRuntime
-from src.session import SessionManager
+from src.session import SessionManager, get_default_sessions_root
 from src.tool_registry import DynamicToolRouter
 
 _ROOT = pathlib.Path(__file__).parent.parent.parent
-_SESSIONS_ROOT = _ROOT / "sessions"
+_SESSIONS_ROOT = get_default_sessions_root()
 _SKILLS_PATH = _ROOT / "config" / "skills.md"
 
 # Frontend dev server (Phase 4) — allowed CORS origins.

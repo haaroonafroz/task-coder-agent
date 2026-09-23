@@ -58,7 +58,13 @@ export function ChatPanel({ session, messages, sending, connected, events, onSen
   return (
     <div className="panel chat-container">
       <div className="panel-header">
-        <span>{session.title}</span>
+        <span title={session.workspace?.path || session.workspace_root}>
+          {session.title}
+          <span style={{ marginLeft: 8, fontSize: 10, color: "var(--text-muted)" }}>
+            {session.workspace?.kind === "external" ? "external" : "managed"}
+            {session.workspace?.access_mode === "read_only" ? " · read only" : ""}
+          </span>
+        </span>
         <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <span className={`conn-dot ${connected ? "connected" : "disconnected"}`} />
           <span style={{ fontSize: 11, color: "var(--text-muted)" }}>

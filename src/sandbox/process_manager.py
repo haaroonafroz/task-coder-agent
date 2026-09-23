@@ -134,6 +134,15 @@ def start_server(
     sandbox = _ctx(ctx)
     if sandbox is None:
         return {"success": False, "error": "No active sandbox context"}
+    if getattr(sandbox, "sandbox_required", False) is True:
+        return {
+            "success": False,
+            "error": (
+                "Managed development servers are disabled for external workspaces "
+                "until they can run inside the required process sandbox."
+            ),
+            "sandbox_denied": True,
+        }
     _prune_dead_servers()
     if len(_PROCESSES) >= _MAX_SERVERS:
         return {

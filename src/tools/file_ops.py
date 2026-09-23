@@ -18,6 +18,7 @@ from typing import Any, Optional
 
 from src.tools.paths import (
     get_workspace_root,
+    is_sensitive_workspace_path,
     normalize_workspace_path,
     resolve_workspace_path,
 )
@@ -112,6 +113,19 @@ def _test_write_error(target_rel: str) -> Optional[dict[str, Any]]:
 
 def _write_jail_error(target_rel: str) -> Optional[dict[str, Any]]:
     """Return an error dict when the path is outside the milestone jail."""
+    from src.sandbox.context import get_sandbox_context
+
+    sandbox = get_sandbox_context()
+    if is_sensitive_workspace_path(target_rel):
+        return {
+            "success": False,
+            "error": "SENSITIVE FILE DENIED: secret-bearing files are not agent-accessible.",
+        }
+    if sandbox is not None and sandbox.workspace_mode == "read_only":
+        return {
+            "success": False,
+            "error": "WORKSPACE READ ONLY: this session cannot modify project files.",
+        }
     if _ALLOWED_WRITE_PATHS is None:
         return None
     if target_rel in _ALLOWED_WRITE_PATHS:
@@ -169,6 +183,11 @@ def read_file(
     except ValueError as exc:
         return {"success": False, "error": str(exc)}
 
+    if is_sensitive_workspace_path(target):
+        return {
+            "success": False,
+            "error": "SENSITIVE FILE DENIED: this file is not agent-accessible.",
+        }
     if not target.exists():
         return {
             "success": False,
@@ -361,7 +380,7 @@ def list_directory(target_dir: str = ".", max_depth: int = 6) -> dict[str, Any]:
         return {"success": False, "error": str(exc)}
 
     if not target.exists():
-        target.mkdir(parents=True, exist_ok=True)
+        return {"success": False, "error": f"Directory not found: {target_dir}"}
 
     if not target.is_dir():
         return {"success": False, "error": f"Path is not a directory: {target_dir}"}
@@ -376,7 +395,10 @@ def list_directory(target_dir: str = ".", max_depth: int = 6) -> dict[str, Any]:
             lines.append(f"{prefix}... (max depth reached)")
             return
         try:
-            entries = sorted(path.iterdir(), key=lambda e: (e.is_file(), e.name))
+            entries = sorted(
+                (e for e in path.iterdir() if not is_sensitive_workspace_path(e)),
+                key=lambda e: (e.is_file(), e.name),
+            )
         except PermissionError:
             lines.append(f"{prefix}[permission denied]")
             return

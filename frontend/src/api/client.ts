@@ -18,6 +18,9 @@ import type {
   ModelChoice,
   RunKind,
   WorkspaceScope,
+  WorkspaceAccessMode,
+  WorkspaceKind,
+  WorkspaceInfo,
 } from "./types";
 
 const BASE = "/api/v1";
@@ -46,7 +49,16 @@ export const api = {
     return req(`/sessions${q}`);
   },
 
-  createSession(body: { title: string; model?: ModelChoice }): Promise<Session> {
+  createSession(body: {
+    title: string;
+    model?: ModelChoice;
+    workspace?: {
+      kind: WorkspaceKind;
+      path?: string;
+      access_mode?: WorkspaceAccessMode;
+      environment_strategy?: "auto" | "project" | "harness";
+    };
+  }): Promise<Session> {
     return req(`/sessions`, {
       method: "POST",
       body: JSON.stringify(body),
@@ -141,6 +153,10 @@ export const api = {
     const params = new URLSearchParams({ path });
     if (scope !== "workspace") params.set("scope", scope);
     return req(`/sessions/${sid}/workspace/file?${params}`);
+  },
+
+  getWorkspaceInfo(sid: string): Promise<WorkspaceInfo> {
+    return req(`/sessions/${sid}/workspace/info`);
   },
 
   // ---- Models ----

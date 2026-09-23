@@ -14,7 +14,7 @@ from typing import Any
 from src.sandbox.context import get_sandbox_context
 from src.sandbox.executor import get_executor
 from src.sandbox.policy import NetworkMode
-from src.tools.paths import get_workspace_root
+from src.tools.paths import get_workspace_root, is_sensitive_workspace_path
 
 
 _MANIFEST_ECOSYSTEMS = {
@@ -70,6 +70,8 @@ def project_info(max_entries: int = 80) -> dict[str, Any]:
         if len(entries) >= max(1, min(max_entries, 200)):
             break
         if any(part in {".git", ".venv", "__pycache__", "node_modules", "target"} for part in path.parts):
+            continue
+        if is_sensitive_workspace_path(path):
             continue
         try:
             entries.append(_relative(path, root) + ("/" if path.is_dir() else ""))

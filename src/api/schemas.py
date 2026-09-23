@@ -22,11 +22,43 @@ ExecutionRoute = Literal["auto", "mission", "hotfix", "review"]
 # Session
 # ---------------------------------------------------------------------------
 
+class WorkspaceCreate(BaseModel):
+    kind: Literal["managed", "external"] = "managed"
+    path: Optional[str] = None
+    access_mode: Literal["read_write", "read_only"] = "read_write"
+    environment_strategy: Literal["auto", "project", "harness"] = "auto"
+
+
+class WorkspaceResponse(BaseModel):
+    kind: Literal["managed", "external"]
+    path: str
+    access_mode: Literal["read_write", "read_only"]
+    environment_strategy: Literal["auto", "project", "harness"]
+    git_root: Optional[str] = None
+    sandbox_required: bool = False
+
+
+class ProjectProfileResponse(BaseModel):
+    root: str
+    workspace_kind: str
+    git: dict[str, Any] = Field(default_factory=dict)
+    languages: list[str] = Field(default_factory=list)
+    manifests: list[str] = Field(default_factory=list)
+    environment: Optional[dict[str, Any]] = None
+    detected_commands: dict[str, str] = Field(default_factory=dict)
+
+
+class WorkspaceInfoResponse(BaseModel):
+    workspace: WorkspaceResponse
+    project: ProjectProfileResponse
+
+
 class SessionCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
     model: ModelChoice = "auto"
     thinking_profile: str = "auto"
     phoenix_project: Optional[str] = None
+    workspace: WorkspaceCreate = Field(default_factory=WorkspaceCreate)
 
 
 class SessionUpdate(BaseModel):
@@ -48,6 +80,8 @@ class SessionResponse(BaseModel):
     workspace_root: str
     plan_path: str
     events_path: str
+    workspace: WorkspaceResponse
+    project_profile: Optional[dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------

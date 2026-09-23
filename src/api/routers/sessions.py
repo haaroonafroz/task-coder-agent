@@ -16,6 +16,22 @@ router = APIRouter(prefix="/sessions", tags=["sessions"])
 
 def _to_response(meta: dict) -> SessionResponse:
     """Build a SessionResponse from a raw session.json meta dict."""
+    workspace = meta.get("workspace") or {
+        "kind": "managed",
+        "path": meta.get("workspace_root", ""),
+        "root": meta.get("workspace_root", ""),
+        "access_mode": "read_write",
+        "environment_strategy": "harness",
+        "sandbox_required": False,
+    }
+    workspace_response = {
+        "kind": workspace.get("kind", "managed"),
+        "path": workspace.get("path") or workspace.get("root", ""),
+        "access_mode": workspace.get("access_mode", "read_write"),
+        "environment_strategy": workspace.get("environment_strategy", "auto"),
+        "git_root": workspace.get("git_root"),
+        "sandbox_required": workspace.get("sandbox_required", False),
+    }
     return SessionResponse(
         session_id=meta.get("session_id", ""),
         title=meta.get("title", "Untitled"),
@@ -28,6 +44,8 @@ def _to_response(meta: dict) -> SessionResponse:
         workspace_root=meta.get("workspace_root", ""),
         plan_path=meta.get("plan_path", ""),
         events_path=meta.get("events_path", ""),
+        workspace=workspace_response,
+        project_profile=meta.get("project_profile"),
     )
 
 
@@ -36,12 +54,19 @@ async def create_session(
     body: SessionCreate,
     manager: SessionManager = Depends(get_session_manager),
 ) -> SessionResponse:
-    ctx = manager.create_session(
-        title=body.title,
-        model=body.model,
-        thinking_profile=body.thinking_profile,
-        phoenix_project=body.phoenix_project,
-    )
+    try:
+        ctx = manager.create_session(
+            title=body.title,
+            model=body.model,
+            thinking_profile=body.thinking_profile,
+            phoenix_project=body.phoenix_project,
+            workspace_kind=body.workspace.kind,
+            workspace_path=body.workspace.path,
+            workspace_access_mode=body.workspace.access_mode,
+            environment_strategy=body.workspace.environment_strategy,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _to_response(ctx.to_meta_dict())
 
 
@@ -93,6 +118,8 @@ async def delete_session(
     ctx = manager.load_session(sid)
     if ctx is None:
         raise HTTPException(status_code=404, detail=f"Session '{sid}' not found")
+    if ctx.workspace.kind == "managed" and ctx.workspace_root.exists():
+        shutil.rmtree(ctx.workspace_root, ignore_errors=True)
     if ctx.root.exists():
         shutil.rmtree(ctx.root, ignore_errors=True)
     return None

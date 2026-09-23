@@ -126,8 +126,12 @@ sessions/<session-id>/
   events.jsonl         # Append-only event stream (incl. llm.call metrics)
   memory_store.json    # JSON memory (synchronous source of truth)
   handoffs/            # Per-milestone telemetry
-  workspace/           # Generated code sandbox
-  .venv/               # Session-local Python environment
+  .venv/               # Harness environment for managed workspaces
+
+managed-workspaces/<session-id>/
+  ...                  # Harness-owned greenfield code
+
+src/workspace/         # Bindings, inspection, environments, Git state, locks
 
 docs/screenshots/      # README demo visualizations
 test_project.txt       # Copy-paste example mission commands
@@ -317,10 +321,12 @@ Open `http://127.0.0.1:5173`. Vite proxies `/api/*` to the FastAPI server on `12
 
 The UI is organized around:
 
-- **Sessions:** left sidebar for creating and switching isolated runs.
+- **Sessions:** create a managed greenfield workspace or attach an existing
+  folder with read/write or read-only access.
 - **Live activity feed:** center chat stream combining user messages, assistant summaries, and SSE events such as `plan.created`, `tool.called`, `validation.finished`, and `mission.complete`.
 - **Run inspector:** resizable right panel with milestone accordions. Each milestone expands into only the events tagged with that milestone id.
-- **Session files:** file browser rooted at `sessions/<session-id>/`, so `plan.json`, `events.jsonl`, `handoffs/`, `.venv/`, and `workspace/` are visible. Runtime-heavy folders are hidden by default and can be toggled on.
+- **Workspace files:** file browser rooted at the bound project. Sensitive
+  files such as `.env`, private keys, and credential files are not exposed.
 - **Theme:** neutral black/gray UI with white/gray emphasis instead of the older blue theme.
 
 > Token-level model deltas are not streamed to the UI yet. The backend already consumes provider streams internally; exposing `llm.delta` events would be the next step if you want live generated-token rendering in the chat feed.
@@ -378,17 +384,31 @@ python -m src.main --session <session-id> --run-kind resume \
   "Continue the interrupted run"
 python -m src.main --session <session-id> --run-kind new \
   "Start a separate task in this workspace"
+
+# Attach an existing project (external repositories are never auto-committed)
+python -m src.main --workspace /home/me/projects/billing-api \
+  "Fix the failing invoice test"
+
+# Review with a read-only project binding
+python -m src.main --workspace /home/me/projects/billing-api --read-only \
+  --execution-route review "Review this project for correctness bugs"
 ```
 
 ### Reset between missions
 
 ```bash
-rm -rf sessions/<session-id>
+rm -rf sessions/<session-id> managed-workspaces/<session-id>
 ```
+
+Deleting a session never deletes an attached external workspace. Managed
+workspaces are deleted with their owning session.
+Set `TASK_CODER_HOME=/path/to/state` to store session state and managed
+workspaces outside this repository.
 
 Artifacts after a run:
 
-- **Code:** `sessions/<session-id>/workspace/`
+- **Managed code:** `managed-workspaces/<session-id>/`
+- **External code:** remains at the attached user path
 - **Plan:** `sessions/<session-id>/plan.json`
 - **Events:** `sessions/<session-id>/events.jsonl`
 - **Handoffs:** `sessions/<session-id>/handoffs/*.json`

@@ -34,6 +34,7 @@ from src.llm_client import ModelChoice
 from src.main import MissionsRuntime
 from src.run_control import RunCancelledError
 from src.session import SessionContext, SessionManager
+from src.workspace.locking import workspace_locks
 
 from src.api.messages import MessageStore
 from src.api.run_cancellation import RunCancellation
@@ -391,14 +392,20 @@ class RunQueue:
         try:
             fresh = self._session_manager.load_session(ctx.session_id) or ctx
             self._runtime.model = model
-            result = self._runtime.run(
-                rec.request,
-                session=fresh,
-                cancel_check=cancel_check,
-                run_kind=rec.run_kind,
-                execution_route=rec.execution_route,
-                run_id=rec.run_id,
+            lock = (
+                workspace_locks.read_lock
+                if fresh.workspace.access_mode == "read_only"
+                else workspace_locks.write_lock
             )
+            with lock(fresh.workspace_root):
+                result = self._runtime.run(
+                    rec.request,
+                    session=fresh,
+                    cancel_check=cancel_check,
+                    run_kind=rec.run_kind,
+                    execution_route=rec.execution_route,
+                    run_id=rec.run_id,
+                )
             rec.plan_id = result.plan_id or rec.plan_id or result.mission_id
             rec.run_kind = result.run_kind
             rec.execution_route = result.execution_route

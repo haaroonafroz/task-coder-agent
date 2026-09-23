@@ -67,6 +67,9 @@ _GLOBAL_BLOCK_PATTERNS: list[re.Pattern[str]] = [
         r"&&\s*curl",
         r"\|\s*bash",
         r"\|\s*sh\s",
+        r"(?:^|[\s/])\.env(?:\.(?!example|sample|template)[\w-]+)?(?:\s|$)",
+        r"(?:^|[\s/])(?:credentials(?:\.json)?|secrets\.json|id_rsa|id_ed25519)(?:\s|$)",
+        r"(?:^|[\s/])[\w.-]+\.(?:pem|key|p12|pfx)(?:\s|$)",
         r"&\s*$",           # background jobs
         r";\s*&",
     ]

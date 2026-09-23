@@ -20,6 +20,7 @@ from src.sandbox.executor import get_executor
 from src.sandbox.policy import NetworkMode, ShellProfile
 from src.tools.paths import (
     get_workspace_root,
+    is_sensitive_workspace_path,
     normalize_shell_command,
     normalize_workspace_path,
     resolve_workspace_path,
@@ -129,7 +130,7 @@ def run_linter(
 
 def install_dependency(package_name: str) -> dict[str, Any]:
     """
-    Install a Python package into the session-local .venv via pip.
+    Install a Python package into the selected project or harness environment.
 
     Args:
         package_name: Package name with optional version specifier (e.g. "httpx>=0.27.0").
@@ -140,6 +141,12 @@ def install_dependency(package_name: str) -> dict[str, Any]:
     ctx = get_sandbox_context()
     if ctx is None:
         return {"success": False, "stdout": "", "stderr": "No active sandbox context"}
+    if ctx.workspace_mode == "read_only":
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": "Cannot install dependencies for a read-only workspace",
+        }
 
     try:
         python = str(ctx.ensure_venv())
@@ -173,7 +180,7 @@ def install_dependency(package_name: str) -> dict[str, Any]:
 
 def uninstall_dependency(package_name: str) -> dict[str, Any]:
     """
-    Uninstall a Python package from the session-local .venv.
+    Uninstall a Python package from the selected project or harness environment.
 
     Args:
         package_name: Package name with optional version specifier.
@@ -184,6 +191,12 @@ def uninstall_dependency(package_name: str) -> dict[str, Any]:
     ctx = get_sandbox_context()
     if ctx is None:
         return {"success": False, "stdout": "", "stderr": "No active sandbox context"}
+    if ctx.workspace_mode == "read_only":
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": "Cannot uninstall dependencies for a read-only workspace",
+        }
 
     if not ctx.venv_python.exists():
         return {"success": False, "stdout": "", "stderr": "Session venv not initialized"}
@@ -240,6 +253,13 @@ def search_grep(query: str, target_dir: str = ".") -> dict[str, Any]:
     except ValueError as exc:
         return {"success": False, "matches": [], "match_count": 0, "error": str(exc)}
 
+    if is_sensitive_workspace_path(target):
+        return {
+            "success": False,
+            "matches": [],
+            "match_count": 0,
+            "error": "SENSITIVE FILE DENIED: this path is not agent-accessible.",
+        }
     if not target.exists():
         return {
             "success": False,
@@ -283,6 +303,8 @@ def search_grep(query: str, target_dir: str = ".") -> dict[str, Any]:
     matches = []
     for filepath in target.rglob("*"):
         if not filepath.is_file():
+            continue
+        if is_sensitive_workspace_path(filepath):
             continue
         try:
             for line_no, line in enumerate(

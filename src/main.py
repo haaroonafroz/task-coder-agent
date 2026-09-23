@@ -12,11 +12,9 @@ Hardware note: only ONE LLM inference runs at any moment (serial design).
 
 Session scoping
 ---------------
-Every run now executes inside an isolated session directory tree under
-``sessions/<session_id>/``. The runtime points the global workspace root
-(``src.tools.paths.set_workspace_root``) at the session's workspace before
-any tool call, so all file/shell tools operate inside the session sandbox.
-Legacy ``active_mission/`` + root ``workspace/`` remain untouched.
+Every run keeps state under ``sessions/<session_id>/`` and binds tools to
+either a harness-managed workspace or an explicitly attached external project.
+The runtime points ``src.tools.paths`` at that binding before tool execution.
 
 Usage:
     # Create a new session and run
@@ -61,13 +59,14 @@ from src.tools.file_ops import (
     begin_milestone_write_policy,
     clear_milestone_write_policy,
 )
-from src.tools.paths import set_workspace_root, get_workspace_root
+from src.tools.paths import set_workspace_root, get_workspace_root, reset_workspace_root
 from src.session import SessionContext, SessionManager
 from src.sandbox import activate_sandbox, deactivate_sandbox
 from src.sandbox.process_manager import format_allowed_ports_block
 from src.sandbox.dependency_check import milestone_suggests_dependencies
 from src.run_control import RunCancelledError, ensure_not_cancelled
 from src.events import EventEmitter, emitter_for_session, register_emitter, unregister_emitter
+from src.workspace.git_state import snapshot_git_state
 from src.agents import (
     replan_mission,
     run_code_review,
@@ -116,10 +115,15 @@ testpaths = tests
 # Workspace bootstrap
 # ---------------------------------------------------------------------------
 
-def _ensure_session_workspace(ctx: SessionContext) -> None:
-    """Create the session workspace, sandbox jail, and pytest bootstrap before any tool calls."""
+def _prepare_session_runtime(ctx: SessionContext) -> None:
+    """Activate harness state and tools without modifying attached code."""
     ctx.ensure_dirs()
     activate_sandbox(ctx)
+    set_workspace_root(ctx.workspace_root)
+
+
+def _bootstrap_managed_workspace(ctx: SessionContext) -> None:
+    """Create greenfield-only convenience files."""
     gitkeep = ctx.workspace_root / ".gitkeep"
     if not gitkeep.exists():
         gitkeep.touch()
@@ -129,7 +133,18 @@ def _ensure_session_workspace(ctx: SessionContext) -> None:
         pytest_ini.write_text(_PYTEST_INI, encoding="utf-8")
 
     (ctx.workspace_root / "tests").mkdir(parents=True, exist_ok=True)
-    set_workspace_root(ctx.workspace_root)
+
+
+def _inspect_external_workspace(
+    ctx: SessionContext,
+    manager: SessionManager,
+) -> dict[str, Any]:
+    """Inspect an external project read-only and persist bounded metadata."""
+    profile = manager.workspace_service.inspect(ctx.workspace).to_dict()
+    ctx.project_profile = profile
+    ctx.git_preflight = profile.get("git")
+    manager._save_meta(ctx)
+    return profile
 
 
 def _workspace_has_user_files(workspace_root: Path) -> bool:
@@ -334,7 +349,11 @@ class MissionsRuntime:
             else None
         )
 
-        _ensure_session_workspace(session)
+        _prepare_session_runtime(session)
+        if session.workspace.kind == "managed":
+            _bootstrap_managed_workspace(session)
+        else:
+            _inspect_external_workspace(session, self._session_manager)
         self._session_manager.update_status(session, "running")
 
         # Event stream for this session (singleton — same instance SSE subscribes to)
@@ -383,8 +402,15 @@ class MissionsRuntime:
             except RunCancelledError:
                 return self._finish_cancelled(session, t_mission_start)
             finally:
+                if session.workspace.kind == "external":
+                    self._persist_run_artifact(
+                        session,
+                        "git_postflight",
+                        snapshot_git_state(session.workspace_root).to_dict(),
+                    )
                 clear_milestone_write_policy()
                 deactivate_sandbox()
+                reset_workspace_root()
                 self._cancel_check = None
                 self._active_run_id = None
 
@@ -512,6 +538,7 @@ class MissionsRuntime:
                         session_root=session.root,
                         model=self.model,
                         previous_plan=previous_plan,
+                        project_profile=session.project_profile,
                         session=telemetry_ctx,
                         emitter=self._emitter,
                     )
@@ -1015,6 +1042,21 @@ class MissionsRuntime:
         self._persist_run_artifact(session, "review_report", report_dict)
         actionable = report.actionable_findings
         if not actionable:
+            summary = _format_review_summary(report_dict)
+            return (
+                self._finish_focused_result(
+                    session=session,
+                    started_at=started_at,
+                    title="Code review",
+                    execution_route="review",
+                    handoffs=[],
+                    plan_id=previous_plan.get("plan_id"),
+                    summary_override=summary,
+                ),
+                report_dict,
+            )
+
+        if session.workspace.access_mode == "read_only":
             summary = _format_review_summary(report_dict)
             return (
                 self._finish_focused_result(
@@ -1674,6 +1716,16 @@ def main() -> None:
         help="Resume an existing session by id (under sessions/<id>/)",
     )
     parser.add_argument(
+        "--workspace",
+        default=None,
+        help="Attach a new session to an existing project directory",
+    )
+    parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help="Attach --workspace with read-only project access",
+    )
+    parser.add_argument(
         "--run-kind",
         choices=["auto", "new", "resume", "repair"],
         default="auto",
@@ -1707,6 +1759,8 @@ def main() -> None:
         help="API server bind port (default: 8088)",
     )
     args = parser.parse_args()
+    if args.read_only and not args.workspace:
+        parser.error("--read-only requires --workspace")
 
     # --serve: launch the Control API and return (does not run a mission).
     if args.serve:
@@ -1747,11 +1801,28 @@ def main() -> None:
 
     session = None
     if args.session:
+        if args.workspace:
+            parser.error("--session and --workspace cannot be used together")
         session = runtime.session_manager.load_session(args.session)
         if session is None:
             print(f"Session '{args.session}' not found under sessions/. Exiting.")
             sys.exit(1)
         print(f"[Runtime] Resuming session {session.session_id} ({session.title}).")
+    elif args.workspace:
+        try:
+            session = runtime.session_manager.create_session(
+                title=request[:60] + ("..." if len(request) > 60 else ""),
+                model=args.model,
+                workspace_kind="external",
+                workspace_path=args.workspace,
+                workspace_access_mode="read_only" if args.read_only else "read_write",
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(
+            f"[Runtime] Attached {session.workspace_root} "
+            f"({session.workspace.access_mode})."
+        )
 
     result = runtime.run(
         request,

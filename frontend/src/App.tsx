@@ -40,7 +40,7 @@ export default function App() {
   const { messages, sending, sendMessage, appendMessage } = useMessages(activeSid);
   const { runs, refresh: refreshRuns } = useRuns(activeSid);
   const { plan, refresh: refreshPlan } = usePlan(activeSid);
-  const { tree, file, fileLoading, refreshTree, openFile } = useWorkspace(activeSid, "session");
+  const { tree, file, fileLoading, refreshTree, openFile } = useWorkspace(activeSid, "workspace");
   const { events, connected, clearEvents } = useSessionEvents(activeSid);
 
   // Track files modified in the current run to highlight them.
