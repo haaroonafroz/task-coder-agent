@@ -68,6 +68,7 @@ class LLMStreamContext:
             "total_ms": result.total_ms,
             "thinking_level": result.thinking_level,
             "fallback_used": result.fallback_used,
+            "tokens_estimated": bool(getattr(result, "tokens_estimated", False)),
             "output_kind": self.output_kind,
             "thinking_chars": len(thinking_text),
             "output_chars": len(output_text),
@@ -83,6 +84,17 @@ class LLMStreamContext:
 
         self.emitter.emit("llm.stream.end", **shared)
         self.emitter.emit("llm.call", **shared)
+        try:
+            from src.session_usage import record_session_tokens
+
+            record_session_tokens(
+                self.emitter.events_path.parent / "session.json",
+                prompt=int(getattr(result, "tokens_prompt", 0) or 0),
+                generated=int(getattr(result, "tokens_generated", 0) or 0),
+                estimated=bool(getattr(result, "tokens_estimated", False)),
+            )
+        except Exception:
+            pass
 
 
 def stream_context_for(

@@ -14,7 +14,7 @@ from src.agents.orchestrator_explore import build_workspace_orientation
 from src.agents.tool_diagnostics import compact_tool_result, event_diagnostics
 from src.agents.utils import parse_agent_turn, trim_conversation
 from src.events import EventEmitter
-from src.llm_client import ModelChoice, call_llm, resolve_model_config
+from src.llm_client import ModelChoice, call_llm, span_model_name
 from src.settings import get_settings
 from src.run_control import ensure_not_cancelled
 from src.telemetry import TelemetryContext, span_llm_call, span_tool_call
@@ -113,11 +113,7 @@ def run_code_review(
 
     while tool_calls < review_budget:
         ensure_not_cancelled(cancel_check)
-        span_model = (
-            resolve_model_config(model, "reviewer").model_name
-            if model != "auto"
-            else model
-        )
+        span_model = span_model_name(model, "reviewer")
         with span_llm_call("reviewer", phase, span_model, session=session):
             result = call_llm(
                 messages=trim_conversation(conversation, max_turns=16),

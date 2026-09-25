@@ -29,7 +29,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from src.llm_client import AgentRole, call_llm, ModelChoice, resolve_model_config
+from src.llm_client import AgentRole, call_llm, ModelChoice, span_model_name
 from src.settings import get_settings
 from src.telemetry import span_llm_call, span_tool_call, TelemetryContext
 from src.tools import dispatch
@@ -262,10 +262,7 @@ def run_worker(
         # rendered prompt append-only (prefix-cache friendly).
         messages = trim_conversation(conversation, max_turns=history_turns)
 
-        span_model = (
-            resolve_model_config(model, agent_role).model_name
-            if model != "auto" else model
-        )
+        span_model = span_model_name(model, agent_role)
         with span_llm_call(agent_role, ms_id, span_model, session=session):
             llm_result = call_llm(
                 messages=messages,

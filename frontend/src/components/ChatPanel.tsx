@@ -61,10 +61,15 @@ export function ChatPanel({
   );
 
   useEffect(() => {
-    if (session) {
-      setModel((session.selected_model as ModelChoice) || "auto");
+    if (!session) return;
+    const next = (session.selected_model as ModelChoice) || "auto";
+    const info = models.find((entry) => entry.key === next);
+    if (next !== "auto" && (!info || info.enabled === false || !info.available)) {
+      setModel("auto");
+      return;
     }
-  }, [session]);
+    setModel(next);
+  }, [session, models]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });

@@ -19,6 +19,9 @@ def _to_model_info(entry: dict, *, probe: bool = True) -> ModelInfo:
         available = bool(get_settings().fallback_ids())
         if not available:
             err = "No providers configured"
+    elif not entry.get("enabled", True):
+        available = False
+        err = "disabled in Settings"
     elif probe:
         provider = get_settings().provider(entry["key"])
         api_key = provider.api_key if provider else ""
@@ -38,6 +41,7 @@ def _to_model_info(entry: dict, *, probe: bool = True) -> ModelInfo:
         context_length=entry.get("context_length"),
         label=entry.get("label"),
         adapter=entry.get("adapter"),
+        compat=entry.get("compat"),
         enabled=entry.get("enabled", True),
         api_key_set=entry.get("api_key_set", False),
         discovered_models=discovered,

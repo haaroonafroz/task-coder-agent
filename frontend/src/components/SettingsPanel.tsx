@@ -57,6 +57,7 @@ export function SettingsPanel({ open, onClose, onSaved }: Props) {
         adapter: preset.adapter,
         model: preset.model || "",
         models_by_role: preset.models_by_role || {},
+        compat: "auto",
         enabled: true,
         context_length: preset.context_length ?? null,
         api_key: "",
@@ -213,6 +214,15 @@ export function SettingsPanel({ open, onClose, onSaved }: Props) {
                       <option value="openai">openai</option>
                       <option value="gemini_openai">gemini</option>
                       <option value="llamacpp_qwen">llama.cpp / Qwen</option>
+                    </select>
+                    <select
+                      value={p.compat || "auto"}
+                      onChange={(e) => updateProvider(p.id, { compat: e.target.value })}
+                      title="Request shape: auto detects gpt-5/gpt-6/o-series"
+                    >
+                      <option value="auto">compat: auto</option>
+                      <option value="classic">compat: classic</option>
+                      <option value="openai_reasoning">compat: reasoning</option>
                     </select>
                     <button onClick={() => void test(p.id)}>Test</button>
                     <button className="danger" onClick={() => removeProvider(p.id)}>Remove</button>

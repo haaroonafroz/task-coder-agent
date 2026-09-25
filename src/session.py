@@ -35,6 +35,7 @@ from typing import Any, Optional
 
 from src.llm_client import ModelChoice
 from src.settings import resolve_home
+from src.session_usage import merge_token_usage
 from src.workspace.models import WorkspaceBinding
 from src.workspace.service import WorkspaceService, default_managed_root
 
@@ -79,6 +80,12 @@ class SessionContext:
     reflection_memory_ids_used: list[str] = field(default_factory=list)
     project_profile: Optional[dict[str, Any]] = None
     git_preflight: Optional[dict[str, Any]] = None
+    token_usage: dict[str, int] = field(default_factory=lambda: {
+        "prompt": 0,
+        "generated": 0,
+        "calls": 0,
+        "estimated_calls": 0,
+    })
 
     # ------------------------------------------------------------------
     # Convenience
@@ -125,6 +132,12 @@ class SessionContext:
             "reflection_memory_ids_used": self.reflection_memory_ids_used,
             "project_profile": self.project_profile,
             "git_preflight": self.git_preflight,
+            "token_usage": self.token_usage or {
+                "prompt": 0,
+                "generated": 0,
+                "calls": 0,
+                "estimated_calls": 0,
+            },
         }
 
 
@@ -278,20 +291,36 @@ class SessionManager:
         # readers (e.g. the API server thread) never see a partial file.
         import os
         import tempfile
-        data = json.dumps(ctx.to_meta_dict(), indent=2)
-        fd, tmp = tempfile.mkstemp(
-            dir=str(ctx.meta_path.parent), suffix=".tmp", prefix="session_"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(data)
-            os.replace(tmp, ctx.meta_path)
-        except Exception:
+
+        from src.session_usage import META_LOCK, merge_token_usage
+
+        with META_LOCK:
+            existing: dict[str, Any] = {}
+            if ctx.meta_path.is_file():
+                try:
+                    existing = json.loads(ctx.meta_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    existing = {}
+            data = ctx.to_meta_dict()
+            data["token_usage"] = merge_token_usage(
+                existing.get("token_usage") if isinstance(existing, dict) else None,
+                data.get("token_usage"),
+            )
+            ctx.token_usage = data["token_usage"]
+            payload = json.dumps(data, indent=2)
+            fd, tmp = tempfile.mkstemp(
+                dir=str(ctx.meta_path.parent), suffix=".tmp", prefix="session_"
+            )
             try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(payload)
+                os.replace(tmp, ctx.meta_path)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
 
     # ------------------------------------------------------------------
     # Internal
@@ -336,4 +365,5 @@ class SessionManager:
             reflection_memory_ids_used=meta.get("reflection_memory_ids_used", []),
             project_profile=meta.get("project_profile"),
             git_preflight=meta.get("git_preflight"),
+            token_usage=merge_token_usage(meta.get("token_usage")),
         )

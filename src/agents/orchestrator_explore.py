@@ -12,7 +12,7 @@ from typing import Any, Optional
 from src.agents.tool_diagnostics import compact_tool_result, event_diagnostics
 from src.agents.utils import parse_agent_turn, validate_plan_payload, trim_conversation
 from src.events import EventEmitter
-from src.llm_client import ModelChoice, call_llm, resolve_model_config
+from src.llm_client import ModelChoice, call_llm, span_model_name
 from src.settings import get_settings
 from src.telemetry import span_llm_call, span_tool_call, TelemetryContext
 from src.tools import dispatch
@@ -228,11 +228,7 @@ def run_orchestration_explore(
 
     while tool_call_count < budget:
         messages = trim_conversation(conversation, max_turns=16)
-        span_model = (
-            resolve_model_config(model, "orchestrator").model_name
-            if model != "auto"
-            else model
-        )
+        span_model = span_model_name(model, "orchestrator")
         with span_llm_call("orchestrator", "explore", span_model, session=session):
             llm_result = call_llm(
                 messages=messages,

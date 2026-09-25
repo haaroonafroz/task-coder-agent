@@ -61,6 +61,12 @@ export interface Session {
   events_path: string;
   workspace: WorkspaceBinding;
   project_profile?: Record<string, unknown> | null;
+  token_usage?: {
+    prompt: number;
+    generated: number;
+    calls: number;
+    estimated_calls?: number;
+  };
 }
 
 export interface Message {
@@ -145,6 +151,7 @@ export interface ModelInfo {
   context_length?: number | null;
   label?: string | null;
   adapter?: string | null;
+  compat?: string | null;
   enabled?: boolean;
   api_key_set?: boolean;
   discovered_models?: string[];
@@ -169,6 +176,7 @@ export interface MissionsSettingsPayload {
       adapter: string;
       model: string;
       models_by_role: Record<string, string>;
+      compat?: string;
       enabled: boolean;
       context_length: number | null;
       api_key: string;
@@ -300,6 +308,7 @@ export interface LLMMetrics {
   thinking_chars?: number;
   output_chars?: number;
   fallback_used?: boolean;
+  tokens_estimated?: boolean;
 }
 
 export interface ToolCallEntry {

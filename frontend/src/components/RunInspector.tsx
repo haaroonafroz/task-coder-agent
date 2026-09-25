@@ -2,6 +2,11 @@ import { useMemo, useState } from "react";
 import type { Plan, Run, SSEEvent, WorkspaceEntry, WorkspaceFile } from "../api/types";
 import { WorkspaceExplorer } from "./WorkspaceExplorer";
 import { stageFromEventType, milestoneStatusFromEvents, statusColor } from "./stageUtils";
+import {
+  formatRoleLabel,
+  formatTokenCount,
+  summarizeSessionUsage,
+} from "./sessionTokens";
 
 interface Props {
   plan: Plan | null;
@@ -66,6 +71,8 @@ export function RunInspector({
   onCancelRun,
 }: Props) {
   const [openMilestones, setOpenMilestones] = useState<Set<string>>(new Set());
+  const [agentsOpen, setAgentsOpen] = useState(false);
+  const [openAgents, setOpenAgents] = useState<Set<string>>(new Set());
   const [cancelling, setCancelling] = useState(false);
 
   const currentStage = useMemo(() => {
@@ -88,6 +95,7 @@ export function RunInspector({
 
   const milestones = plan?.milestones || [];
   const passedCount = Object.values(milestoneStatuses).filter((s) => s === "passed").length;
+  const tokenTotals = useMemo(() => summarizeSessionUsage(events), [events]);
 
   const toggleMilestone = (msId: string) => {
     setOpenMilestones((prev) => {
@@ -97,6 +105,15 @@ export function RunInspector({
       } else {
         next.add(msId);
       }
+      return next;
+    });
+  };
+
+  const toggleAgent = (role: string) => {
+    setOpenAgents((prev) => {
+      const next = new Set(prev);
+      if (next.has(role)) next.delete(role);
+      else next.add(role);
       return next;
     });
   };
@@ -135,6 +152,80 @@ export function RunInspector({
               ? `${passedCount} / ${milestones.length} milestones passed`
               : "Waiting for plan"}
           </div>
+          {(tokenTotals.calls > 0 || tokenTotals.byRole.length > 0) && (
+            <div className="session-token-totals">
+              <div className="stage-label">Session tokens</div>
+              <div className="session-token-line">
+                {formatTokenCount(tokenTotals.prompt)} prefill
+                <span className="session-token-sep">·</span>
+                {formatTokenCount(tokenTotals.generated)} generated
+                {tokenTotals.estimated ? <span className="session-token-est">est.</span> : null}
+              </div>
+              <div className="session-token-line muted">
+                {formatTokenCount(tokenTotals.total)} total
+                <span className="session-token-sep">·</span>
+                {tokenTotals.calls} LLM {tokenTotals.calls === 1 ? "call" : "calls"}
+              </div>
+              {tokenTotals.byRole.length > 0 && (
+                <div className="agent-usage">
+                  <button
+                    className="agent-usage-toggle"
+                    onClick={() => setAgentsOpen((open) => !open)}
+                  >
+                    <span className="ms-expand">{agentsOpen ? "-" : "+"}</span>
+                    By agent
+                  </button>
+                  {agentsOpen && (
+                    <div className="agent-usage-list">
+                      {tokenTotals.byRole.map((agent) => {
+                        const open = openAgents.has(agent.role);
+                        return (
+                          <div key={agent.role} className="agent-usage-item">
+                            <button
+                              className="agent-usage-row"
+                              onClick={() => toggleAgent(agent.role)}
+                            >
+                              <span className="ms-expand">{open ? "-" : "+"}</span>
+                              <span className="agent-usage-name">{formatRoleLabel(agent.role)}</span>
+                              <span className="agent-usage-summary">
+                                {formatTokenCount(agent.total)} tok
+                                <span className="session-token-sep">·</span>
+                                {agent.toolCalls} tool{agent.toolCalls === 1 ? "" : "s"}
+                              </span>
+                            </button>
+                            {open && (
+                              <div className="agent-usage-detail">
+                                <div>
+                                  {formatTokenCount(agent.prompt)} prefill
+                                  <span className="session-token-sep">·</span>
+                                  {formatTokenCount(agent.generated)} generated
+                                  <span className="session-token-sep">·</span>
+                                  {agent.calls} LLM {agent.calls === 1 ? "call" : "calls"}
+                                  {agent.estimated ? <span className="session-token-est">est.</span> : null}
+                                </div>
+                                {agent.tools.length === 0 ? (
+                                  <div className="empty-inline">No tools.</div>
+                                ) : (
+                                  <ul className="agent-tool-list">
+                                    {agent.tools.map((item) => (
+                                      <li key={item.tool}>
+                                        <span>{item.tool}</span>
+                                        <span>×{item.count}</span>
+                                      </li>
+                                    ))}
+                                  </ul>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         <div className="mission-events">

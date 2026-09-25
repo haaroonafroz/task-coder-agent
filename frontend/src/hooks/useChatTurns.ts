@@ -58,6 +58,7 @@ function metricsFromData(data: Record<string, unknown>, callId: string): LLMMetr
     thinking_chars: asNumber(data.thinking_chars) || undefined,
     output_chars: asNumber(data.output_chars) || undefined,
     fallback_used: Boolean(data.fallback_used),
+    tokens_estimated: Boolean(data.tokens_estimated),
   };
 }
 

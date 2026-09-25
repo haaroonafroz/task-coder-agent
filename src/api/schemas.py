@@ -82,6 +82,14 @@ class SessionResponse(BaseModel):
     events_path: str
     workspace: WorkspaceResponse
     project_profile: Optional[dict[str, Any]] = None
+    token_usage: dict[str, int] = Field(
+        default_factory=lambda: {
+            "prompt": 0,
+            "generated": 0,
+            "calls": 0,
+            "estimated_calls": 0,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +244,7 @@ class ModelInfo(BaseModel):
     context_length: Optional[int] = None
     label: Optional[str] = None
     adapter: Optional[str] = None
+    compat: Optional[str] = None
     enabled: bool = True
     api_key_set: bool = False
     discovered_models: list[str] = Field(default_factory=list)

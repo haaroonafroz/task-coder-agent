@@ -46,6 +46,8 @@ def _to_response(meta: dict) -> SessionResponse:
         events_path=meta.get("events_path", ""),
         workspace=workspace_response,
         project_profile=meta.get("project_profile"),
+        token_usage=meta.get("token_usage")
+        or {"prompt": 0, "generated": 0, "calls": 0, "estimated_calls": 0},
     )
 
 

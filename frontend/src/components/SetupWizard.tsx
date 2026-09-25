@@ -67,6 +67,7 @@ export function SetupWizard({ onComplete }: Props) {
       adapter: preset?.adapter || (kind === "local" ? "llamacpp_qwen" : "openai"),
       model,
       models_by_role: preset?.models_by_role || {},
+      compat: "auto",
       enabled: true,
       context_length: preset?.context_length ?? null,
       api_key: apiKey,

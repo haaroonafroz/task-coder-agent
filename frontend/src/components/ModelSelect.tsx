@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import type { ModelChoice, ModelInfo } from "../api/types";
 
 /** Human-readable label for a backend option in the model selector. */
@@ -29,6 +30,14 @@ export function ModelSelect({ value, models, onChange, className }: Props) {
           { key: "auto", model: "Auto", base_url: "", available: true, error: null },
         ] as ModelInfo[]);
 
+  useEffect(() => {
+    if (!value || value === "auto" || options.length === 0) return;
+    const selected = options.find((m) => m.key === value);
+    if (!selected || selected.enabled === false || !selected.available) {
+      onChange("auto");
+    }
+  }, [value, options, onChange]);
+
   return (
     <select
       className={className}
@@ -36,9 +45,17 @@ export function ModelSelect({ value, models, onChange, className }: Props) {
       onChange={(e) => onChange(e.target.value as ModelChoice)}
     >
       {options.map((m) => (
-        <option key={m.key} value={m.key} disabled={m.key !== "auto" && !m.available}>
+        <option
+          key={m.key}
+          value={m.key}
+          disabled={m.key !== "auto" && (m.enabled === false || !m.available)}
+        >
           {formatModelOption(m)}
-          {m.key !== "auto" && !m.available ? " (unavailable)" : ""}
+          {m.key !== "auto" && m.enabled === false
+            ? " (disabled)"
+            : m.key !== "auto" && !m.available
+              ? " (unavailable)"
+              : ""}
         </option>
       ))}
     </select>

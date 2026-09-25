@@ -15,7 +15,7 @@ from src.agents.contracts import normalize_fix_verification
 from src.agents.llm_stream_events import stream_context_for
 from src.agents.utils import parse_json_from_text
 from src.events import EventEmitter
-from src.llm_client import ModelChoice, call_llm, resolve_model_config
+from src.llm_client import ModelChoice, call_llm, span_model_name
 from src.telemetry import TelemetryContext, span_llm_call
 from src.tools import dispatch
 from src.tools.git_ops import git_diff
@@ -115,11 +115,7 @@ def run_fix_verification(
         f"## Diff\n```diff\n{diff[:6000]}\n```\n\n"
         "Emit the verification JSON now."
     )
-    span_model = (
-        resolve_model_config(model, "validator").model_name
-        if model != "auto"
-        else model
-    )
+    span_model = span_model_name(model, "validator")
     try:
         with span_llm_call("verify_hotfix", "verify", span_model, session=session):
             result = call_llm(

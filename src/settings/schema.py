@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 
 AdapterName = Literal["generic", "openai", "gemini_openai", "llamacpp_qwen"]
+CompatName = Literal["auto", "classic", "openai_reasoning"]
 QdrantMode = Literal["embedded", "http", "off"]
 EmbeddingBackend = Literal["auto", "hf", "openai", "none"]
 SandboxExecutorName = Literal["auto", "bwrap", "native"]
@@ -41,6 +42,7 @@ class ProviderConfig(BaseModel):
     adapter: AdapterName = "generic"
     model: str = ""
     models_by_role: dict[str, str] = Field(default_factory=dict)
+    compat: CompatName = "auto"
     enabled: bool = True
     context_length: Optional[int] = None
     api_key: str = ""

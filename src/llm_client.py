@@ -12,17 +12,19 @@ settings. Vendor quirks live in adapters:
 from __future__ import annotations
 
 import json
+import re
+import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional, Literal
 from urllib.parse import urlparse
 
 from openai import OpenAI, APIConnectionError, APIStatusError
 
 from src.settings import ADAPTER_UNSUPPORTED_PARAMS, get_settings
-from src.settings.schema import ProviderConfig, RoleSettings
+from src.settings.schema import RoleSettings
 
 # ---------------------------------------------------------------------------
 # Types
@@ -32,6 +34,30 @@ AgentRole = Literal[
     "triage", "orchestrator", "worker", "hotfix", "reviewer", "validator"
 ]
 ThinkingLevel = Literal["off", "minimal", "low", "medium", "high", "xhigh"]
+TokenField = Literal["max_tokens", "max_completion_tokens"]
+
+
+@dataclass
+class RequestProfile:
+    """Wire-format knobs for one (endpoint, model) pair.
+
+    Role settings still supply the *values* (token budget, temperature,
+    thinking level). This object only says which Chat Completions fields
+    the model will accept.
+    """
+
+    token_field: TokenField = "max_tokens"
+    sampling: bool = True
+    reasoning: bool = False
+    drop: set[str] = field(default_factory=set)
+
+    def snapshot(self) -> "RequestProfile":
+        return RequestProfile(
+            token_field=self.token_field,
+            sampling=self.sampling,
+            reasoning=self.reasoning,
+            drop=set(self.drop),
+        )
 
 
 @dataclass(frozen=True)
@@ -45,6 +71,7 @@ class ResolvedModelConfig:
     model_name: str
     thinking_level: ThinkingLevel
     adapter: str = "generic"
+    compat: str = "auto"
 
 
 @dataclass
@@ -59,6 +86,83 @@ class LLMResult:
     fallback_used: bool = False
     thinking_level: Optional[str] = None
     thinking_text: str = ""
+    tokens_estimated: bool = False
+
+
+_PROFILE_LOCK = threading.Lock()
+_LEARNED_PROFILES: dict[tuple[str, str], RequestProfile] = {}
+_REASONING_PREFIXES = ("o1", "o3", "o4", "gpt-5", "gpt-6", "gpt-7")
+
+
+def reset_learned_profiles() -> None:
+    """Drop process-local request-profile cache (tests)."""
+    with _PROFILE_LOCK:
+        _LEARNED_PROFILES.clear()
+
+
+def _profile_cache_key(base_url: str, model_name: str) -> tuple[str, str]:
+    return ((base_url or "").rstrip("/").lower(), (model_name or "").strip().lower())
+
+
+def _looks_openai_reasoning(model_name: str) -> bool:
+    text = (model_name or "").strip().split("/")[-1].lower()
+    if not text:
+        return False
+    for prefix in _REASONING_PREFIXES:
+        if text == prefix or text.startswith(f"{prefix}-") or text.startswith(f"{prefix}."):
+            return True
+        if prefix.startswith("gpt-") and text.startswith(prefix):
+            return True
+    return False
+
+
+def _classic_profile() -> RequestProfile:
+    return RequestProfile(token_field="max_tokens", sampling=True, reasoning=False)
+
+
+def _openai_reasoning_profile() -> RequestProfile:
+    return RequestProfile(
+        token_field="max_completion_tokens",
+        sampling=False,
+        reasoning=True,
+    )
+
+
+def resolve_request_profile(
+    *,
+    adapter: str,
+    model_name: str,
+    compat: str = "auto",
+    base_url: str = "",
+) -> RequestProfile:
+    """Pick a request shape for this model.
+
+    Precedence: learned cache → explicit ``compat`` → model-id heuristic
+    (openai adapter only) → classic ``max_tokens``.
+    """
+    key = _profile_cache_key(base_url, model_name)
+    with _PROFILE_LOCK:
+        cached = _LEARNED_PROFILES.get(key)
+        if cached is not None:
+            return cached.snapshot()
+
+    adapter = adapter or "generic"
+    if adapter in {"llamacpp_qwen", "gemini_openai"}:
+        return _classic_profile()
+
+    mode = (compat or "auto").strip().lower()
+    if mode == "classic":
+        return _classic_profile()
+    if mode == "openai_reasoning":
+        return _openai_reasoning_profile()
+    if adapter == "openai" and _looks_openai_reasoning(model_name):
+        return _openai_reasoning_profile()
+    return _classic_profile()
+
+
+def _remember_profile(base_url: str, model_name: str, profile: RequestProfile) -> None:
+    with _PROFILE_LOCK:
+        _LEARNED_PROFILES[_profile_cache_key(base_url, model_name)] = profile.snapshot()
 
 
 def get_context_length() -> int:
@@ -73,12 +177,19 @@ def _role_settings(role: AgentRole) -> RoleSettings:
     return get_settings().roles.for_role(role)
 
 
-def _normalize_thinking(role_cfg: RoleSettings, adapter: str) -> ThinkingLevel:
+def _normalize_thinking(
+    role_cfg: RoleSettings,
+    adapter: str,
+    *,
+    reasoning: bool = False,
+) -> ThinkingLevel:
     effort = (role_cfg.thinking or "medium").strip().lower()
     enabled = role_cfg.thinking_enabled
     if effort == "off" or not enabled:
         return "off"
-    aliases = {"minimal": "low", "high": "xhigh", "max": "xhigh"}
+    aliases = {"high": "xhigh", "max": "xhigh"}
+    if not reasoning:
+        aliases["minimal"] = "low"
     effort = aliases.get(effort, effort)
     if adapter == "llamacpp_qwen":
         if effort not in ("low", "medium", "xhigh"):
@@ -86,6 +197,12 @@ def _normalize_thinking(role_cfg: RoleSettings, adapter: str) -> ThinkingLevel:
         return effort  # type: ignore[return-value]
     if adapter == "gemini_openai":
         if effort not in ("off", "minimal", "low", "medium", "high"):
+            effort = "medium"
+        return effort  # type: ignore[return-value]
+    if reasoning:
+        if effort == "xhigh":
+            effort = "high"
+        if effort not in ("minimal", "low", "medium", "high"):
             effort = "medium"
         return effort  # type: ignore[return-value]
     return "off"
@@ -101,14 +218,23 @@ def resolve_model_config(backend: str, role: AgentRole) -> ResolvedModelConfig:
         raise KeyError(f"Unknown or disabled provider: {backend}")
     role_cfg = _role_settings(role)
     adapter = provider.adapter or "generic"
+    compat = getattr(provider, "compat", "auto") or "auto"
+    model_name = provider.model_for_role(role)
+    profile = resolve_request_profile(
+        adapter=adapter,
+        model_name=model_name,
+        compat=compat,
+        base_url=provider.base_url,
+    )
     return ResolvedModelConfig(
         backend=backend,
         role=role,
         base_url=provider.base_url,
         api_key=provider.api_key or "EMPTY",
-        model_name=provider.model_for_role(role),
-        thinking_level=_normalize_thinking(role_cfg, adapter),
+        model_name=model_name,
+        thinking_level=_normalize_thinking(role_cfg, adapter, reasoning=profile.reasoning),
         adapter=adapter,
+        compat=compat,
     )
 
 
@@ -121,15 +247,26 @@ def get_model_catalog() -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for provider in settings.llm.providers:
         models_by_role = {role: provider.model_for_role(role) for role in roles}
-        thinking_by_role = {
-            role: _normalize_thinking(settings.roles.for_role(role), provider.adapter)
-            for role in roles
-        }
+        thinking_by_role: dict[str, str] = {}
+        for role in roles:
+            model_name = provider.model_for_role(role)
+            profile = resolve_request_profile(
+                adapter=provider.adapter,
+                model_name=model_name,
+                compat=getattr(provider, "compat", "auto") or "auto",
+                base_url=provider.base_url,
+            )
+            thinking_by_role[role] = _normalize_thinking(
+                settings.roles.for_role(role),
+                provider.adapter,
+                reasoning=profile.reasoning,
+            )
         entries.append({
             "key": provider.id,
             "label": provider.display_label(),
             "base_url": provider.base_url,
             "adapter": provider.adapter,
+            "compat": getattr(provider, "compat", "auto") or "auto",
             "enabled": provider.enabled,
             "model": provider.model_for_role("orchestrator"),
             "models_by_role": models_by_role,
@@ -161,17 +298,27 @@ def get_model_catalog() -> list[dict[str, Any]]:
     return entries
 
 
+def span_model_name(backend: str, role: AgentRole) -> str:
+    """Best-effort label for telemetry; never raises on a disabled provider."""
+    if not backend or backend == "auto":
+        return "auto"
+    try:
+        return resolve_model_config(backend, role).model_name
+    except KeyError:
+        return backend
+
+
 def _candidate_ids(model: ModelChoice) -> list[str]:
     settings = get_settings()
     if model and model != "auto":
         provider = settings.provider(model)
-        if provider is None:
-            raise RuntimeError(
-                f"Unknown provider '{model}'. Add it in Settings or pick Auto."
-            )
-        if not provider.enabled:
-            raise RuntimeError(f"Provider '{model}' is disabled in Settings.")
-        return [model]
+        if provider is not None and provider.enabled:
+            return [model]
+        reason = "unknown" if provider is None else "disabled"
+        print(
+            f"[LLMClient] Provider '{model}' is {reason}; "
+            "using the enabled fallback chain."
+        )
     ids = settings.fallback_ids()
     if not ids:
         raise RuntimeError(
@@ -196,6 +343,132 @@ def _gemini_extra_body(thinking_level: ThinkingLevel) -> dict[str, Any]:
 
 def _build_client(cfg: ResolvedModelConfig) -> OpenAI:
     return OpenAI(api_key=cfg.api_key or "EMPTY", base_url=cfg.base_url)
+
+
+def _openai_reasoning_effort(thinking_level: ThinkingLevel) -> Optional[str]:
+    if thinking_level in {"off", ""}:
+        return None
+    if thinking_level == "xhigh":
+        return "high"
+    if thinking_level in {"minimal", "low", "medium", "high"}:
+        return thinking_level
+    return "medium"
+
+
+def _build_chat_kwargs(
+    cfg: ResolvedModelConfig,
+    *,
+    chat_messages: list[dict[str, Any]],
+    role_cfg: RoleSettings,
+    max_tokens: int,
+    json_mode: bool,
+    thinking_level: ThinkingLevel,
+    profile: RequestProfile,
+    seed: int,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = dict(
+        model=cfg.model_name or "default",
+        messages=chat_messages,
+        stream=True,
+        stream_options={"include_usage": True},
+    )
+    kwargs[profile.token_field] = max_tokens
+    if profile.sampling:
+        sampling_values = {
+            "temperature": role_cfg.temperature,
+            "top_p": role_cfg.top_p,
+            "seed": seed,
+        }
+        for key, value in sampling_values.items():
+            if key not in profile.drop:
+                kwargs[key] = value
+
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    if cfg.adapter == "llamacpp_qwen":
+        template_kwargs: dict[str, Any] = {
+            "enable_thinking": thinking_level != "off",
+        }
+        if thinking_level != "off":
+            template_kwargs["reasoning_effort"] = thinking_level
+        kwargs["extra_body"] = {"chat_template_kwargs": template_kwargs}
+
+    if cfg.adapter == "gemini_openai" and thinking_level not in ("off",):
+        kwargs["extra_body"] = _gemini_extra_body(thinking_level)["extra_body"]
+
+    if profile.reasoning and cfg.adapter not in {"llamacpp_qwen", "gemini_openai"}:
+        effort = _openai_reasoning_effort(thinking_level)
+        if effort:
+            kwargs["reasoning_effort"] = effort
+
+    for param in ADAPTER_UNSUPPORTED_PARAMS.get(cfg.adapter, set()):
+        kwargs.pop(param, None)
+    for param in profile.drop:
+        kwargs.pop(param, None)
+    return kwargs
+
+
+def _unsupported_param(exc: APIStatusError) -> Optional[str]:
+    body = exc.body if isinstance(getattr(exc, "body", None), dict) else {}
+    err = body.get("error") if isinstance(body, dict) else {}
+    if not isinstance(err, dict):
+        err = {}
+    param = err.get("param")
+    if isinstance(param, str) and param.strip():
+        return param.strip()
+    message = str(err.get("message") or exc)
+    match = re.search(
+        r"unsupported parameter:\s*'([a-z0-9_]+)'",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return match.group(1)
+    return None
+
+
+def _is_param_compat_error(exc: APIStatusError) -> bool:
+    if getattr(exc, "status_code", None) != 400:
+        return False
+    body = exc.body if isinstance(getattr(exc, "body", None), dict) else {}
+    err = body.get("error") if isinstance(body, dict) else {}
+    code = err.get("code") if isinstance(err, dict) else ""
+    message = str(err.get("message") if isinstance(err, dict) else exc).lower()
+    return code == "unsupported_parameter" or "unsupported parameter" in message
+
+
+def apply_unsupported_param(profile: RequestProfile, param: str) -> bool:
+    """Mutate ``profile`` so the next attempt omits/renames ``param``.
+
+    Returns False when the profile already accounted for it (stop retrying).
+    """
+    name = (param or "").strip()
+    if not name:
+        return False
+    if name == "max_tokens":
+        if profile.token_field == "max_completion_tokens":
+            return False
+        profile.token_field = "max_completion_tokens"
+        return True
+    if name == "max_completion_tokens":
+        if profile.token_field == "max_tokens":
+            return False
+        profile.token_field = "max_tokens"
+        return True
+    if name in {"temperature", "top_p", "seed"}:
+        if name in profile.drop:
+            return False
+        profile.drop.add(name)
+        if {"temperature", "top_p", "seed"} <= profile.drop:
+            profile.sampling = False
+        return True
+    if name in profile.drop:
+        return False
+    profile.drop.add(name)
+    if name == "reasoning_effort":
+        profile.reasoning = False
+    return True
 
 
 def probe_provider(
@@ -284,7 +557,13 @@ def call_llm(
             print(f"[LLMClient] {model_key} unreachable: {exc}. Trying next.")
             last_exc = exc
         except APIStatusError as exc:
-            if exc.status_code in (400, 429) or exc.status_code >= 500:
+            if exc.status_code == 400 and _is_param_compat_error(exc):
+                print(
+                    f"[LLMClient] {model_key} still rejected request shape "
+                    f"after retries ({exc}). Trying next."
+                )
+                last_exc = exc
+            elif exc.status_code in (400, 429) or exc.status_code >= 500:
                 print(f"[LLMClient] {model_key} HTTP {exc.status_code} — trying next.")
                 last_exc = exc
             elif exc.status_code in (401, 403):
@@ -340,34 +619,48 @@ def _call_single(
     else:
         chat_messages.append({"role": "user", "content": prompt or ""})
 
-    kwargs: dict[str, Any] = dict(
-        model=cfg.model_name or "default",
-        messages=chat_messages,
-        temperature=role_cfg.temperature,
-        top_p=role_cfg.top_p,
-        seed=settings.llm.seed,
-        max_tokens=max_tokens,
-        stream=True,
-        stream_options={"include_usage": True},
+    profile = resolve_request_profile(
+        adapter=cfg.adapter,
+        model_name=cfg.model_name,
+        compat=cfg.compat,
+        base_url=cfg.base_url,
     )
-    if json_mode:
-        kwargs["response_format"] = {"type": "json_object"}
-
-    if cfg.adapter == "llamacpp_qwen":
-        template_kwargs: dict[str, Any] = {
-            "enable_thinking": thinking_level != "off",
-        }
-        if thinking_level != "off":
-            template_kwargs["reasoning_effort"] = thinking_level
-        kwargs["extra_body"] = {"chat_template_kwargs": template_kwargs}
-
-    if cfg.adapter == "gemini_openai" and thinking_level not in ("off",):
-        kwargs["extra_body"] = _gemini_extra_body(thinking_level)
-
-    for param in ADAPTER_UNSUPPORTED_PARAMS.get(cfg.adapter, set()):
-        kwargs.pop(param, None)
-
+    last_shape_exc: Optional[APIStatusError] = None
+    stream = None
     t0 = time.perf_counter()
+    for _attempt in range(5):
+        kwargs = _build_chat_kwargs(
+            cfg,
+            chat_messages=chat_messages,
+            role_cfg=role_cfg,
+            max_tokens=max_tokens,
+            json_mode=json_mode,
+            thinking_level=thinking_level,
+            profile=profile,
+            seed=settings.llm.seed,
+        )
+        try:
+            t0 = time.perf_counter()
+            stream = client.chat.completions.create(**kwargs)
+            break
+        except APIStatusError as exc:
+            if not _is_param_compat_error(exc):
+                raise
+            param = _unsupported_param(exc) or ""
+            print(
+                f"[LLMClient] {model_key}/{cfg.model_name} unsupported "
+                f"parameter {param or '(unknown)'} — adapting request."
+            )
+            if not apply_unsupported_param(profile, param or "max_tokens"):
+                raise
+            _remember_profile(cfg.base_url, cfg.model_name, profile)
+            last_shape_exc = exc
+            stream = None
+    if stream is None:
+        if last_shape_exc is not None:
+            raise last_shape_exc
+        raise RuntimeError(f"{model_key} failed to start a completion stream")
+
     t_first: Optional[float] = None
     content_chunks: list[str] = []
     thinking_chunks: list[str] = []
@@ -382,7 +675,6 @@ def _call_single(
             stream_context.delta(channel, pending)
         return ""
 
-    stream = client.chat.completions.create(**kwargs)
     for chunk in stream:
         if not chunk.choices:
             if chunk.usage is not None:
@@ -432,6 +724,17 @@ def _call_single(
 
     thinking_text = "".join(thinking_chunks)
     text = "".join(content_chunks)
+    tokens_estimated = False
+    if prompt_tokens <= 0:
+        blob = "".join(str(message.get("content") or "") for message in chat_messages)
+        if blob:
+            prompt_tokens = max(1, len(blob) // 4)
+            tokens_estimated = True
+    if completion_tokens <= 0:
+        generated_blob = text + thinking_text
+        if generated_blob:
+            completion_tokens = max(1, len(generated_blob) // 4)
+            tokens_estimated = True
 
     result = LLMResult(
         text=text,
@@ -444,6 +747,7 @@ def _call_single(
         fallback_used=fallback_used,
         thinking_level=thinking_level,
         thinking_text=thinking_text,
+        tokens_estimated=tokens_estimated,
     )
 
     if stream_context is not None:

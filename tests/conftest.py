@@ -8,6 +8,7 @@ import tempfile
 import pytest
 
 from src.settings.store import reset_settings
+from src.llm_client import reset_learned_profiles
 
 
 def pytest_configure(config) -> None:
@@ -43,6 +44,8 @@ def _isolate_missions_home(tmp_path_factory, monkeypatch):
     monkeypatch.delenv("TARGET_MODEL", raising=False)
     monkeypatch.delenv("MODEL_ALIAS", raising=False)
     monkeypatch.delenv("HF_TOKEN", raising=False)
+    reset_learned_profiles()
     reset_settings()
     yield home
+    reset_learned_profiles()
     reset_settings()

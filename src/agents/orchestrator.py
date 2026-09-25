@@ -25,7 +25,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from src.llm_client import call_llm, ModelChoice, resolve_model_config
+from src.llm_client import call_llm, ModelChoice, span_model_name
 from src.settings import get_settings
 from src.telemetry import span_llm_call, TelemetryContext
 from src.agents.utils import parse_json_from_text, validate_plan_payload
@@ -79,10 +79,7 @@ def _call_json_with_correction(
         RuntimeError: when all attempts fail (caller converts to a graceful
                       mission failure — never an uncaught traceback).
     """
-    span_model = (
-        resolve_model_config(model, role).model_name  # type: ignore[arg-type]
-        if model != "auto" else model
-    )
+    span_model = span_model_name(model, role)  # type: ignore[arg-type]
     prompt = initial_prompt
     last_error = "unknown"
 

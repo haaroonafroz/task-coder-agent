@@ -21,7 +21,7 @@ import re
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
-from src.llm_client import call_llm, ModelChoice, resolve_model_config
+from src.llm_client import call_llm, ModelChoice, span_model_name
 from src.settings import get_settings
 from src.telemetry import span_llm_call, TelemetryContext
 from src.sandbox.commands import execute_contract
@@ -361,10 +361,7 @@ def run_validator(
         "\nEmit your PASS, FAIL, or REPLAN JSON verdict now:"
     )
 
-    span_model = (
-        resolve_model_config(model, "validator").model_name
-        if model != "auto" else model
-    )
+    span_model = span_model_name(model, "validator")
     with span_llm_call("validator", ms_id, span_model, session=session):
         result = call_llm(
             prompt, model=model, max_tokens=get_settings().roles.validator.max_tokens,
