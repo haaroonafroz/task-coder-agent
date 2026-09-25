@@ -49,6 +49,7 @@ export function statusColor(status: string): string {
     planning: "status-planning",
     paused: "status-created",
     pending: "status-created",
+    awaiting_decision: "status-planning",
     passed: "status-completed",
     blocked: "status-failed",
     replan: "status-planning",

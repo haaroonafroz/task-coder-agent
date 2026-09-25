@@ -2,7 +2,7 @@
 .env
 
 # Python
-__pycache__/
+*__pycache__*
 *.pyc
 *.pyo
 .venv/
@@ -25,9 +25,7 @@ experiments/logs/
 experiments/charts/
 
 # Keep the CSV and metadata (small, useful for version control)
-*experiments/results.csv
-*experiments/run_metadata.json
-*experiments/aggregate_metrics.json
+*experiments/results.csvwrics.json
 
 #datasets
 datasets/*.json
@@ -38,7 +36,7 @@ datasets/*.json
 .cursorignore
 llama.cpp/
 refactor.md
-workspace/
+managed-workspaces/
 frontend/node_modules/
 frontend/dist/
 

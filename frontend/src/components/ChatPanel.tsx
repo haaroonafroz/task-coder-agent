@@ -1,7 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { Session, Message, ModelChoice, SSEEvent } from "../api/types";
+import type {
+  DecisionAction,
+  PendingDecision,
+  ReviewFixMode,
+  Session,
+  Message,
+  ModelChoice,
+  SSEEvent,
+} from "../api/types";
 import { ModelSelect } from "./ModelSelect";
 import { PersonaTurn } from "./PersonaTurn";
+import { DecisionBanner } from "./DecisionBanner";
 import { useModels } from "../hooks";
 import { buildChatItems, formatTs, missionStatusLabel } from "../hooks/useChatTurns";
 
@@ -11,12 +20,31 @@ interface Props {
   sending: boolean;
   connected: boolean;
   events: SSEEvent[];
-  onSend: (content: string, triggerRun: boolean, model?: string) => void;
+  decision: PendingDecision | null;
+  resolvingDecision: boolean;
+  onSend: (
+    content: string,
+    triggerRun: boolean,
+    model?: string,
+    reviewFixMode?: ReviewFixMode,
+  ) => void;
+  onResolveDecision: (action: DecisionAction) => void;
 }
 
-export function ChatPanel({ session, messages, sending, connected, events, onSend }: Props) {
+export function ChatPanel({
+  session,
+  messages,
+  sending,
+  connected,
+  events,
+  decision,
+  resolvingDecision,
+  onSend,
+  onResolveDecision,
+}: Props) {
   const [input, setInput] = useState("");
   const [model, setModel] = useState<ModelChoice>("auto");
+  const [reviewFixMode, setReviewFixMode] = useState<ReviewFixMode>("ask");
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const { models } = useModels();
 
@@ -43,7 +71,7 @@ export function ChatPanel({ session, messages, sending, connected, events, onSen
 
   const handleSend = () => {
     if (!input.trim() || sending) return;
-    onSend(input.trim(), true, model);
+    onSend(input.trim(), true, model, reviewFixMode);
     setInput("");
   };
 
@@ -58,7 +86,13 @@ export function ChatPanel({ session, messages, sending, connected, events, onSen
   return (
     <div className="panel chat-container">
       <div className="panel-header">
-        <span>{session.title}</span>
+        <span title={session.workspace?.path || session.workspace_root}>
+          {session.title}
+          <span style={{ marginLeft: 8, fontSize: 10, color: "var(--text-muted)" }}>
+            {session.workspace?.kind === "external" ? "external" : "managed"}
+            {session.workspace?.access_mode === "read_only" ? " · read only" : ""}
+          </span>
+        </span>
         <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <span className={`conn-dot ${connected ? "connected" : "disconnected"}`} />
           <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
@@ -116,6 +150,14 @@ export function ChatPanel({ session, messages, sending, connected, events, onSen
         <div ref={messagesEndRef} />
       </div>
 
+      {decision && (
+        <DecisionBanner
+          decision={decision}
+          resolving={resolvingDecision}
+          onResolve={onResolveDecision}
+        />
+      )}
+
       <div className="chat-composer">
         <div className="composer-row">
           <textarea
@@ -132,12 +174,24 @@ export function ChatPanel({ session, messages, sending, connected, events, onSen
           />
         </div>
         <div className="composer-row" style={{ justifyContent: "space-between" }}>
-          <ModelSelect
-            className="model-select"
-            value={model}
-            models={models}
-            onChange={setModel}
-          />
+          <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <ModelSelect
+              className="model-select"
+              value={model}
+              models={models}
+              onChange={setModel}
+            />
+            <select
+              value={reviewFixMode}
+              onChange={(e) => setReviewFixMode(e.target.value as ReviewFixMode)}
+              aria-label="Review fix mode"
+              title="Ask: pause when review finds defects. Auto: apply fixes without asking."
+              style={{ fontSize: 12 }}
+            >
+              <option value="ask">Review fixes: ask me</option>
+              <option value="auto">Review fixes: auto-apply</option>
+            </select>
+          </span>
           <button
             className="primary"
             disabled={sending || !input.trim()}

@@ -11,14 +11,19 @@ from src.api.schemas import (
     HandoffResponse,
     PlanResponse,
     WorkspaceFileResponse,
+    WorkspaceInfoResponse,
     WorkspaceNodeResponse,
     WorkspaceTreeResponse,
 )
 from src.session import SessionContext, SessionManager
+from src.tools.paths import is_sensitive_workspace_path
 import json
 from pathlib import Path
 
 router = APIRouter(prefix="/sessions/{sid}", tags=["workspace", "plan", "handoffs", "memory"])
+
+def _is_sensitive(path: Path) -> bool:
+    return is_sensitive_workspace_path(path)
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +172,10 @@ def _build_tree(
     if depth >= max_depth:
         return "", []
     try:
-        entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name))
+        entries = sorted(
+            (p for p in path.iterdir() if not _is_sensitive(p)),
+            key=lambda p: (not p.is_dir(), p.name),
+        )
     except (OSError, PermissionError):
         return "", []
     lines: list[str] = []
@@ -201,7 +209,10 @@ def _build_nodes(
     if depth >= max_depth:
         return []
     try:
-        entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        entries = sorted(
+            (p for p in path.iterdir() if not _is_sensitive(p)),
+            key=lambda p: (not p.is_dir(), p.name.lower()),
+        )
     except (OSError, PermissionError):
         return []
 
@@ -257,6 +268,27 @@ async def list_workspace(
     )
 
 
+@router.get("/workspace/info", response_model=WorkspaceInfoResponse)
+async def get_workspace_info(
+    sid: str,
+    manager: SessionManager = Depends(get_session_manager),
+) -> WorkspaceInfoResponse:
+    ctx = require_session(sid, manager)
+    project = manager.workspace_service.inspect(ctx.workspace).to_dict()
+    binding = ctx.workspace.to_dict()
+    return WorkspaceInfoResponse(
+        workspace={
+            "kind": binding["kind"],
+            "path": binding["root"],
+            "access_mode": binding["access_mode"],
+            "environment_strategy": binding["environment_strategy"],
+            "git_root": binding.get("git_root"),
+            "sandbox_required": binding.get("sandbox_required", False),
+        },
+        project=project,
+    )
+
+
 @router.get("/workspace/file", response_model=WorkspaceFileResponse)
 async def read_workspace_file(
     sid: str,
@@ -271,6 +303,11 @@ async def read_workspace_file(
         raise HTTPException(status_code=404, detail=f"File not found: {path}")
     if not target.is_file():
         raise HTTPException(status_code=400, detail=f"Not a file: {path}")
+    if _is_sensitive(target):
+        raise HTTPException(
+            status_code=403,
+            detail="Sensitive files are not exposed by the workspace browser",
+        )
     try:
         content = target.read_text(encoding="utf-8")
         encoding = "utf-8"

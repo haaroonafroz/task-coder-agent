@@ -37,6 +37,7 @@ async def create_message(
             model=body.model,
             run_kind=body.run_kind,
             execution_route=body.execution_route,
+            review_fix_mode=body.review_fix_mode,
         )
         run_id = rec.run_id
     msg = message_store.append(ctx, "user", body.content, run_id=run_id)

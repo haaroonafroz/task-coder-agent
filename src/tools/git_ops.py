@@ -1,9 +1,4 @@
-"""
-Git operation tools — git_commit, git_diff, view_git_log.
-
-Git repos are session-scoped: each session jail (``sessions/<id>/``) has its
-own ``.git`` directory.  Commits only capture changes under ``workspace/``.
-"""
+"""Git tools scoped to the active managed or external workspace."""
 
 from __future__ import annotations
 
@@ -18,10 +13,13 @@ _REPO_ROOT = Path(__file__).parent.parent.parent  # legacy fallback
 
 
 def _git_root() -> Path:
-    """Return session jail root when sandbox is active, else legacy repo root."""
+    """Return the repository root for the active workspace."""
     ctx = get_sandbox_context()
     if ctx is not None:
-        return ctx.jail_root
+        # Preserve history for sessions created before workspace separation.
+        if ctx.workspace_kind == "managed" and (ctx.jail_root / ".git").exists():
+            return ctx.jail_root
+        return ctx.workspace_root
     return _REPO_ROOT
 
 
@@ -40,7 +38,7 @@ def _git(*args: str, cwd: Path | None = None, timeout: int = 30) -> dict[str, An
 
 
 def _ensure_git_repo(root: Path) -> dict[str, Any] | None:
-    """Initialise git in the session jail if needed. Returns error dict or None."""
+    """Initialise Git for a managed workspace if needed."""
     if (root / ".git").exists():
         return None
     init = _git("init", cwd=root)
@@ -57,10 +55,10 @@ def _ensure_git_repo(root: Path) -> dict[str, Any] | None:
 
 def git_commit(message: str, stage_paths: list[str] | None = None) -> dict[str, Any]:
     """
-    Stage modified files and create a git commit in the session jail.
+    Stage and commit a managed workspace.
 
-    By default stages ``workspace/`` inside the session jail.  Legacy
-    ``stage_paths`` is ignored — session git only tracks workspace content.
+    External workspaces are deliberately never auto-committed; their changes
+    remain in the user's working tree for review.
 
     Args:
         message:     Conventional-commit-style message.
@@ -70,13 +68,28 @@ def git_commit(message: str, stage_paths: list[str] | None = None) -> dict[str, 
         {"success": True, "commit_hash": "<sha>", "message": "<msg>"}
         {"success": False, "error": "<message>"}
     """
+    ctx = get_sandbox_context()
+    if ctx is not None and ctx.workspace_kind == "external":
+        return {
+            "success": True,
+            "commit_hash": "not-committed",
+            "message": "External workspace changes were not auto-committed.",
+            "skipped": True,
+        }
+    if ctx is not None and ctx.workspace_mode == "read_only":
+        return {
+            "success": False,
+            "commit_hash": "",
+            "error": "Cannot commit a read-only workspace.",
+        }
+
     root = _git_root()
     err = _ensure_git_repo(root)
     if err:
         return err
 
-    # Stage workspace/ inside session jail
-    stage = _git("add", "workspace/", cwd=root)
+    stage_target = "workspace/" if ctx is not None and root == ctx.jail_root else "."
+    stage = _git("add", stage_target, cwd=root)
     if not stage["success"] and "pathspec" not in stage.get("stderr", ""):
         return {"success": False, "error": f"git add failed: {stage['stderr']}"}
 
@@ -122,10 +135,19 @@ def git_diff() -> dict[str, Any]:
         result = _git("diff", "--cached", cwd=root)
 
     diff_text = result["stdout"] or "(no changes)"
+    ctx = get_sandbox_context()
+    preflight = ctx.git_preflight if ctx is not None else None
     return {
         "success": True,
         "diff": diff_text,
         "has_changes": bool(result["stdout"].strip()),
+        "preexisting_changes": preflight or {},
+        "note": (
+            "Diff may include user changes that existed before this run; compare "
+            "against preexisting_changes and worker-reported files."
+            if preflight
+            else ""
+        ),
     }
 
 
@@ -135,7 +157,7 @@ def git_diff() -> dict[str, Any]:
 
 def view_git_log(limit: int = 10) -> dict[str, Any]:
     """
-    Show recent git commit history for the session jail.
+    Show recent Git history for the bound workspace.
 
     Args:
         limit: Maximum number of commits to show (default 10).

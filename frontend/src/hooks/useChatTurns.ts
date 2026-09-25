@@ -377,6 +377,8 @@ export function missionStatusLabel(status: string): string {
       return "Failed";
     case "cancelled":
       return "Cancelled";
+    case "awaiting_decision":
+      return "Awaiting decision";
     default:
       return status;
   }

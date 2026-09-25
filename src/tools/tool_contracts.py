@@ -71,6 +71,10 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "required": {},
         "optional": {"max_entries": int},
     },
+    "probe_dependency": {
+        "required": {"package_name": str},
+        "optional": {},
+    },
     "run_checks": {
         "required": {},
         "optional": {
@@ -107,6 +111,64 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         },
     },
 }
+
+
+# Common LLM guesses for argument names, mapped to canonical keys. Applied
+# only when the canonical key is absent (explicit args always win), so this
+# can only turn a would-be invalid_arguments failure into a valid call.
+# Seen in the wild: `path` for target_dir/file_path, `start_line` for offset,
+# `pattern` for query — each costing a full wasted turn on local models.
+_ARG_ALIASES: dict[str, dict[str, str]] = {
+    "list_directory": {
+        "path": "target_dir",
+        "dir": "target_dir",
+        "directory": "target_dir",
+        "depth": "max_depth",
+    },
+    "read_file": {
+        "path": "file_path",
+        "file": "file_path",
+        "filename": "file_path",
+        "start_line": "offset",
+        "start": "offset",
+        "num_lines": "limit",
+        "max_lines": "limit",
+    },
+    "search_grep": {
+        "path": "target_dir",
+        "dir": "target_dir",
+        "pattern": "query",
+        "text": "query",
+        "keyword": "query",
+        "regex": "query",
+    },
+    "write_file": {
+        "path": "file_path",
+        "file": "file_path",
+    },
+    "patch_file": {
+        "path": "file_path",
+        "file": "file_path",
+    },
+    "run_shellscript": {
+        "command": "script",
+        "cmd": "script",
+    },
+}
+
+
+def normalize_tool_args(tool_name: str, args: Any) -> Any:
+    """Rewrite known argument aliases to canonical keys (non-destructive)."""
+    if not isinstance(args, dict):
+        return args
+    aliases = _ARG_ALIASES.get(tool_name or "")
+    if not aliases:
+        return args
+    normalized = dict(args)
+    for alias, canonical in aliases.items():
+        if alias in normalized and canonical not in normalized:
+            normalized[canonical] = normalized.pop(alias)
+    return normalized
 
 
 def validate_tool_call(

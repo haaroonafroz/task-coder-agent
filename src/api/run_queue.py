@@ -34,6 +34,7 @@ from src.llm_client import ModelChoice
 from src.main import MissionsRuntime
 from src.run_control import RunCancelledError
 from src.session import SessionContext, SessionManager
+from src.workspace.locking import workspace_locks
 
 from src.api.messages import MessageStore
 from src.api.run_cancellation import RunCancellation
@@ -52,11 +53,12 @@ class RunRecord:
     run_id: str
     session_id: str
     request: str
-    status: str  # queued | running | completed | partial | failed | error | cancelled
+    status: str  # queued | running | completed | partial | failed | error | cancelled | awaiting_decision
     model: str
     queued_at: str
     run_kind: str = "auto"
     execution_route: str = "auto"
+    review_fix_mode: str = "ask"
     plan_id: Optional[str] = None
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
@@ -118,6 +120,7 @@ class RunRegistry:
         model: str,
         run_kind: str = "auto",
         execution_route: str = "auto",
+        review_fix_mode: str = "ask",
     ) -> RunRecord:
         run_id = uuid.uuid4().hex[:12]
         rec = RunRecord(
@@ -129,6 +132,7 @@ class RunRegistry:
             queued_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
             run_kind=run_kind,
             execution_route=execution_route,
+            review_fix_mode=review_fix_mode or "ask",
         )
         with self._lock:
             self._runs[run_id] = rec
@@ -281,6 +285,7 @@ class RunQueue:
         model: Optional[ModelChoice] = None,
         run_kind: str = "auto",
         execution_route: str = "auto",
+        review_fix_mode: str = "ask",
     ) -> RunRecord:
         """Create a run record and submit it to the serial worker."""
         chosen_model = model or ctx.selected_model or "auto"
@@ -290,8 +295,30 @@ class RunQueue:
             str(chosen_model),
             run_kind=run_kind,
             execution_route=execution_route,
+            review_fix_mode=review_fix_mode or "ask",
         )
-        self._queue.put((rec, ctx, chosen_model))
+        self._queue.put((rec, ctx, chosen_model, None))
+        return rec
+
+    def enqueue_packet(
+        self,
+        ctx: SessionContext,
+        packet: dict[str, Any],
+        request: str,
+        model: Optional[ModelChoice] = None,
+        review_fix_mode: str = "ask",
+    ) -> RunRecord:
+        """Enqueue a HITL follow-up run carrying a stored fix/setup packet."""
+        chosen_model = model or ctx.selected_model or "auto"
+        rec = self._registry.create(
+            ctx.session_id,
+            request,
+            str(chosen_model),
+            run_kind="new",  # never resume-hijacked: packets execute directly
+            execution_route="review",
+            review_fix_mode=review_fix_mode or "ask",
+        )
+        self._queue.put((rec, ctx, chosen_model, packet))
         return rec
 
     def cancel(self, run_id: str) -> RunRecord:
@@ -364,14 +391,19 @@ class RunQueue:
             item = self._queue.get()
             if item is _SENTINEL:
                 break
-            rec, ctx, model = item
-            self._execute(rec, ctx, model)
+            if len(item) == 4:
+                rec, ctx, model, packet = item
+            else:  # backward-compatible 3-tuple
+                rec, ctx, model = item
+                packet = None
+            self._execute(rec, ctx, model, packet)
 
     def _execute(
         self,
         rec: RunRecord,
         ctx: SessionContext,
         model: ModelChoice,
+        packet: Optional[dict[str, Any]] = None,
     ) -> None:
         """Runs on the single worker thread — no concurrent runs possible."""
         if self._cancellation.is_cancelled(rec.run_id):
@@ -391,14 +423,22 @@ class RunQueue:
         try:
             fresh = self._session_manager.load_session(ctx.session_id) or ctx
             self._runtime.model = model
-            result = self._runtime.run(
-                rec.request,
-                session=fresh,
-                cancel_check=cancel_check,
-                run_kind=rec.run_kind,
-                execution_route=rec.execution_route,
-                run_id=rec.run_id,
+            lock = (
+                workspace_locks.read_lock
+                if fresh.workspace.access_mode == "read_only"
+                else workspace_locks.write_lock
             )
+            with lock(fresh.workspace_root):
+                result = self._runtime.run(
+                    rec.request,
+                    session=fresh,
+                    cancel_check=cancel_check,
+                    run_kind=rec.run_kind,
+                    execution_route=rec.execution_route,
+                    review_fix_mode=getattr(rec, "review_fix_mode", "ask") or "ask",
+                    review_fix_packet=packet,
+                    run_id=rec.run_id,
+                )
             rec.plan_id = result.plan_id or rec.plan_id or result.mission_id
             rec.run_kind = result.run_kind
             rec.execution_route = result.execution_route
@@ -442,6 +482,7 @@ class RunQueue:
                     "plan_id": result.plan_id,
                     "summary_text": result.summary_text,
                     "failure_reason": result.failure_reason,
+                    "pending_decision": getattr(result, "pending_decision", None),
                 }
                 rec.status = result.status
         except RunCancelledError as exc:

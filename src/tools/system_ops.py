@@ -20,6 +20,7 @@ from src.sandbox.executor import get_executor
 from src.sandbox.policy import NetworkMode, ShellProfile
 from src.tools.paths import (
     get_workspace_root,
+    is_sensitive_workspace_path,
     normalize_shell_command,
     normalize_workspace_path,
     resolve_workspace_path,
@@ -127,24 +128,89 @@ def run_linter(
 # install_dependency
 # ---------------------------------------------------------------------------
 
+def _resolve_install_python(ctx) -> tuple[str, str, str]:
+    """Return ``(python, env_kind, note)`` for a dependency install.
+
+    Managed sessions always use the harness session venv. Attached external
+    projects resolve to their own venv (``.venv``/``venv`` reused, else
+    created in place) so checks and installs share the project interpreter.
+    When project-venv setup fails, fall back to the session venv and say so.
+    """
+    if ctx.workspace_kind == "external":
+        try:
+            return str(ctx.ensure_project_venv()), "project", ""
+        except Exception as exc:
+            fallback = str(ctx.ensure_venv())
+            return (
+                fallback,
+                "session",
+                f"project venv unavailable ({exc}); fell back to session venv",
+            )
+    return str(ctx.ensure_venv()), "session", ""
+
+
+def _package_pip_show(python: str, base_name: str, ctx) -> bool:
+    """True when pip already reports the package in the target env."""
+    try:
+        result = _executor().run_argv(
+            [python, "-m", "pip", "show", base_name],
+            ctx=ctx,
+            timeout=30,
+            profile="pip",
+            cwd=ctx.workspace_root,
+            use_venv=False,
+        )
+    except Exception:
+        return False
+    return bool(result.get("success", False))
+
+
 def install_dependency(package_name: str) -> dict[str, Any]:
     """
-    Install a Python package into the session-local .venv via pip.
+    Install a Python package into the session venv, or into the attached
+    external project's own venv (``.venv``/``venv`` — reused when present,
+    created otherwise).
+
+    Idempotent: returns success immediately when pip already reports the
+    package in the target environment. Managed sessions always use the
+    harness session venv; only harness-owned ``requirements.txt`` files are
+    maintained (an external project's file is never modified).
 
     Args:
         package_name: Package name with optional version specifier (e.g. "httpx>=0.27.0").
 
     Returns:
-        {"success": bool, "stdout": str, "stderr": str}
+        {"success": bool, "stdout": str, "stderr": str,
+         "already_installed": bool, "environment": {"kind": "project"|"session", "python": str}}
     """
     ctx = get_sandbox_context()
     if ctx is None:
         return {"success": False, "stdout": "", "stderr": "No active sandbox context"}
+    if ctx.workspace_mode == "read_only":
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": "Cannot install dependencies for a read-only workspace",
+        }
+
+    base_name = re.split(r"[><=!]", package_name)[0].strip()
+    if not base_name:
+        return {"success": False, "stdout": "", "stderr": f"Invalid package name: {package_name!r}"}
 
     try:
-        python = str(ctx.ensure_venv())
+        python, env_kind, env_note = _resolve_install_python(ctx)
     except Exception as exc:
         return {"success": False, "stdout": "", "stderr": f"venv creation failed: {exc}"}
+
+    environment = {"kind": env_kind, "python": python}
+    if _package_pip_show(python, base_name, ctx):
+        return {
+            "success": True,
+            "stdout": f"{base_name} already installed in {env_kind} environment",
+            "stderr": "",
+            "already_installed": True,
+            "environment": environment,
+        }
 
     cmd = [python, "-m", "pip", "install", package_name, "--quiet"]
     result = _executor().run_argv(
@@ -156,13 +222,19 @@ def install_dependency(package_name: str) -> dict[str, Any]:
         cwd=ctx.workspace_root,
         use_venv=True,
     )
+    result["already_installed"] = False
+    result["environment"] = environment
+    if env_note:
+        result["note"] = env_note
 
-    req_file = get_workspace_root() / "requirements.txt"
-    if result["success"] and req_file.exists():
-        existing = req_file.read_text(encoding="utf-8")
-        base_name = re.split(r"[><=!]", package_name)[0].strip()
-        if base_name not in existing:
-            req_file.write_text(existing.rstrip() + f"\n{package_name}\n", encoding="utf-8")
+    # Only harness-owned requirements files are maintained — never rewrite
+    # a user's project manifest as a side effect of an install.
+    if result["success"] and env_kind == "session":
+        req_file = get_workspace_root() / "requirements.txt"
+        if req_file.exists():
+            existing = req_file.read_text(encoding="utf-8")
+            if base_name not in existing:
+                req_file.write_text(existing.rstrip() + f"\n{package_name}\n", encoding="utf-8")
 
     return result
 
@@ -173,7 +245,7 @@ def install_dependency(package_name: str) -> dict[str, Any]:
 
 def uninstall_dependency(package_name: str) -> dict[str, Any]:
     """
-    Uninstall a Python package from the session-local .venv.
+    Uninstall a Python package from the selected project or harness environment.
 
     Args:
         package_name: Package name with optional version specifier.
@@ -184,6 +256,12 @@ def uninstall_dependency(package_name: str) -> dict[str, Any]:
     ctx = get_sandbox_context()
     if ctx is None:
         return {"success": False, "stdout": "", "stderr": "No active sandbox context"}
+    if ctx.workspace_mode == "read_only":
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": "Cannot uninstall dependencies for a read-only workspace",
+        }
 
     if not ctx.venv_python.exists():
         return {"success": False, "stdout": "", "stderr": "Session venv not initialized"}
@@ -240,6 +318,13 @@ def search_grep(query: str, target_dir: str = ".") -> dict[str, Any]:
     except ValueError as exc:
         return {"success": False, "matches": [], "match_count": 0, "error": str(exc)}
 
+    if is_sensitive_workspace_path(target):
+        return {
+            "success": False,
+            "matches": [],
+            "match_count": 0,
+            "error": "SENSITIVE FILE DENIED: this path is not agent-accessible.",
+        }
     if not target.exists():
         return {
             "success": False,
@@ -283,6 +368,8 @@ def search_grep(query: str, target_dir: str = ".") -> dict[str, Any]:
     matches = []
     for filepath in target.rglob("*"):
         if not filepath.is_file():
+            continue
+        if is_sensitive_workspace_path(filepath):
             continue
         try:
             for line_no, line in enumerate(
@@ -332,4 +419,8 @@ def run_shellscript(
     ctx = get_sandbox_context()
     if ctx is not None:
         script = canonicalize_shell_script(script, ctx=ctx)
+        # Read-only bindings cannot run mutating shells. Force the read-only
+        # review profile so writes/installs are policy-denied, not executed.
+        if ctx.workspace_mode == "read_only" and profile == "worker":
+            profile = "review"
     return _executor().run_shell(script, timeout=timeout, profile=profile)

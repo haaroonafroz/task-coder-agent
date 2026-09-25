@@ -14,7 +14,7 @@ from typing import Any
 from src.sandbox.context import get_sandbox_context
 from src.sandbox.executor import get_executor
 from src.sandbox.policy import NetworkMode
-from src.tools.paths import get_workspace_root
+from src.tools.paths import get_workspace_root, is_sensitive_workspace_path
 
 
 _MANIFEST_ECOSYSTEMS = {
@@ -61,6 +61,40 @@ def _detect_ecosystems(root: Path) -> tuple[list[str], list[str]]:
     return sorted(ecosystems), sorted(manifests)
 
 
+def probe_dependency(package_name: str) -> dict[str, Any]:
+    """Check whether a dependency is importable without importing heavy modules.
+
+    Uses importlib find_spec (no side effects) plus the active interpreter's
+    pip show version when available. Safe for read-only review shells.
+    """
+    import importlib.util
+
+    name = (package_name or "").strip()
+    if not name:
+        return {"success": False, "error": "package_name is required"}
+    base = name.split("[")[0].strip().split()[0]
+    if not base or len(base) > 120:
+        return {"success": False, "error": f"Invalid package name: {package_name!r}"}
+    spec = importlib.util.find_spec(base.replace("-", "_"))
+    found = spec is not None
+    if not found and "-" in base:
+        found = importlib.util.find_spec(base.replace("-", "_").replace("_", "")) is not None
+    result: dict[str, Any] = {
+        "success": True,
+        "package": base,
+        "installed": found,
+        "version": None,
+    }
+    if found:
+        try:
+            from importlib.metadata import version as _version
+
+            result["version"] = _version(base)
+        except Exception:
+            result["version"] = None
+    return result
+
+
 def project_info(max_entries: int = 80) -> dict[str, Any]:
     """Return a bounded, deterministic summary of the current workspace."""
     root = _workspace()
@@ -70,6 +104,8 @@ def project_info(max_entries: int = 80) -> dict[str, Any]:
         if len(entries) >= max(1, min(max_entries, 200)):
             break
         if any(part in {".git", ".venv", "__pycache__", "node_modules", "target"} for part in path.parts):
+            continue
+        if is_sensitive_workspace_path(path):
             continue
         try:
             entries.append(_relative(path, root) + ("/" if path.is_dir() else ""))

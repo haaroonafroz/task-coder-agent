@@ -7,7 +7,7 @@ import {
   type CSSProperties,
   type MouseEvent as ReactMouseEvent,
 } from "react";
-import type { Message } from "./api/types";
+import type { DecisionAction, Message, ReviewFixMode } from "./api/types";
 import { api } from "./api/client";
 import {
   useSessions,
@@ -17,6 +17,7 @@ import {
   usePlan,
   useWorkspace,
   useSessionEvents,
+  useDecision,
 } from "./hooks";
 import { SessionSidebar } from "./components/SessionSidebar";
 import { ChatPanel } from "./components/ChatPanel";
@@ -38,9 +39,11 @@ export default function App() {
   const { sessions, refresh: refreshSessions } = useSessions();
   const { session, setSession } = useSession(activeSid);
   const { messages, sending, sendMessage, appendMessage } = useMessages(activeSid);
+  const { decision, resolving: resolvingDecision, refresh: refreshDecision, resolve: resolveDecision } =
+    useDecision(activeSid);
   const { runs, refresh: refreshRuns } = useRuns(activeSid);
   const { plan, refresh: refreshPlan } = usePlan(activeSid);
-  const { tree, file, fileLoading, refreshTree, openFile } = useWorkspace(activeSid, "session");
+  const { tree, file, fileLoading, refreshTree, openFile } = useWorkspace(activeSid, "workspace");
   const { events, connected, clearEvents } = useSessionEvents(activeSid);
 
   // Track files modified in the current run to highlight them.
@@ -94,6 +97,12 @@ export default function App() {
         refreshPlan();
         refreshSessions();
         refreshRuns();
+        refreshDecision();
+        break;
+      case "run.awaiting_decision":
+        refreshDecision();
+        refreshRuns();
+        refreshSessions();
         break;
       case "mission.cancelled":
         refreshTree();
@@ -123,8 +132,13 @@ export default function App() {
   }, [activeSid, activeRun, refreshRuns, refreshPlan, refreshSessions, setSession, appendMessage]);
 
   const handleSend = useCallback(
-    async (content: string, triggerRun: boolean, model?: string) => {
-      const msg = await sendMessage(content, triggerRun, model);
+    async (
+      content: string,
+      triggerRun: boolean,
+      model?: string,
+      reviewFixMode?: ReviewFixMode,
+    ) => {
+      const msg = await sendMessage(content, triggerRun, model, reviewFixMode);
       if (msg && triggerRun) {
         refreshRuns();
         refreshSessions();
@@ -135,6 +149,20 @@ export default function App() {
       }
     },
     [sendMessage, refreshRuns, refreshPlan, refreshSessions]
+  );
+
+  const handleResolveDecision = useCallback(
+    async (action: DecisionAction) => {
+      await resolveDecision(action);
+      refreshRuns();
+      refreshSessions();
+      setTimeout(() => {
+        refreshPlan();
+        refreshRuns();
+        refreshDecision();
+      }, 2000);
+    },
+    [resolveDecision, refreshRuns, refreshSessions, refreshPlan, refreshDecision]
   );
 
   const handleSelectSession = useCallback((sid: string) => {
@@ -199,7 +227,10 @@ export default function App() {
         sending={sending}
         connected={connected}
         events={events}
+        decision={decision}
+        resolvingDecision={resolvingDecision}
         onSend={handleSend}
+        onResolveDecision={handleResolveDecision}
       />
 
       <div className="right-resizer" onMouseDown={handleResizeStart} />

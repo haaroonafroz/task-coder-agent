@@ -12,6 +12,9 @@ import type {
   WorkspaceFile,
   SSEEvent,
   WorkspaceScope,
+  DecisionAction,
+  PendingDecision,
+  ReviewFixMode,
 } from "../api/types";
 
 // ---- Sessions ----
@@ -90,7 +93,12 @@ export function useMessages(sid: string | null) {
   }, [sid, refresh]);
 
   const sendMessage = useCallback(
-    async (content: string, triggerRun: boolean, model?: string) => {
+    async (
+      content: string,
+      triggerRun: boolean,
+      model?: string,
+      reviewFixMode?: ReviewFixMode,
+    ) => {
       if (!sid) return null;
       setSending(true);
       try {
@@ -98,6 +106,7 @@ export function useMessages(sid: string | null) {
           content,
           trigger_run: triggerRun,
           model: model as "auto" | "local" | "gemini" | "gpt4o" | undefined,
+          review_fix_mode: reviewFixMode,
         });
         setMessages((prev) => [...prev, msg]);
         return msg;
@@ -247,6 +256,44 @@ export function useSessionEvents(sid: string | null) {
   const clearEvents = useCallback(() => setEvents([]), []);
 
   return { events, connected, clearEvents };
+}
+
+// ---- HITL decisions ----
+
+export function useDecision(sid: string | null) {
+  const [decision, setDecision] = useState<PendingDecision | null>(null);
+  const [resolving, setResolving] = useState(false);
+
+  const refresh = useCallback(async () => {
+    if (!sid) return;
+    try {
+      setDecision(await api.getDecision(sid));
+    } catch {
+      // ignore
+    }
+  }, [sid]);
+
+  useEffect(() => {
+    setDecision(null);
+    if (sid) refresh();
+  }, [sid, refresh]);
+
+  const resolve = useCallback(
+    async (action: DecisionAction) => {
+      if (!sid) return null;
+      setResolving(true);
+      try {
+        const out = await api.resolveDecision(sid, action);
+        setDecision(null);
+        return out;
+      } finally {
+        setResolving(false);
+      }
+    },
+    [sid]
+  );
+
+  return { decision, resolving, refresh, resolve };
 }
 
 // ---- Models catalog ----

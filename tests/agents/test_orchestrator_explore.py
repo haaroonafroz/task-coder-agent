@@ -15,6 +15,7 @@ from src.agents.orchestrator_explore import (
 from src.agents.utils import validate_plan_payload
 from src.sandbox import activate_sandbox, deactivate_sandbox
 from src.session import SessionContext
+from src.workspace.models import WorkspaceBinding
 
 
 @pytest.fixture
@@ -29,8 +30,8 @@ def workspace(tmp_path: Path):
     session = SessionContext(
         session_id="test-session",
         title="test",
-        root=tmp_path,
-        workspace_root=root,
+        state_root=tmp_path,
+        workspace=WorkspaceBinding(kind="managed", root=root),
         plan_path=tmp_path / "plan.json",
         handoffs_dir=tmp_path / "handoffs",
         memory_store_path=tmp_path / "memory.json",

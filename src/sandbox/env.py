@@ -50,6 +50,8 @@ def build_sandbox_env(
     if use_venv and ctx.venv_python.exists():
         env["VIRTUAL_ENV"] = str(ctx.venv_path)
         env["MISSIONS_PYTHON"] = str(ctx.venv_python.resolve())
+    else:
+        env["MISSIONS_PYTHON"] = resolve_python(ctx)
 
     # Preserve only safe, non-secret host vars needed for toolchains.
     safe_passthrough = ("SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY")
@@ -61,7 +63,26 @@ def build_sandbox_env(
 
 
 def resolve_python(ctx: SandboxContext) -> str:
-    """Return absolute session venv python path — prefer venv when it exists."""
+    """Return an interpreter path that works both on host and inside the jail.
+
+    A bare ``sys.executable`` fallback once pointed validation at the harness
+    venv, which bwrap cannot see (``execvp ... No such file or directory``).
+    Instead, provision the proper venv — project ``.venv`` for attached
+    externals, session venv for managed runs — so checks and installs share
+    one jail-visible interpreter. Read-only externals cannot provision, so
+    they keep the host fallback (probes then honestly report missing).
+    """
     if ctx.venv_python.exists():
         return str(ctx.venv_python.absolute())
+    if ctx.workspace_kind == "external":
+        if ctx.workspace_mode != "read_only":
+            try:
+                return str(ctx.ensure_project_venv())
+            except Exception:
+                pass
+    else:
+        try:
+            return str(ctx.ensure_venv())
+        except Exception:
+            pass
     return sys.executable

@@ -3,8 +3,8 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).parent.parent.parent
 
 # Default workspace root (legacy). The active workspace root is mutable so
-# that session-scoped runs can point all file/shell tools at
-# sessions/<id>/workspace/ without changing call sites.
+# that session-scoped runs can point all file/shell tools at a managed or
+# external workspace without changing call sites.
 _DEFAULT_WORKSPACE_ROOT = _REPO_ROOT / "workspace"
 _workspace_root: Path = _DEFAULT_WORKSPACE_ROOT
 
@@ -35,6 +35,25 @@ def reset_workspace_root() -> None:
 # external scripts and notebooks that did `from src.tools.paths import
 # WORKSPACE_ROOT` keep working against the default location.
 WORKSPACE_ROOT = _DEFAULT_WORKSPACE_ROOT
+
+_SENSITIVE_NAMES = {
+    ".env", "credentials", "credentials.json", "secrets.json",
+    "id_rsa", "id_ed25519",
+}
+_SENSITIVE_SUFFIXES = {".pem", ".key", ".p12", ".pfx"}
+
+
+def is_sensitive_workspace_path(path: str | Path) -> bool:
+    """Return True for secrets that must not be surfaced to an agent."""
+    candidate = Path(path)
+    name = candidate.name.lower()
+    if name in {".env.example", ".env.sample", ".env.template"}:
+        return False
+    return (
+        name in _SENSITIVE_NAMES
+        or name.startswith(".env.")
+        or candidate.suffix.lower() in _SENSITIVE_SUFFIXES
+    )
 
 
 def normalize_workspace_path(path: str) -> str:

@@ -18,6 +18,7 @@ from typing import Any, Optional
 
 from src.tools.paths import (
     get_workspace_root,
+    is_sensitive_workspace_path,
     normalize_workspace_path,
     resolve_workspace_path,
 )
@@ -112,6 +113,19 @@ def _test_write_error(target_rel: str) -> Optional[dict[str, Any]]:
 
 def _write_jail_error(target_rel: str) -> Optional[dict[str, Any]]:
     """Return an error dict when the path is outside the milestone jail."""
+    from src.sandbox.context import get_sandbox_context
+
+    sandbox = get_sandbox_context()
+    if is_sensitive_workspace_path(target_rel):
+        return {
+            "success": False,
+            "error": "SENSITIVE FILE DENIED: secret-bearing files are not agent-accessible.",
+        }
+    if sandbox is not None and sandbox.workspace_mode == "read_only":
+        return {
+            "success": False,
+            "error": "WORKSPACE READ ONLY: this session cannot modify project files.",
+        }
     if _ALLOWED_WRITE_PATHS is None:
         return None
     if target_rel in _ALLOWED_WRITE_PATHS:
@@ -169,6 +183,11 @@ def read_file(
     except ValueError as exc:
         return {"success": False, "error": str(exc)}
 
+    if is_sensitive_workspace_path(target):
+        return {
+            "success": False,
+            "error": "SENSITIVE FILE DENIED: this file is not agent-accessible.",
+        }
     if not target.exists():
         return {
             "success": False,
@@ -343,16 +362,38 @@ def patch_file(file_path: str, search_string: str, replace_string: str) -> dict[
 # list_directory
 # ---------------------------------------------------------------------------
 
+# Directories never worth rendering into an LLM prompt. A single project
+# .venv (torch: ~40k files) once inflated a worker prompt to 304k tokens and
+# killed a run against a 128k context window. Skipped dirs are still listed
+# by name (so the model knows a venv exists) but never recursed into.
+_SKIP_TREE_DIRS = frozenset({
+    ".git", ".hg", ".svn",
+    ".venv", "venv", ".tox", "__pycache__",
+    "node_modules", ".next", ".nuxt",
+    "target", "dist", "build",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".ipynb_checkpoints",
+    "wandb",
+})
+
+# Hard ceiling on rendered tree size; every worker turn inlines the tree.
+_MAX_TREE_CHARS = 60_000
+
+
 def list_directory(target_dir: str = ".", max_depth: int = 6) -> dict[str, Any]:
     """
     Recursively list all files and subdirectories inside target_dir.
+
+    Generated/environment directories (venvs, caches, build output, VCS)
+    are listed by name but not recursed into, and the rendered tree is
+    capped at 60k chars — prompts inlining the tree must stay small.
 
     Args:
         target_dir: Directory relative to workspace/ (. = workspace root).
         max_depth:  Maximum recursion depth (default 6).
 
     Returns:
-        {"success": True, "tree": "<indented text tree>", "count": <int>, "cwd": ...}
+        {"success": True, "tree": "<indented text tree>", "count": <int>,
+         "truncated": bool, "cwd": ...}
         {"success": False, "error": "<message>"}
     """
     try:
@@ -361,27 +402,35 @@ def list_directory(target_dir: str = ".", max_depth: int = 6) -> dict[str, Any]:
         return {"success": False, "error": str(exc)}
 
     if not target.exists():
-        target.mkdir(parents=True, exist_ok=True)
+        return {"success": False, "error": f"Directory not found: {target_dir}"}
 
     if not target.is_dir():
         return {"success": False, "error": f"Path is not a directory: {target_dir}"}
 
     lines: list[str] = []
     count = 0
+    truncated = False
     rel_root = _path_info(target)["workspace_relative_path"]
 
     def _walk(path: Path, depth: int, prefix: str) -> None:
-        nonlocal count
+        nonlocal count, truncated
         if depth > max_depth:
             lines.append(f"{prefix}... (max depth reached)")
             return
         try:
-            entries = sorted(path.iterdir(), key=lambda e: (e.is_file(), e.name))
+            entries = sorted(
+                (e for e in path.iterdir() if not is_sensitive_workspace_path(e)),
+                key=lambda e: (e.is_file(), e.name),
+            )
         except PermissionError:
             lines.append(f"{prefix}[permission denied]")
             return
         for i, entry in enumerate(entries):
             connector = "└── " if i == len(entries) - 1 else "├── "
+            if entry.is_dir() and entry.name in _SKIP_TREE_DIRS:
+                lines.append(f"{prefix}{connector}{entry.name}/ (contents hidden)")
+                count += 1
+                continue
             lines.append(f"{prefix}{connector}{entry.name}{'/' if entry.is_dir() else ''}")
             count += 1
             if entry.is_dir():
@@ -392,10 +441,20 @@ def list_directory(target_dir: str = ".", max_depth: int = 6) -> dict[str, Any]:
     lines.append(f"{display_root}/")
     _walk(target, 0, "")
 
+    tree = "\n".join(lines) if count else f"{display_root}/\n(empty)"
+    if len(tree) > _MAX_TREE_CHARS:
+        tree = (
+            tree[:_MAX_TREE_CHARS]
+            + f"\n... (tree truncated at {_MAX_TREE_CHARS} chars; "
+            + "use list_directory on a subdirectory for detail)"
+        )
+        truncated = True
+
     return {
         "success": True,
-        "tree": "\n".join(lines) if count else f"{display_root}/\n(empty)",
+        "tree": tree,
         "count": count,
+        "truncated": truncated,
         "target_dir": rel_root,
         **_path_info(get_workspace_root()),
     }

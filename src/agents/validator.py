@@ -26,6 +26,7 @@ from src.telemetry import span_llm_call, TelemetryContext
 from src.sandbox.commands import execute_contract
 from src.sandbox.context import get_sandbox_context
 from src.sandbox.dependency_check import (
+    active_env_label,
     check_target_file_dependencies,
     format_missing_dependency_message,
     planned_module_names,
@@ -434,8 +435,10 @@ def _bounded_workspace_diff() -> str:
     if not diff_text.strip() or diff_text.startswith("(no"):
         return ""
     if len(diff_text) > _DIFF_MAX_CHARS:
-        head = diff_text[:3000]
-        tail = diff_text[-900:]
+        # Tail-heavy: the most recent changes (the fix attempt under review)
+        # live at the end of the diff; keep only a small head for context.
+        head = diff_text[:500]
+        tail = diff_text[-3400:]
         diff_text = f"{head}\n... [diff truncated {len(diff_text)} chars total] ...\n{tail}"
     return f"## Workspace Diff (uncommitted changes)\n```diff\n{diff_text}\n```\n\n"
 
@@ -655,7 +658,7 @@ def _missing_dependency_fail(
         "errors": [message, *report.errors],
         "root_cause": (
             "Target files import third-party packages that are not installed in "
-            "the session venv."
+            f"the {active_env_label()}."
         ),
         "fix_guidance": (
             "Call install_dependency for each missing package "

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
 
-ShellProfile = str  # "worker" | "validation" | "pip" | "devserver" | "browser"
+ShellProfile = str  # "worker" | "validation" | "pip" | "devserver" | "browser" | "review" | "fixverify"
 
 
 class SandboxMode(str, Enum):
@@ -67,6 +67,9 @@ _GLOBAL_BLOCK_PATTERNS: list[re.Pattern[str]] = [
         r"&&\s*curl",
         r"\|\s*bash",
         r"\|\s*sh\s",
+        r"(?:^|[\s/])\.env(?:\.(?!example|sample|template)[\w-]+)?(?:\s|$)",
+        r"(?:^|[\s/])(?:credentials(?:\.json)?|secrets\.json|id_rsa|id_ed25519)(?:\s|$)",
+        r"(?:^|[\s/])[\w.-]+\.(?:pem|key|p12|pfx)(?:\s|$)",
         r"&\s*$",           # background jobs
         r";\s*&",
     ]
@@ -95,6 +98,20 @@ _VALIDATION_ALLOW: set[str] = {
     "test", "[", "true", "false", "echo", "ls", "cat", "pwd",
 }
 
+# Read-only/smoke shell for review + fix verification inside the bound root.
+# No writes, no installs, no service management: presence checks, targeted
+# compile/lint, and bounded git/rg inspection only.
+_REVIEW_ALLOW: set[str] = {
+    "python", "python3", "ls", "cat", "pwd", "echo", "test", "[",
+    "true", "false", "rg", "grep", "git", "which", "file", "stat",
+}
+
+_FIXVERIFY_ALLOW: set[str] = {
+    "python", "python3", "pytest", "flake8", "black", "mypy", "ruff",
+    "ls", "cat", "pwd", "echo", "test", "[", "true", "false",
+    "rg", "grep", "git", "which", "file", "stat",
+}
+
 _PIP_ALLOW: set[str] = {"python", "python3"}
 _DEVSERVER_ALLOW: set[str] = {
     "python", "python3", "node", "npm", "pnpm", "yarn", "npx",
@@ -110,9 +127,42 @@ _ALLOWED_PY_MODULES_VALIDATION: set[str] = {
     "pytest", "flake8", "black", "mypy", "ruff", "py_compile", "compileall",
 }
 
+_ALLOWED_PY_MODULES_REVIEW: set[str] = {"py_compile", "compileall"}
+
+_ALLOWED_PY_MODULES_FIXVERIFY: set[str] = {
+    "pytest", "flake8", "black", "mypy", "ruff", "py_compile", "compileall",
+}
+
 _ALLOWED_PY_MODULES_PIP: set[str] = {"pip"}
 
 _PYTHON_INTERPRETER_SUFFIXES = ("/bin/python", "/bin/python3")
+
+
+_SAFE_PROBE_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(p, re.DOTALL)
+    for p in [
+        r"import\s+importlib",
+        r"importlib\.util\.find_spec",
+        r"import\s+sys\b.*sys\.version",
+        r"from\s+platform\s+import",
+    ]
+]
+
+
+def _safe_probe_script(body: str) -> bool:
+    """Allow only dependency-presence probes in read-only shell profiles."""
+    lowered = body.strip().lower()
+    if not lowered:
+        return False
+    banned = ("open(", "write", "os.", "sys.modules", "subprocess", "socket",
+              "urllib", "requests", "pip install", "__import__", "eval", "exec")
+    if any(token in lowered for token in banned):
+        # importlib itself is fine; __import__/eval/exec tricks are not.
+        if "importlib.util.find_spec" not in body:
+            return False
+        if any(token in lowered for token in ("__import__", "eval", "exec", "subprocess", "socket")):
+            return False
+    return any(pat.search(body) for pat in _SAFE_PROBE_PATTERNS)
 
 
 @dataclass
@@ -172,6 +222,10 @@ def _check_blocklist(script: str, profile: ShellProfile) -> Optional[str]:
 def _allowlist_for_profile(profile: ShellProfile) -> set[str]:
     if profile == "validation":
         return _VALIDATION_ALLOW
+    if profile == "review":
+        return _REVIEW_ALLOW
+    if profile == "fixverify":
+        return _FIXVERIFY_ALLOW
     if profile == "pip":
         return _PIP_ALLOW
     if profile == "devserver":
@@ -184,6 +238,10 @@ def _allowlist_for_profile(profile: ShellProfile) -> set[str]:
 def _py_modules_for_profile(profile: ShellProfile) -> set[str]:
     if profile == "validation":
         return _ALLOWED_PY_MODULES_VALIDATION
+    if profile == "review":
+        return _ALLOWED_PY_MODULES_REVIEW
+    if profile == "fixverify":
+        return _ALLOWED_PY_MODULES_FIXVERIFY
     if profile == "pip":
         return _ALLOWED_PY_MODULES_PIP
     if profile in {"devserver", "browser"}:
@@ -225,7 +283,8 @@ def _segment_allowed(segment: str, profile: ShellProfile, mode: SandboxMode) -> 
         if token == "rm" and profile != "pip":
             if re.search(r"\s+(-rf?|--recursive)\s+/", segment):
                 return PolicyVerdict(False, "rm with absolute path blocked")
-        # Block `python -m pip` outside the dedicated pip profile
+        # Block `python -m pip` outside the dedicated pip profile, except
+        # read-only `pip show/list` probes in review/fixverify profiles.
         try:
             tokens = shlex.split(segment, posix=True)
             if (
@@ -234,10 +293,26 @@ def _segment_allowed(segment: str, profile: ShellProfile, mode: SandboxMode) -> 
                 and tokens[2] == "pip"
                 and profile != "pip"
             ):
+                if profile in {"review", "fixverify"} and len(tokens) >= 4 and tokens[3] in {"show", "list", "--version"}:
+                    return PolicyVerdict(True)
                 return PolicyVerdict(
                     False,
                     f"pip module not allowed in {profile} shell profile",
                 )
+            # Review/fixverify `python -c` is limited to dependency presence
+            # probes so arbitrary code cannot write files or open network.
+            if (
+                profile in {"review", "fixverify"}
+                and len(tokens) >= 3
+                and tokens[1] == "-c"
+            ):
+                body = tokens[2]
+                if not _safe_probe_script(body):
+                    return PolicyVerdict(
+                        False,
+                        f"python -c probe not allowed in {profile} shell profile",
+                    )
+                return PolicyVerdict(True)
         except ValueError:
             pass
         return PolicyVerdict(True)

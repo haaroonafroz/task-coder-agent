@@ -11,13 +11,25 @@ import re
 import shlex
 import socket
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from src.tools.paths import get_workspace_root, normalize_workspace_path
 from src.sandbox.process_manager import get_allowed_ports
 
-_UI_HINTS = ("ui", "html", "frontend", "react", "vite", "streamlit", "browser", "web")
 _QUOTED_TEXT = re.compile(r"""['"]([^'"]{2,120})['"]""")
+
+# Structural UI signals. Deliberately NOT prose matching: substring hints
+# like "ui" match "build", "require", "guidance" and once compiled a ui_smoke
+# contract for a PyTorch training repo because a criterion mentioned
+# `build_trainer`. UI-ness is decided from file types, imports, and
+# manifests — never from free text.
+_UI_SUFFIXES = frozenset({".html", ".htm", ".jsx", ".tsx", ".vue", ".svelte", ".astro"})
+_JS_SUFFIXES = frozenset({".js", ".jsx", ".ts", ".tsx"})
+_STREAMLIT_IMPORT_RE = re.compile(
+    r"^\s*(import streamlit\b|from streamlit(?:\s+import|\s*$))",
+    re.MULTILINE,
+)
+_MAX_PROBE_BYTES = 200_000
 
 
 def _profile(milestone: dict[str, Any]) -> str:
@@ -28,22 +40,64 @@ def _profile(milestone: dict[str, Any]) -> str:
 
 
 def _is_ui_milestone(milestone: dict[str, Any]) -> bool:
-    profile = _profile(milestone)
-    if profile == "ui":
-        return True
-    if profile in {"python", "lint", "structural"}:
-        return False
-    text = " ".join(
-        [
-            str(milestone.get("title", "")),
-            str(milestone.get("description", "")),
-            " ".join(str(item) for item in milestone.get("acceptance_criteria", [])),
-        ]
-    ).lower()
-    targets = [str(path).lower() for path in milestone.get("target_files", [])]
-    return any(hint in text for hint in _UI_HINTS) or any(
-        path.endswith((".html", ".jsx", ".tsx", ".vue")) for path in targets
-    )
+    """Legacy alias — delegates to the structural classifier."""
+    profile, _reason = classify_validation_target(milestone)
+    return profile == "ui"
+
+
+def _resolve_target(path: str, workspace: Path) -> Optional[Path]:
+    """Resolve a milestone target inside the workspace; None when absent."""
+    candidate = (workspace / path).resolve()
+    try:
+        candidate.relative_to(workspace.resolve())
+    except ValueError:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def classify_validation_target(
+    milestone: dict[str, Any],
+    *,
+    workspace: Optional[Path] = None,
+) -> tuple[str, str]:
+    """Decide ``ui`` vs ``python`` for ``auto``-profile milestones.
+
+    Structural signals only — file suffixes, Streamlit imports, and frontend
+    manifests. Free-text prose (titles, descriptions, criteria) is NEVER
+    consulted: that is what misclassified a training-loop hotfix as a UI
+    task. Returns ``(profile, reason)`` for logging and tests.
+    """
+    ws = workspace or get_workspace_root()
+    targets = [
+        str(path).strip()
+        for path in milestone.get("target_files", [])
+        if str(path).strip()
+    ]
+    suffixes = {Path(path).suffix.lower() for path in targets}
+    if suffixes & _UI_SUFFIXES:
+        hit = sorted(suffixes & _UI_SUFFIXES)
+        return "ui", f"UI file suffixes in targets: {hit}"
+
+    for rel in targets:
+        if not rel.lower().endswith(".py"):
+            continue
+        resolved = _resolve_target(rel, ws)
+        if resolved is None:
+            continue
+        try:
+            if resolved.stat().st_size > _MAX_PROBE_BYTES:
+                continue
+            text = resolved.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if _STREAMLIT_IMPORT_RE.search(text):
+            return "ui", f"Streamlit import in {rel}"
+
+    if (ws / "package.json").is_file() and suffixes & _JS_SUFFIXES:
+        hit = sorted(suffixes & _JS_SUFFIXES)
+        return "ui", f"JS targets in a package.json project: {hit}"
+
+    return "python", "no structural UI signals (suffixes, Streamlit imports, manifests)"
 
 
 def _criteria(milestone: dict[str, Any]) -> list[str]:
@@ -102,7 +156,9 @@ def compile_validation_contract(
             "validation_profile must be one of: auto, ui, python, lint, structural"
         )
     if profile == "auto":
-        profile = "ui" if _is_ui_milestone(milestone) else "python"
+        classified, reason = classify_validation_target(milestone)
+        profile = classified
+        print(f"  [Validation] auto profile → {profile} ({reason})")
 
     if profile == "ui":
         workspace = get_workspace_root()

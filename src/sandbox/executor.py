@@ -47,6 +47,8 @@ class RunSpec:
     network: NetworkMode = NetworkMode.NONE
     profile: ShellProfile = "worker"
     jail_root: Optional[Path] = None
+    workspace_mode: str = "read_write"
+    sandbox_required: bool = False
 
 
 def _bwrap_available() -> bool:
@@ -134,8 +136,8 @@ _BWRAP_ENV_KEYS = (
 
 
 def _bwrap_cmd(inner_cmd: list[str], spec: RunSpec) -> list[str]:
-    """Build a bwrap invocation that jails execution to session root."""
-    jail = (spec.jail_root or spec.cwd).resolve()
+    """Build a bwrap invocation with independent state and workspace mounts."""
+    state = (spec.jail_root or spec.cwd).resolve()
     workspace = spec.cwd.resolve()
 
     cmd: list[str] = ["bwrap"]
@@ -146,8 +148,31 @@ def _bwrap_cmd(inner_cmd: list[str], spec: RunSpec) -> list[str]:
         if p.exists():
             cmd.extend(["--ro-bind", str(p), str(p)])
 
-    # Writable session jail
-    cmd.extend(["--bind", str(jail), str(jail)])
+    # Harness state is always writable. The project mount follows the binding
+    # access mode and may live anywhere outside the harness state tree.
+    cmd.extend(["--bind", str(state), str(state)])
+    if workspace != state:
+        mount_flag = "--ro-bind" if spec.workspace_mode == "read_only" else "--bind"
+        cmd.extend([mount_flag, str(workspace), str(workspace)])
+
+    # A harness/system Python may live outside both roots (for example a
+    # deployment venv or Conda prefix). Mount only its environment prefix RO.
+    python_raw = spec.env.get("MISSIONS_PYTHON")
+    if python_raw:
+        python_path = Path(python_raw).resolve()
+        covered = (
+            python_path == state
+            or state in python_path.parents
+            or python_path == workspace
+            or workspace in python_path.parents
+            or any(
+                base == python_path or base in python_path.parents
+                for base in (Path("/usr"), Path("/bin"), Path("/lib"), Path("/lib64"))
+            )
+        )
+        if not covered:
+            prefix = python_path.parent.parent if python_path.parent.name == "bin" else python_path.parent
+            cmd.extend(["--ro-bind", str(prefix), str(prefix)])
     cmd.extend(["--chdir", str(workspace)])
 
     # Explicit env inside the jail (do not rely on shell inheritance)
@@ -214,6 +239,8 @@ class SubprocessExecutor:
             network=network,
             profile=profile,
             jail_root=ctx.jail_root,
+            workspace_mode=ctx.workspace_mode,
+            sandbox_required=ctx.sandbox_required,
         )
 
     def run_argv(
@@ -236,6 +263,18 @@ class SubprocessExecutor:
                 "success": False, "timed_out": False,
             }
 
+        if sandbox.sandbox_required and (
+            self.backend != ExecutorBackend.BWRAP or not _bwrap_available()
+        ):
+            return {
+                "returncode": -1,
+                "stdout": "",
+                "stderr": "Sandbox required for external workspace, but bubblewrap is unavailable",
+                "success": False,
+                "timed_out": False,
+                "sandbox_denied": True,
+            }
+
         verdict = validate_argv(argv, profile=profile)
         if not verdict.allowed:
             from src.sandbox.env import resolve_python
@@ -255,10 +294,16 @@ class SubprocessExecutor:
             bwrap_argv = _bwrap_cmd(argv, spec)
             proc = _native_popen(bwrap_argv, shell=False, spec=spec)
             result = _collect_result(proc, timeout, spec.cwd)
-            if result["returncode"] != 0 and "bwrap:" in result.get("stderr", ""):
+            if (
+                result["returncode"] != 0
+                and "bwrap:" in result.get("stderr", "")
+                and not spec.sandbox_required
+            ):
                 proc = _native_popen(argv, shell=False, spec=spec)
                 result = _collect_result(proc, timeout, spec.cwd)
                 result["executor_fallback"] = "native"
+            elif result["returncode"] != 0 and "bwrap:" in result.get("stderr", ""):
+                result["sandbox_denied"] = True
             return self._annotate_result(result, spec=spec, ctx=sandbox)
         else:
             proc = _native_popen(argv, shell=False, spec=spec)
@@ -287,6 +332,18 @@ class SubprocessExecutor:
                 "success": False, "timed_out": False,
             }
 
+        if sandbox.sandbox_required and (
+            self.backend != ExecutorBackend.BWRAP or not _bwrap_available()
+        ):
+            return {
+                "returncode": -1,
+                "stdout": "",
+                "stderr": "Sandbox required for external workspace, but bubblewrap is unavailable",
+                "success": False,
+                "timed_out": False,
+                "sandbox_denied": True,
+            }
+
         verdict = validate_shell_script(script, profile=profile)
         if not verdict.allowed:
             from src.sandbox.env import resolve_python
@@ -310,10 +367,16 @@ class SubprocessExecutor:
             bwrap_argv = _bwrap_cmd(inner, spec)
             proc = _native_popen(bwrap_argv, shell=False, spec=spec)
             result = _collect_result(proc, timeout, spec.cwd)
-            if result["returncode"] != 0 and "bwrap:" in result.get("stderr", ""):
+            if (
+                result["returncode"] != 0
+                and "bwrap:" in result.get("stderr", "")
+                and not spec.sandbox_required
+            ):
                 proc = _native_popen(script, shell=True, spec=spec)
                 result = _collect_result(proc, timeout, spec.cwd)
                 result["executor_fallback"] = "native"
+            elif result["returncode"] != 0 and "bwrap:" in result.get("stderr", ""):
+                result["sandbox_denied"] = True
         else:
             proc = _native_popen(script, shell=True, spec=spec)
             result = _collect_result(proc, timeout, spec.cwd)

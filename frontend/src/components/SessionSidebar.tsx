@@ -1,5 +1,10 @@
 import { useState } from "react";
-import type { Session, ModelChoice } from "../api/types";
+import type {
+  Session,
+  ModelChoice,
+  WorkspaceAccessMode,
+  WorkspaceKind,
+} from "../api/types";
 import { api } from "../api/client";
 import { statusColor } from "./stageUtils";
 import { ModelSelect } from "./ModelSelect";
@@ -16,15 +21,28 @@ export function SessionSidebar({ sessions, activeSid, onSelect, onCreated }: Pro
   const [showForm, setShowForm] = useState(false);
   const [title, setTitle] = useState("");
   const [model, setModel] = useState<ModelChoice>("auto");
+  const [workspaceKind, setWorkspaceKind] = useState<WorkspaceKind>("managed");
+  const [workspacePath, setWorkspacePath] = useState("");
+  const [accessMode, setAccessMode] = useState<WorkspaceAccessMode>("read_write");
   const [creating, setCreating] = useState(false);
   const { models } = useModels();
 
   const handleCreate = async () => {
-    if (!title.trim()) return;
+    if (!title.trim() || (workspaceKind === "external" && !workspacePath.trim())) return;
     setCreating(true);
     try {
-      const s = await api.createSession({ title: title.trim(), model });
+      const s = await api.createSession({
+        title: title.trim(),
+        model,
+        workspace: {
+          kind: workspaceKind,
+          path: workspaceKind === "external" ? workspacePath.trim() : undefined,
+          access_mode: accessMode,
+          environment_strategy: workspaceKind === "external" ? "auto" : "harness",
+        },
+      });
       setTitle("");
+      setWorkspacePath("");
       setShowForm(false);
       onCreated();
       onSelect(s.session_id);
@@ -57,8 +75,42 @@ export function SessionSidebar({ sessions, activeSid, onSelect, onCreated }: Pro
             onKeyDown={(e) => e.key === "Enter" && handleCreate()}
             autoFocus
           />
+          <select
+            value={workspaceKind}
+            onChange={(e) => setWorkspaceKind(e.target.value as WorkspaceKind)}
+            aria-label="Workspace type"
+          >
+            <option value="managed">New managed workspace</option>
+            <option value="external">Open existing folder</option>
+          </select>
+          {workspaceKind === "external" && (
+            <>
+              <input
+                type="text"
+                placeholder="/absolute/path/to/project"
+                value={workspacePath}
+                onChange={(e) => setWorkspacePath(e.target.value)}
+              />
+              <select
+                value={accessMode}
+                onChange={(e) => setAccessMode(e.target.value as WorkspaceAccessMode)}
+                aria-label="Workspace access"
+              >
+                <option value="read_write">Read and write</option>
+                <option value="read_only">Read only</option>
+              </select>
+            </>
+          )}
           <ModelSelect value={model} models={models} onChange={setModel} />
-          <button className="primary" disabled={creating || !title.trim()} onClick={handleCreate}>
+          <button
+            className="primary"
+            disabled={
+              creating
+              || !title.trim()
+              || (workspaceKind === "external" && !workspacePath.trim())
+            }
+            onClick={handleCreate}
+          >
             {creating ? "Creating..." : "Create"}
           </button>
         </div>
@@ -77,6 +129,10 @@ export function SessionSidebar({ sessions, activeSid, onSelect, onCreated }: Pro
             onClick={() => onSelect(s.session_id)}
           >
             <div className="title">{s.title}</div>
+            <div className="meta" title={s.workspace?.path || s.workspace_root}>
+              <span>{s.workspace?.kind || "managed"}</span>
+              <span>{s.workspace?.access_mode === "read_only" ? "read only" : "read/write"}</span>
+            </div>
             <div className="meta">
               <span className={`status-badge ${statusColor(s.status)}`}>{s.status}</span>
               <span>{s.selected_model}</span>

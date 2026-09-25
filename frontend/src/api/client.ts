@@ -17,7 +17,13 @@ import type {
   ExecutionRoute,
   ModelChoice,
   RunKind,
+  ReviewFixMode,
+  DecisionAction,
+  PendingDecision,
   WorkspaceScope,
+  WorkspaceAccessMode,
+  WorkspaceKind,
+  WorkspaceInfo,
 } from "./types";
 
 const BASE = "/api/v1";
@@ -46,7 +52,16 @@ export const api = {
     return req(`/sessions${q}`);
   },
 
-  createSession(body: { title: string; model?: ModelChoice }): Promise<Session> {
+  createSession(body: {
+    title: string;
+    model?: ModelChoice;
+    workspace?: {
+      kind: WorkspaceKind;
+      path?: string;
+      access_mode?: WorkspaceAccessMode;
+      environment_strategy?: "auto" | "project" | "harness";
+    };
+  }): Promise<Session> {
     return req(`/sessions`, {
       method: "POST",
       body: JSON.stringify(body),
@@ -83,6 +98,7 @@ export const api = {
       model?: ModelChoice;
       run_kind?: RunKind;
       execution_route?: ExecutionRoute;
+      review_fix_mode?: ReviewFixMode;
     }
   ): Promise<Message> {
     return req(`/sessions/${sid}/messages`, {
@@ -103,6 +119,27 @@ export const api = {
 
   cancelRun(sid: string, rid: string): Promise<Run> {
     return req(`/sessions/${sid}/runs/${rid}/cancel`, { method: "POST" });
+  },
+
+  // ---- HITL decisions ----
+
+  async getDecision(sid: string): Promise<PendingDecision | null> {
+    try {
+      return await req(`/sessions/${sid}/decisions`);
+    } catch (e) {
+      if (String(e).includes("API 404")) return null;
+      throw e;
+    }
+  },
+
+  resolveDecision(
+    sid: string,
+    action: DecisionAction
+  ): Promise<{ action: string; session_id: string; run_id: string | null; detail: string }> {
+    return req(`/sessions/${sid}/decisions`, {
+      method: "POST",
+      body: JSON.stringify({ action }),
+    });
   },
 
   // ---- Plan ----
@@ -141,6 +178,10 @@ export const api = {
     const params = new URLSearchParams({ path });
     if (scope !== "workspace") params.set("scope", scope);
     return req(`/sessions/${sid}/workspace/file?${params}`);
+  },
+
+  getWorkspaceInfo(sid: string): Promise<WorkspaceInfo> {
+    return req(`/sessions/${sid}/workspace/info`);
   },
 
   // ---- Models ----

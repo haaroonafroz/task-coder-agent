@@ -3,6 +3,49 @@
 export type ModelChoice = "auto" | "local" | "gemini" | "gpt4o";
 export type RunKind = "auto" | "new" | "resume" | "repair";
 export type ExecutionRoute = "auto" | "mission" | "hotfix" | "review";
+export type ReviewFixMode = "ask" | "auto";
+export type DecisionAction =
+  | "apply_fix"
+  | "dismiss"
+  | "escalate_mission"
+  | "run_smoke"
+  | "setup_env";
+
+export interface PendingDecision {
+  type: string;
+  title: string;
+  summary: string;
+  options: DecisionAction[];
+  session_id: string;
+  created_at: string;
+  payload: Record<string, unknown>;
+}
+export type WorkspaceKind = "managed" | "external";
+export type WorkspaceAccessMode = "read_write" | "read_only";
+
+export interface WorkspaceBinding {
+  kind: WorkspaceKind;
+  path: string;
+  access_mode: WorkspaceAccessMode;
+  environment_strategy: "auto" | "project" | "harness";
+  git_root: string | null;
+  sandbox_required: boolean;
+}
+
+export interface ProjectProfile {
+  root: string;
+  workspace_kind: WorkspaceKind;
+  git: Record<string, unknown>;
+  languages: string[];
+  manifests: string[];
+  environment: Record<string, unknown> | null;
+  detected_commands: Record<string, string>;
+}
+
+export interface WorkspaceInfo {
+  workspace: WorkspaceBinding;
+  project: ProjectProfile;
+}
 
 export interface Session {
   session_id: string;
@@ -16,6 +59,8 @@ export interface Session {
   workspace_root: string;
   plan_path: string;
   events_path: string;
+  workspace: WorkspaceBinding;
+  project_profile?: Record<string, unknown> | null;
 }
 
 export interface Message {
@@ -32,7 +77,15 @@ export interface Run {
   run_id: string;
   session_id: string;
   request: string;
-  status: "queued" | "running" | "completed" | "partial" | "failed" | "error" | "cancelled";
+  status:
+    | "queued"
+    | "running"
+    | "completed"
+    | "partial"
+    | "failed"
+    | "error"
+    | "cancelled"
+    | "awaiting_decision";
   model: string;
   queued_at: string;
   started_at: string | null;
@@ -41,6 +94,7 @@ export interface Run {
   error: string | null;
   run_kind: RunKind;
   execution_route?: ExecutionRoute;
+  review_fix_mode?: ReviewFixMode;
   plan_id: string | null;
 }
 

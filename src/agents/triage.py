@@ -58,6 +58,7 @@ def run_triage(
     session_root: Path,
     model: ModelChoice,
     previous_plan: Optional[dict[str, Any]] = None,
+    project_profile: Optional[dict[str, Any]] = None,
     session: Optional[TelemetryContext] = None,
     emitter: Optional[EventEmitter] = None,
 ) -> dict[str, Any]:
@@ -70,6 +71,7 @@ def run_triage(
         workspace_root=workspace_root,
         session_root=session_root,
         previous_plan=previous_plan,
+        project_profile=project_profile,
     )
     span_model = (
         resolve_model_config(model, "triage").model_name
@@ -150,6 +152,7 @@ def _build_prompt(
     workspace_root: Path,
     session_root: Path,
     previous_plan: Optional[dict[str, Any]],
+    project_profile: Optional[dict[str, Any]] = None,
 ) -> str:
     return (
         f"{_TRIAGE_MD}\n\n---\n\n"
@@ -158,6 +161,8 @@ def _build_prompt(
         f"{_read_messages(session_root)}\n```\n\n"
         f"## Previous Plan\n```json\n"
         f"{json.dumps(previous_plan or {}, indent=2)[:12000]}\n```\n\n"
+        f"## Project Profile\n```json\n"
+        f"{json.dumps(project_profile or {}, indent=2)[:12000]}\n```\n\n"
         f"## Recent Session Events\n```\n"
         f"{_read_recent_events(session_root)}\n```\n\n"
         f"## Current Workspace Snapshot\n"

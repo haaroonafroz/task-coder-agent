@@ -227,6 +227,8 @@ def test_hotfix_route_preserves_active_plan(tmp_path: Path):
     )
     sentinel = object()
     runtime._finish_focused_result = lambda **kwargs: sentinel
+    # PASS hotfixes flow through FixVerifier before finishing.
+    runtime._verify_hotfix_result = lambda *args, **kwargs: sentinel
     session = SimpleNamespace(
         root=tmp_path,
         plan_path=plan_path,

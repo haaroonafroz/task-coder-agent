@@ -223,7 +223,7 @@
 
 <!-- SKILL_START: install_dependency -->
 ## Skill Name: install_dependency
-- **Description:** Installs a Python package into the session venv via pip. Also appends the package to `requirements.txt` if it exists. **Required before complete** when target files import third-party libraries.
+- **Description:** Installs a Python package via pip (idempotent — already-installed packages succeed immediately). Managed sessions install into the session venv and the package is appended to `requirements.txt` if it exists. Attached external projects install into the project's own venv (`.venv`/`venv`, created if missing); a project's `requirements.txt` is never modified. **Required before complete** when target files import third-party libraries.
 - **Keywords:** install, pip, package, dependency, pygame, flask, httpx, requirements, third-party, runtime
 - **Parameters:**
   - `package_name` (string): Package identifier, optionally with version pin (e.g. `httpx>=0.27.0`, `pygame`).
