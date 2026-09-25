@@ -8,7 +8,12 @@ import type {
   ToolCallEntry,
 } from "../api/types";
 
-const SYSTEM_EVENT_TYPES = new Set(["session.started", "mission.cancelled"]);
+const SYSTEM_EVENT_TYPES = new Set([
+  "session.started",
+  "mission.cancelled",
+  "verify_hotfix.started",
+  "verify_hotfix.completed",
+]);
 
 function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
@@ -26,6 +31,7 @@ function asRole(value: unknown): AgentRole {
     role === "hotfix" ||
     role === "reviewer" ||
     role === "validator" ||
+    role === "verify_hotfix" ||
     role === "triage"
   ) {
     return role;
@@ -88,6 +94,16 @@ function systemLine(ev: SSEEvent): string {
   }
   if (ev.type === "mission.cancelled") {
     return "Mission cancelled";
+  }
+  if (ev.type === "verify_hotfix.started") {
+    return "Verify-Hotfix started — checking the hotfix against the fix criteria";
+  }
+  if (ev.type === "verify_hotfix.completed") {
+    const verdict = asString(ev.data.verdict) || "UNKNOWN";
+    const summary = asString(ev.data.summary);
+    return summary
+      ? `Verify-Hotfix ${verdict} — ${summary}`
+      : `Verify-Hotfix ${verdict}`;
   }
   return ev.type;
 }
@@ -355,6 +371,7 @@ export function personaLabel(turn: AgentTurn): string {
     hotfix: "Hotfix",
     reviewer: "Code Review",
     validator: "Validator",
+    verify_hotfix: "Verify-Hotfix",
     triage: "Triage",
   };
   const base = roleLabels[turn.role];

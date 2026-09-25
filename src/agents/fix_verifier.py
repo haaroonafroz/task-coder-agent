@@ -99,8 +99,9 @@ def run_fix_verification(
     session: Optional[TelemetryContext] = None,
     emitter: Optional[EventEmitter] = None,
 ) -> dict[str, Any]:
+    packet_id = str((hotfix_packet or {}).get("id", ""))
     if emitter:
-        emitter.emit("fixverify.started")
+        emitter.emit("verify_hotfix.started", milestone_id=packet_id)
     target_files = list((hotfix_packet or {}).get("target_files", []))
     deterministic = _deterministic_checks(target_files)
     diff = _bounded_diff()
@@ -120,7 +121,7 @@ def run_fix_verification(
         else model
     )
     try:
-        with span_llm_call("fixverify", "verify", span_model, session=session):
+        with span_llm_call("verify_hotfix", "verify", span_model, session=session):
             result = call_llm(
                 prompt,
                 model=model,
@@ -128,7 +129,8 @@ def run_fix_verification(
                 json_mode=True,
                 role="validator",
                 stream_context=stream_context_for(
-                    emitter, "fixverify", output_kind="json"
+                    emitter, "verify_hotfix", milestone_id=packet_id,
+                    output_kind="json",
                 ),
             )
         parsed = parse_json_from_text(result.text)
@@ -140,7 +142,8 @@ def run_fix_verification(
     verdict["deterministic_checks"] = deterministic
     if emitter:
         emitter.emit(
-            "fixverify.completed",
+            "verify_hotfix.completed",
+            milestone_id=packet_id,
             verdict=verdict.get("verdict"),
             summary=str(verdict.get("summary", ""))[:500],
         )

@@ -279,6 +279,7 @@ export type AgentRole =
   | "hotfix"
   | "reviewer"
   | "validator"
+  | "verify_hotfix"
   | "triage";
 
 export interface LLMMetrics {

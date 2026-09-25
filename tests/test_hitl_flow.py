@@ -452,3 +452,59 @@ def test_verify_reuses_precomputed_verdict(
     )
     assert result is not None
     assert result.status == "completed"
+
+
+# ---------------------------------------------------------------------------
+# Verify-Hotfix wire identity (regression: UI rendered it as "Worker")
+# ---------------------------------------------------------------------------
+
+def test_verify_hotfix_emits_own_role_and_milestone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.agents.fix_verifier as fv
+
+    seen: list[tuple[str, dict]] = []
+
+    class _Emitter:
+        def emit(self, event_type: str, **payload) -> None:
+            seen.append((event_type, payload))
+
+    class _Result:
+        text = '{"verdict": "VERIFIED", "summary": "ok"}'
+        model_used = "m"
+        tokens_prompt = 1
+        tokens_generated = 1
+        prefill_ms = 0
+        decode_ms = 0
+        total_ms = 0
+        thinking_level = ""
+        fallback_used = False
+
+    captured: dict[str, object] = {}
+
+    def _fake_call_llm(prompt: str, **kwargs):
+        captured.update(kwargs)
+        ctx = kwargs.get("stream_context")
+        if ctx is not None:
+            ctx.start(model_used="m", thinking_level="")
+            ctx.finish(_Result(), output_text=_Result.text)
+        return _Result()
+
+    monkeypatch.setattr(fv, "call_llm", _fake_call_llm)
+    monkeypatch.setattr(fv, "_deterministic_checks", lambda paths: {"checks": []})
+    monkeypatch.setattr(fv, "_bounded_diff", lambda max_chars=6000: "")
+    verdict = fv.run_fix_verification(
+        review_report={},
+        hotfix_packet={"id": "HOTFIX", "target_files": [],
+                       "acceptance_criteria": ["fixed"]},
+        hotfix_handoff={"files_modified": [], "summary": "s"},
+        emitter=_Emitter(),  # type: ignore[arg-type]
+    )
+    assert verdict["verdict"] == "VERIFIED"
+    by_type = {t: p for t, p in seen}
+    assert by_type["verify_hotfix.started"]["milestone_id"] == "HOTFIX"
+    assert by_type["verify_hotfix.completed"]["verdict"] == "VERIFIED"
+    # The LLM turn must carry the verify_hotfix role (never "worker").
+    llm_roles = {p.get("role") for t, p in seen if t in {"llm.stream.start", "llm.call"}}
+    assert llm_roles == {"verify_hotfix"}
+    assert "worker" not in llm_roles

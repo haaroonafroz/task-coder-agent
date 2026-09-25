@@ -61,6 +61,8 @@ export function openEventStream(
     "review.started",
     "review.completed",
     "review.escalated",
+    "verify_hotfix.started",
+    "verify_hotfix.completed",
     "tool.called",
     "tool.result",
     "validation.started",
