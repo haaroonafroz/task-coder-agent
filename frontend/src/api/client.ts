@@ -24,6 +24,7 @@ import type {
   WorkspaceAccessMode,
   WorkspaceKind,
   WorkspaceInfo,
+  SettingsResponse,
 } from "./types";
 
 const BASE = "/api/v1";
@@ -224,5 +225,34 @@ export const api = {
 
   health(): Promise<{ status: string }> {
     return req(`/health`);
+  },
+
+  getSettings(): Promise<SettingsResponse> {
+    return req(`/settings`);
+  },
+
+  patchSettings(settings: Record<string, unknown>): Promise<SettingsResponse> {
+    return req(`/settings`, {
+      method: "PATCH",
+      body: JSON.stringify({ settings }),
+    });
+  },
+
+  putSettings(settings: Record<string, unknown>): Promise<SettingsResponse> {
+    return req(`/settings`, {
+      method: "PUT",
+      body: JSON.stringify({ settings }),
+    });
+  },
+
+  testProvider(body: {
+    base_url: string;
+    api_key?: string;
+    provider_id?: string;
+  }): Promise<{ ok: boolean; models: string[]; error: string | null }> {
+    return req(`/settings/test-provider`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
   },
 };

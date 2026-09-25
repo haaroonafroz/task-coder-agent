@@ -1,6 +1,6 @@
 // TypeScript types mirroring the Phase 3 FastAPI Pydantic schemas.
 
-export type ModelChoice = "auto" | "local" | "gemini" | "gpt4o";
+export type ModelChoice = string;
 export type RunKind = "auto" | "new" | "resume" | "repair";
 export type ExecutionRoute = "auto" | "mission" | "hotfix" | "review";
 export type ReviewFixMode = "ask" | "auto";
@@ -143,6 +143,77 @@ export interface ModelInfo {
   models_by_role?: Record<string, string>;
   thinking_by_role?: Record<string, string>;
   context_length?: number | null;
+  label?: string | null;
+  adapter?: string | null;
+  enabled?: boolean;
+  api_key_set?: boolean;
+  discovered_models?: string[];
+}
+
+export interface ProviderPreset {
+  id: string;
+  label: string;
+  base_url: string;
+  adapter: string;
+  model?: string;
+  models_by_role?: Record<string, string>;
+  context_length?: number;
+}
+
+export interface MissionsSettingsPayload {
+  llm: {
+    providers: Array<{
+      id: string;
+      label: string;
+      base_url: string;
+      adapter: string;
+      model: string;
+      models_by_role: Record<string, string>;
+      enabled: boolean;
+      context_length: number | null;
+      api_key: string;
+      api_key_set: boolean;
+    }>;
+    default_provider: string;
+    fallback_order: string[];
+    seed: number;
+    context_length: number;
+  };
+  roles: Record<string, {
+    temperature: number;
+    top_p: number;
+    max_tokens: number;
+    thinking: string;
+    thinking_enabled: boolean;
+  }>;
+  qdrant: {
+    mode: "embedded" | "http" | "off";
+    path: string;
+    url: string;
+    api_key: string;
+    api_key_set: boolean;
+    collection: string;
+    dense_name: string;
+    sparse_name: string;
+    dense_dims: number;
+  };
+  embeddings: {
+    backend: "auto" | "hf" | "openai" | "none";
+    hf_model: string;
+    openai_model: string;
+    openai_dims: number;
+  };
+  runtime: Record<string, unknown>;
+  observability: Record<string, unknown>;
+  memory: { backend: string };
+}
+
+export interface SettingsResponse {
+  settings: MissionsSettingsPayload;
+  home: string;
+  presets: ProviderPreset[];
+  migrated_from_env: boolean;
+  container: boolean;
 }
 
 export interface ToolParam {

@@ -1,186 +1,42 @@
 """
-Multi-model LLM client — Missions Framework.
+OpenAI-compatible LLM client for the Missions harness.
 
-Priority chain (when model="auto"):
-  1. Local  — Qwen/Gemma via llama.cpp server
-  2. Gemini — gemini-3.1-flash-lite via OpenAI-compatible Gemini endpoint
-  3. GPT-4o — gpt-4o / gpt-4o-mini via OpenAI API
+Providers are named connections (base_url + api_key + model) loaded from
+settings. Vendor quirks live in adapters:
 
-The frontend selects a backend key (``local`` | ``gemini`` | ``gpt4o`` | ``auto``).
-Each agent role resolves to a concrete model + thinking profile via the registry
-(Phase 11):
-
-  Backend   Orchestrator / Validator     Worker
-  --------  -------------------------     ------
-  local     TARGET_MODEL, per-role Qwen3.8 effort
-  gemini    GEMINI_MODEL, thinking=max   GEMINI_MODEL, thinking=default
-  gpt4o     OPENAI_LLM_MODEL             OPENAI_LLM_MODEL_ENRICHMENT
-
-Environment variables (can be set in .env):
-  LLM_SPECULATIVE_URL          — llama.cpp server base URL
-  TARGET_MODEL                 — local model alias
-  GEMINI_API_KEY, GEMINI_MODEL
-  GEMINI_THINKING_LEVEL_DEFAULT, GEMINI_THINKING_LEVEL_MAX
-  OPENAI_API_KEY, OPENAI_LLM_MODEL, OPENAI_LLM_MODEL_ENRICHMENT
-  LLM_TEMPERATURE, LLM_TEMPERATURE_<ROLE>, LLM_TOP_P, LLM_TOP_P_<ROLE>, LLM_SEED
-  LOCAL_REASONING_EFFORT_<ROLE>, LOCAL_ENABLE_THINKING_<ROLE>
+  generic / openai     — stock Chat Completions
+  gemini_openai        — Gemini's OpenAI-compat endpoint + thinking_config
+  llamacpp_qwen        — llama.cpp chat_template_kwargs for Qwen thinking
 """
 
 from __future__ import annotations
 
-import os
+import json
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Optional, Literal
+from urllib.parse import urlparse
 
 from openai import OpenAI, APIConnectionError, APIStatusError
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv(Path(__file__).parent.parent / ".env", override=False)
-except ImportError:
-    pass
+from src.settings import ADAPTER_UNSUPPORTED_PARAMS, get_settings
+from src.settings.schema import ProviderConfig, RoleSettings
 
 # ---------------------------------------------------------------------------
 # Types
 # ---------------------------------------------------------------------------
-ModelChoice = Literal["local", "gemini", "gpt4o", "auto"]
+ModelChoice = str  # "auto" or a provider id
 AgentRole = Literal[
     "triage", "orchestrator", "worker", "hotfix", "reviewer", "validator"
 ]
 ThinkingLevel = Literal["off", "minimal", "low", "medium", "high", "xhigh"]
 
-# Parameters not accepted by each backend's OpenAI-compatible endpoint.
-_UNSUPPORTED_PARAMS: dict[str, set[str]] = {
-    "local": set(),
-    "gemini": {"seed", "stream_options"},
-    "gpt4o": set(),
-}
-
-_FALLBACK_CHAIN: list[str] = ["local", "gemini", "gpt4o"]
-
-SEED = int(os.getenv("LLM_SEED", "42"))
-
-
-def _env_float(name: str) -> float:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    try:
-        return float(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"Invalid float in {name}={raw!r}") from exc
-
-
-def _role_sampling(role: AgentRole, base_var: str) -> float:
-    """Resolve a per-role float from env.
-
-    Precedence: ``{base_var}_<ROLE>`` > ``{base_var}`` (both must be set in .env).
-    """
-    role_var = f"{base_var}_{role.upper()}"
-    raw = os.getenv(role_var, "").strip()
-    if raw:
-        try:
-            return float(raw)
-        except ValueError as exc:
-            raise RuntimeError(f"Invalid float in {role_var}={raw!r}") from exc
-    return _env_float(base_var)
-
-
-def _role_temperature(role: AgentRole) -> float:
-    return _role_sampling(role, "LLM_TEMPERATURE")
-
-
-def _role_top_p(role: AgentRole) -> float:
-    return _role_sampling(role, "LLM_TOP_P")
-
-
-_LOCAL_DEFAULT_EFFORT: dict[AgentRole, str] = {
-    "triage": "medium",
-    "orchestrator": "medium",
-    "worker": "low",
-    "hotfix": "low",
-    "reviewer": "medium",
-    "validator": "medium",
-}
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    """Resolve a boolean environment variable with an explicit error on typos."""
-    raw = os.getenv(name, "").strip().lower()
-    if not raw:
-        return default
-    if raw in ("1", "true", "yes", "on"):
-        return True
-    if raw in ("0", "false", "no", "off"):
-        return False
-    raise RuntimeError(
-        f"Invalid boolean in {name}={raw!r}; use true or false"
-    )
-
-
-def _local_thinking_level(role: AgentRole) -> ThinkingLevel:
-    """Resolve Qwen3.8 thinking for one role from the environment.
-
-    The split ``LOCAL_REASONING_EFFORT_*`` /
-    ``LOCAL_ENABLE_THINKING_*`` form is preferred because it maps directly to
-    Qwen3.8's request parameters.  The compact ``LOCAL_THINKING_*`` form is
-    also accepted as an atomic compatibility fallback.
-    """
-    role_name = role.upper()
-    effort_name = f"LOCAL_REASONING_EFFORT_{role_name}"
-    enabled_name = f"LOCAL_ENABLE_THINKING_{role_name}"
-    compact_name = f"LOCAL_THINKING_{role_name}"
-    legacy_name = f"LOCAL_THINKING_LEVEL_{role_name}"
-
-    split_configured = bool(
-        os.getenv(effort_name, "").strip()
-        or os.getenv(enabled_name, "").strip()
-    )
-    if split_configured:
-        effort = os.getenv(
-            effort_name, _LOCAL_DEFAULT_EFFORT[role]
-        ).strip().lower()
-        enabled = _env_bool(
-            enabled_name,
-            default=(role != "worker"),
-        )
-    else:
-        compact = os.getenv(compact_name, "").strip().lower()
-        if not compact:
-            compact = os.getenv(legacy_name, "").strip().lower()
-        if not compact:
-            compact = _LOCAL_DEFAULT_EFFORT[role]
-        effort = compact
-        enabled = effort != "off"
-
-    if effort == "off":
-        if split_configured and enabled:
-            raise RuntimeError(
-                f"Invalid Qwen3.8 thinking configuration: {effort_name}=off "
-                f"but {enabled_name} enables thinking"
-            )
-        return "off"
-
-    # Map old generic labels to the nearest Qwen3.8 value.  Do not pass these
-    # aliases to the model: Qwen3.8 accepts only low, medium, and xhigh.
-    effort = {
-        "minimal": "low",
-        "high": "xhigh",
-        "max": "xhigh",
-    }.get(effort, effort)
-    if effort not in ("low", "medium", "xhigh"):
-        raise RuntimeError(
-            f"Invalid Qwen3.8 reasoning effort in {effort_name}={effort!r}; "
-            "use low, medium, or xhigh"
-        )
-    return effort if enabled else "off"  # type: ignore[return-value]
-
 
 @dataclass(frozen=True)
 class ResolvedModelConfig:
-    """Concrete model + thinking settings for one (backend, role) pair."""
+    """Concrete model + thinking settings for one (provider, role) pair."""
 
     backend: str
     role: AgentRole
@@ -188,6 +44,7 @@ class ResolvedModelConfig:
     api_key: str
     model_name: str
     thinking_level: ThinkingLevel
+    adapter: str = "generic"
 
 
 @dataclass
@@ -205,169 +62,123 @@ class LLMResult:
 
 
 def get_context_length() -> int:
-    """Return configured llama.cpp context length for UI metrics."""
-    try:
-        return max(1024, int(os.getenv("CONTEXT_LEN", "32768")))
-    except ValueError:
-        return 32768
+    settings = get_settings()
+    local = settings.provider("local")
+    if local and local.context_length:
+        return max(1024, int(local.context_length))
+    return max(1024, int(settings.llm.context_length or 32768))
 
 
-# ---------------------------------------------------------------------------
-# Registry — env-backed endpoint metadata (no per-role model baked in)
-# ---------------------------------------------------------------------------
-
-def _endpoint_meta(backend: str) -> dict[str, str]:
-    """Return base_url + api_key for a backend key."""
-    if backend == "local":
-        return {
-            "base_url": os.getenv("LLM_SPECULATIVE_URL", "http://localhost:8001/v1"),
-            "api_key": "EMPTY",
-        }
-    if backend == "gemini":
-        return {
-            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-            "api_key": os.getenv("GEMINI_API_KEY", ""),
-        }
-    if backend == "gpt4o":
-        return {
-            "base_url": "https://api.openai.com/v1",
-            "api_key": os.getenv("OPENAI_API_KEY", ""),
-        }
-    raise KeyError(f"Unknown backend: {backend}")
+def _role_settings(role: AgentRole) -> RoleSettings:
+    return get_settings().roles.for_role(role)
 
 
-def _role_thinking_level(backend: str, role: AgentRole) -> ThinkingLevel:
-    """
-    Resolve the thinking level for a backend + role.
-
-    Gemini reads GEMINI_THINKING_LEVEL_DEFAULT (worker) and
-    GEMINI_THINKING_LEVEL_MAX (orchestrator/validator).
-    Local uses per-role Qwen3.8 environment settings.  The split form is
-    LOCAL_REASONING_EFFORT_<ROLE> plus LOCAL_ENABLE_THINKING_<ROLE>.
-    GPT has no thinking knob — level is always off (model choice handles capability).
-    """
-    if backend == "gemini":
-        if role in {"worker", "hotfix"}:
-            raw = os.getenv("GEMINI_THINKING_LEVEL_DEFAULT", "minimal")
-        else:
-            raw = os.getenv("GEMINI_THINKING_LEVEL_MAX", "medium")
-        level = raw.strip().lower()
-        if level in ("off", "minimal", "low", "medium", "high"):
-            return level  # type: ignore[return-value]
-        return "minimal" if role in {"worker", "hotfix"} else "medium"
-
-    if backend == "local":
-        return _local_thinking_level(role)
-
+def _normalize_thinking(role_cfg: RoleSettings, adapter: str) -> ThinkingLevel:
+    effort = (role_cfg.thinking or "medium").strip().lower()
+    enabled = role_cfg.thinking_enabled
+    if effort == "off" or not enabled:
+        return "off"
+    aliases = {"minimal": "low", "high": "xhigh", "max": "xhigh"}
+    effort = aliases.get(effort, effort)
+    if adapter == "llamacpp_qwen":
+        if effort not in ("low", "medium", "xhigh"):
+            effort = "medium"
+        return effort  # type: ignore[return-value]
+    if adapter == "gemini_openai":
+        if effort not in ("off", "minimal", "low", "medium", "high"):
+            effort = "medium"
+        return effort  # type: ignore[return-value]
     return "off"
 
 
-def _role_model_name(backend: str, role: AgentRole) -> str:
-    """Resolve the concrete model name for a backend + role."""
-    if backend == "local":
-        return os.getenv("TARGET_MODEL", "qwen3.8-27b-mtp")
-    if backend == "gemini":
-        return os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
-    if backend == "gpt4o":
-        if role in {"worker", "hotfix"}:
-            return os.getenv("OPENAI_LLM_MODEL_ENRICHMENT", "gpt-4o-mini")
-        return os.getenv("OPENAI_LLM_MODEL", "gpt-4o")
-    raise KeyError(f"Unknown backend: {backend}")
-
-
 def resolve_model_config(backend: str, role: AgentRole) -> ResolvedModelConfig:
-    """
-    Resolve env-backed model name + thinking level for a backend and agent role.
-
-    Args:
-        backend: ``local`` | ``gemini`` | ``gpt4o`` (not ``auto``).
-        role:    ``triage`` | ``orchestrator`` | ``worker`` | ``hotfix`` |
-                 ``reviewer`` | ``validator``.
-
-    Returns:
-        A :class:`ResolvedModelConfig` with everything needed for one LLM call.
-    """
-    meta = _endpoint_meta(backend)
+    """Resolve provider + role into a concrete chat-completions config."""
+    if backend == "auto":
+        raise KeyError("resolve_model_config does not accept backend='auto'")
+    settings = get_settings()
+    provider = settings.provider(backend)
+    if provider is None or not provider.enabled:
+        raise KeyError(f"Unknown or disabled provider: {backend}")
+    role_cfg = _role_settings(role)
+    adapter = provider.adapter or "generic"
     return ResolvedModelConfig(
         backend=backend,
         role=role,
-        base_url=meta["base_url"],
-        api_key=meta["api_key"],
-        model_name=_role_model_name(backend, role),
-        thinking_level=_role_thinking_level(backend, role),
+        base_url=provider.base_url,
+        api_key=provider.api_key or "EMPTY",
+        model_name=provider.model_for_role(role),
+        thinking_level=_normalize_thinking(role_cfg, adapter),
+        adapter=adapter,
     )
 
 
 def get_model_catalog() -> list[dict[str, Any]]:
-    """
-    Return the full model registry for API exposure.
-
-    Each entry describes one selectable backend with per-role model names and
-    thinking levels. Includes a synthetic ``auto`` entry at the front.
-    """
+    """Return the configured provider catalog, with a synthetic ``auto`` entry."""
+    settings = get_settings()
+    roles = (
+        "triage", "orchestrator", "worker", "hotfix", "reviewer", "validator"
+    )
     entries: list[dict[str, Any]] = []
-    for key in _FALLBACK_CHAIN:
-        meta = _endpoint_meta(key)
-        models_by_role = {
-            role: _role_model_name(key, role)
-            for role in (
-                "triage", "orchestrator", "worker", "hotfix", "reviewer", "validator"
-            )
-        }
+    for provider in settings.llm.providers:
+        models_by_role = {role: provider.model_for_role(role) for role in roles}
         thinking_by_role = {
-            role: _role_thinking_level(key, role)
-            for role in (
-                "triage", "orchestrator", "worker", "hotfix", "reviewer", "validator"
-            )
+            role: _normalize_thinking(settings.roles.for_role(role), provider.adapter)
+            for role in roles
         }
         entries.append({
-            "key": key,
-            "base_url": meta["base_url"],
-            "model": models_by_role["orchestrator"],
+            "key": provider.id,
+            "label": provider.display_label(),
+            "base_url": provider.base_url,
+            "adapter": provider.adapter,
+            "enabled": provider.enabled,
+            "model": provider.model_for_role("orchestrator"),
             "models_by_role": models_by_role,
             "thinking_by_role": thinking_by_role,
-            "context_length": get_context_length() if key == "local" else None,
+            "context_length": provider.context_length or (
+                get_context_length() if provider.adapter == "llamacpp_qwen" else None
+            ),
+            "api_key_set": bool(provider.api_key),
         })
 
+    fallback = settings.fallback_ids()
+    auto_label = (
+        "(auto — " + " → ".join(fallback) + ")"
+        if fallback
+        else "(auto — no providers configured)"
+    )
     entries.insert(0, {
         "key": "auto",
+        "label": "Auto",
         "base_url": "",
-        "model": "(auto — local → gemini → gpt4o)",
-        "models_by_role": {
-            "triage": "(fallback chain)",
-            "orchestrator": "(fallback chain)",
-            "worker": "(fallback chain)",
-            "hotfix": "(fallback chain)",
-            "reviewer": "(fallback chain)",
-            "validator": "(fallback chain)",
-        },
-        "thinking_by_role": {
-            "triage": "per-backend",
-            "orchestrator": "per-backend",
-            "worker": "per-backend",
-            "hotfix": "per-backend",
-            "reviewer": "per-backend",
-            "validator": "per-backend",
-        },
+        "adapter": "generic",
+        "enabled": bool(fallback),
+        "model": auto_label,
+        "models_by_role": {role: "(fallback chain)" for role in roles},
+        "thinking_by_role": {role: "per-provider" for role in roles},
         "context_length": get_context_length(),
+        "api_key_set": False,
     })
     return entries
 
 
-# Backward-compatible flat endpoint dict (orchestrator model as primary label).
-def _build_legacy_endpoints() -> dict[str, dict]:
-    out: dict[str, dict] = {}
-    for key in _FALLBACK_CHAIN:
-        meta = _endpoint_meta(key)
-        out[key] = {
-            "base_url": meta["base_url"],
-            "api_key": meta["api_key"],
-            "model": _role_model_name(key, "orchestrator"),
-        }
-    return out
-
-
-_ENDPOINTS: dict[str, dict] = _build_legacy_endpoints()
+def _candidate_ids(model: ModelChoice) -> list[str]:
+    settings = get_settings()
+    if model and model != "auto":
+        provider = settings.provider(model)
+        if provider is None:
+            raise RuntimeError(
+                f"Unknown provider '{model}'. Add it in Settings or pick Auto."
+            )
+        if not provider.enabled:
+            raise RuntimeError(f"Provider '{model}' is disabled in Settings.")
+        return [model]
+    ids = settings.fallback_ids()
+    if not ids:
+        raise RuntimeError(
+            "No LLM providers configured. Open Settings and add a local "
+            "OpenAI-compatible URL or a cloud API key."
+        )
+    return ids
 
 
 def _gemini_extra_body(thinking_level: ThinkingLevel) -> dict[str, Any]:
@@ -387,9 +198,53 @@ def _build_client(cfg: ResolvedModelConfig) -> OpenAI:
     return OpenAI(api_key=cfg.api_key or "EMPTY", base_url=cfg.base_url)
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+def probe_provider(
+    base_url: str,
+    api_key: str = "",
+    timeout: float = 5.0,
+) -> tuple[bool, list[str], Optional[str]]:
+    """Call GET {base_url}/models and return (ok, model ids, error)."""
+    url = (base_url or "").rstrip("/")
+    if not url:
+        return False, [], "base_url is empty"
+    if not url.endswith("/models"):
+        url = url + "/models"
+    headers = {"Accept": "application/json"}
+    if api_key and api_key != "EMPTY":
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return False, [], f"HTTP {exc.code}: {exc.reason}"
+    except Exception as exc:  # noqa: BLE001
+        return False, [], str(exc)
+
+    models: list[str] = []
+    data = payload.get("data", payload) if isinstance(payload, dict) else payload
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and item.get("id"):
+                models.append(str(item["id"]))
+            elif isinstance(item, str):
+                models.append(item)
+    return True, models, None
+
+
+def tcp_reachable(url: str, timeout: float = 2.0) -> tuple[bool, Optional[str]]:
+    if not url:
+        return True, None
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        import socket
+        with socket.create_connection((host, port), timeout=timeout):
+            return True, None
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+
 
 def call_llm(
     prompt: Optional[str] = None,
@@ -405,29 +260,10 @@ def call_llm(
     """
     Send a prompt to the selected LLM and return the result with precise timing.
 
-    Args:
-        prompt:        User-turn prompt text. Ignored when ``messages`` is given.
-        model:         Backend key: ``local`` | ``gemini`` | ``gpt4o`` | ``auto``.
-        max_tokens:    Maximum completion tokens.
-        system_prompt: Optional system-turn text prepended to messages.
-        json_mode:     If True, request JSON object output.
-        role:          Agent role — selects per-role model + thinking from registry.
-        enable_thinking: Deprecated. Maps to role thinking when provided without
-                         changing role defaults (True → medium, False → off for local).
-        messages:      Optional native chat message list (``role``/``content``
-                       dicts). Content may be a string or an OpenAI-compatible
-                       multimodal content-part list. Prefer this over flattened
-                       single-turn prompts:
-                       it preserves role semantics and keeps the rendered prompt
-                       append-only so server-side prefix caches stay hot.
-
-    Returns:
-        LLMResult with text, timing, token counts, and resolved model id.
-
-    Raises:
-        RuntimeError: If all models in the chain fail.
+    ``model`` is ``auto`` or a configured provider id. ``auto`` walks
+    ``settings.llm.fallback_order``.
     """
-    candidates = _FALLBACK_CHAIN if model == "auto" else [model]
+    candidates = _candidate_ids(model)
     last_exc: Optional[Exception] = None
 
     for attempt, model_key in enumerate(candidates):
@@ -477,12 +313,13 @@ def _call_single(
     messages: Optional[list[dict[str, Any]]] = None,
     stream_context: Any = None,
 ) -> LLMResult:
-    """Execute a single streaming call to the given model backend."""
+    """Execute a single streaming call to the given provider."""
     cfg = resolve_model_config(model_key, role)
+    role_cfg = _role_settings(role)
+    settings = get_settings()
 
-    # Legacy enable_thinking override (local only meaningful path)
     thinking_level = cfg.thinking_level
-    if enable_thinking_override is not None and model_key == "local":
+    if enable_thinking_override is not None and cfg.adapter == "llamacpp_qwen":
         thinking_level = "medium" if enable_thinking_override else "off"
 
     model_used = f"{model_key}/{cfg.model_name}"
@@ -504,11 +341,11 @@ def _call_single(
         chat_messages.append({"role": "user", "content": prompt or ""})
 
     kwargs: dict[str, Any] = dict(
-        model=cfg.model_name,
+        model=cfg.model_name or "default",
         messages=chat_messages,
-        temperature=_role_temperature(role),
-        top_p=_role_top_p(role),
-        seed=SEED,
+        temperature=role_cfg.temperature,
+        top_p=role_cfg.top_p,
+        seed=settings.llm.seed,
         max_tokens=max_tokens,
         stream=True,
         stream_options={"include_usage": True},
@@ -516,11 +353,7 @@ def _call_single(
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
 
-    # Qwen3.8 reads both controls in the Jinja template.  These are request-
-    # scoped, so different roles can share one llama-server instance.  Keep
-    # reasoning_effort nested: llama.cpp's top-level OpenAI-compatible field
-    # only gives special treatment to reasoning_effort="none".
-    if model_key == "local":
+    if cfg.adapter == "llamacpp_qwen":
         template_kwargs: dict[str, Any] = {
             "enable_thinking": thinking_level != "off",
         }
@@ -528,10 +361,10 @@ def _call_single(
             template_kwargs["reasoning_effort"] = thinking_level
         kwargs["extra_body"] = {"chat_template_kwargs": template_kwargs}
 
-    if model_key == "gemini" and thinking_level not in ("off",):
+    if cfg.adapter == "gemini_openai" and thinking_level not in ("off",):
         kwargs["extra_body"] = _gemini_extra_body(thinking_level)
 
-    for param in _UNSUPPORTED_PARAMS.get(model_key, set()):
+    for param in ADAPTER_UNSUPPORTED_PARAMS.get(cfg.adapter, set()):
         kwargs.pop(param, None)
 
     t0 = time.perf_counter()

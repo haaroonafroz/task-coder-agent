@@ -9,6 +9,7 @@ from typing import Any
 from src.agents.utils import parse_json_from_text
 from src.evals.types import EvalContext, EvalScore
 from src.llm_client import ModelChoice, call_llm
+from src.settings import get_settings
 
 _PASS_THRESHOLD = 0.7
 
@@ -139,4 +140,4 @@ def run_llm_judge_evals(
 
 
 def llm_judges_enabled() -> bool:
-    return os.getenv("MISSIONS_EVAL_LLM_JUDGE", "false").strip().lower() == "true"
+    return bool(get_settings().observability.eval_llm_judge)

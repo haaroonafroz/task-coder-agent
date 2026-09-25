@@ -22,6 +22,8 @@ import {
 import { SessionSidebar } from "./components/SessionSidebar";
 import { ChatPanel } from "./components/ChatPanel";
 import { RunInspector } from "./components/RunInspector";
+import { SettingsPanel } from "./components/SettingsPanel";
+import { SetupWizard } from "./components/SetupWizard";
 
 const RIGHT_PANEL_MIN = 360;
 const RIGHT_PANEL_MAX = 820;
@@ -35,9 +37,19 @@ export default function App() {
     return Number.isFinite(parsed) ? parsed : RIGHT_PANEL_DEFAULT;
   });
   const resizingRef = useRef(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [needsSetup, setNeedsSetup] = useState<boolean | null>(null);
 
   const { sessions, refresh: refreshSessions } = useSessions();
   const { session, setSession } = useSession(activeSid);
+
+  useEffect(() => {
+    api.getSettings()
+      .then((data) => {
+        setNeedsSetup(data.settings.llm.providers.length === 0);
+      })
+      .catch(() => setNeedsSetup(false));
+  }, []);
   const { messages, sending, sendMessage, appendMessage } = useMessages(activeSid);
   const { decision, resolving: resolvingDecision, refresh: refreshDecision, resolve: resolveDecision } =
     useDecision(activeSid);
@@ -210,6 +222,20 @@ export default function App() {
     "--right-panel-width": `${rightPanelWidth}px`,
   } as CSSProperties;
 
+  if (needsSetup === null) {
+    return <div className="wizard-overlay"><div className="wizard-card">Loading…</div></div>;
+  }
+  if (needsSetup) {
+    return (
+      <SetupWizard
+        onComplete={() => {
+          setNeedsSetup(false);
+          refreshSessions();
+        }}
+      />
+    );
+  }
+
   return (
     <div className="app-layout" style={layoutStyle}>
       {/* Left: Sessions */}
@@ -218,6 +244,7 @@ export default function App() {
         activeSid={activeSid}
         onSelect={handleSelectSession}
         onCreated={refreshSessions}
+        onOpenSettings={() => setSettingsOpen(true)}
       />
 
       {/* Center: Chat */}
@@ -246,6 +273,10 @@ export default function App() {
         onOpenFile={openFile}
         onRefreshWorkspace={refreshTree}
         onCancelRun={handleCancelRun}
+      />
+      <SettingsPanel
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
       />
     </div>
   );

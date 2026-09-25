@@ -49,10 +49,11 @@ export function ChatPanel({
   const { models } = useModels();
 
   const contextLength = useMemo(() => {
-    const local = models.find((entry) => entry.key === "local");
+    const selected = models.find((entry) => entry.key === model);
+    const local = models.find((entry) => entry.adapter === "llamacpp_qwen" || entry.key === "local");
     const auto = models.find((entry) => entry.key === "auto");
-    return local?.context_length ?? auto?.context_length ?? null;
-  }, [models]);
+    return selected?.context_length ?? local?.context_length ?? auto?.context_length ?? null;
+  }, [models, model]);
 
   const feed = useMemo(
     () => buildChatItems(messages, events),

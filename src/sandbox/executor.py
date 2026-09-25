@@ -27,6 +27,7 @@ from src.sandbox.policy import (
     validate_argv,
     validate_shell_script,
 )
+from src.settings import get_settings
 
 ExecResult = dict[str, Any]
 
@@ -56,12 +57,34 @@ def _bwrap_available() -> bool:
 
 
 def resolve_backend() -> ExecutorBackend:
-    raw = os.getenv("SANDBOX_EXECUTOR", "auto").strip().lower()
+    raw = get_settings().runtime.sandbox.executor
     if raw == "bwrap":
         return ExecutorBackend.BWRAP
     if raw == "native":
         return ExecutorBackend.NATIVE
     return ExecutorBackend.BWRAP if _bwrap_available() else ExecutorBackend.NATIVE
+
+
+def _bwrap_required() -> bool:
+    return bool(get_settings().runtime.sandbox.require_bwrap)
+
+
+def _deny_missing_bwrap(
+    sandbox: SandboxContext,
+    backend: ExecutorBackend,
+) -> Optional[ExecResult]:
+    """Fail closed only when an external jail is required and bwrap is mandatory."""
+    using_bwrap = backend == ExecutorBackend.BWRAP and _bwrap_available()
+    if sandbox.sandbox_required and not using_bwrap and _bwrap_required():
+        return {
+            "returncode": -1,
+            "stdout": "",
+            "stderr": "Sandbox required for external workspace, but bubblewrap is unavailable",
+            "success": False,
+            "timed_out": False,
+            "sandbox_denied": True,
+        }
+    return None
 
 
 def _kill_process_group(proc: subprocess.Popen, sig: int = signal.SIGTERM) -> None:
@@ -263,17 +286,9 @@ class SubprocessExecutor:
                 "success": False, "timed_out": False,
             }
 
-        if sandbox.sandbox_required and (
-            self.backend != ExecutorBackend.BWRAP or not _bwrap_available()
-        ):
-            return {
-                "returncode": -1,
-                "stdout": "",
-                "stderr": "Sandbox required for external workspace, but bubblewrap is unavailable",
-                "success": False,
-                "timed_out": False,
-                "sandbox_denied": True,
-            }
+        denied = _deny_missing_bwrap(sandbox, self.backend)
+        if denied is not None:
+            return denied
 
         verdict = validate_argv(argv, profile=profile)
         if not verdict.allowed:
@@ -332,17 +347,9 @@ class SubprocessExecutor:
                 "success": False, "timed_out": False,
             }
 
-        if sandbox.sandbox_required and (
-            self.backend != ExecutorBackend.BWRAP or not _bwrap_available()
-        ):
-            return {
-                "returncode": -1,
-                "stdout": "",
-                "stderr": "Sandbox required for external workspace, but bubblewrap is unavailable",
-                "success": False,
-                "timed_out": False,
-                "sandbox_denied": True,
-            }
+        denied = _deny_missing_bwrap(sandbox, self.backend)
+        if denied is not None:
+            return denied
 
         verdict = validate_shell_script(script, profile=profile)
         if not verdict.allowed:

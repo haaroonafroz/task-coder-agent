@@ -15,9 +15,10 @@ interface Props {
   activeSid: string | null;
   onSelect: (sid: string) => void;
   onCreated: () => void;
+  onOpenSettings?: () => void;
 }
 
-export function SessionSidebar({ sessions, activeSid, onSelect, onCreated }: Props) {
+export function SessionSidebar({ sessions, activeSid, onSelect, onCreated, onOpenSettings }: Props) {
   const [showForm, setShowForm] = useState(false);
   const [title, setTitle] = useState("");
   const [model, setModel] = useState<ModelChoice>("auto");
@@ -57,12 +58,20 @@ export function SessionSidebar({ sessions, activeSid, onSelect, onCreated }: Pro
     <div className="panel" style={{ overflow: "hidden" }}>
       <div className="panel-header">
         <span>Sessions</span>
-        <button
-          style={{ padding: "2px 8px", fontSize: 12 }}
-          onClick={() => setShowForm(!showForm)}
-        >
-          {showForm ? "Cancel" : "+ New"}
-        </button>
+        <div className="panel-actions">
+          <button
+            style={{ padding: "2px 8px", fontSize: 12 }}
+            onClick={() => onOpenSettings?.()}
+          >
+            Settings
+          </button>
+          <button
+            style={{ padding: "2px 8px", fontSize: 12 }}
+            onClick={() => setShowForm(!showForm)}
+          >
+            {showForm ? "Cancel" : "+ New"}
+          </button>
+        </div>
       </div>
 
       {showForm && (

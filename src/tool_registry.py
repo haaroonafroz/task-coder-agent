@@ -16,9 +16,8 @@ Sparse vectors: BM25-style TF-IDF with per-skill keyword boost (keywords from
                 the "Keywords:" line in each skill block are repeated 2× in the
                 document token stream, raising their TF weight at retrieval time).
 
-Qdrant connection reads from .env:
-  QDRANT_URL, QDRANT_API_KEY, QDRANT_COLLECTION,
-  QDRANT_DENSE_VECTOR_NAME, QDRANT_SPARSE_VECTOR_NAME, QDRANT_DENSE_VECTOR_DIMS
+Qdrant defaults to an embedded local store under ``$TASK_CODER_HOME/qdrant``.
+Cloud / HTTP Qdrant remains available via settings ``qdrant.mode=http``.
 
 Usage:
     from src.tool_registry import DynamicToolRouter
@@ -29,6 +28,8 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 import re
@@ -36,35 +37,10 @@ from collections import Counter
 from pathlib import Path
 from typing import Optional
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv(Path(__file__).parent.parent / ".env", override=False)
-except ImportError:
-    pass
+from src.settings import get_settings, models_cache_path, qdrant_path, secrets_path
+from src.settings.store import _read_json
 
-# ---------------------------------------------------------------------------
-# Qdrant config (from .env)
-# ---------------------------------------------------------------------------
-QDRANT_URL  = os.getenv("QDRANT_URL", "")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
-COLLECTION  = os.getenv("QDRANT_COLLECTION", "agent_skills")
-DENSE_NAME  = os.getenv("QDRANT_DENSE_VECTOR_NAME", "dense")
-SPARSE_NAME = os.getenv("QDRANT_SPARSE_VECTOR_NAME", "sparse")
-DENSE_DIMS  = int(os.getenv("QDRANT_DENSE_VECTOR_DIMS", "768"))
-
-# ---------------------------------------------------------------------------
-# Embedding config (from .env)
-# ---------------------------------------------------------------------------
-HF_MODEL         = "BAAI/bge-base-en-v1.5"
-HF_QUERY_PREFIX  = "Represent this sentence for searching relevant passages: "
-HF_TOKEN         = os.getenv("HF_TOKEN", "")
-
-OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-OPENAI_EMBEDDING_DIMS  = int(os.getenv("OPENAI_EMBEDDING_DIMS", "768"))
-OPENAI_API_KEY         = os.getenv("OPENAI_API_KEY", "")
-
-# Keyword repetition factor for BM25 boost (keywords appear N extra times
-# in the document token stream to increase their term-frequency weight).
+HF_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 KEYWORD_BOOST = 2
 
 # ---------------------------------------------------------------------------
@@ -76,8 +52,6 @@ try:
         Distance,
         VectorParams,
         SparseVectorParams,
-        NamedVector,
-        NamedSparseVector,
         SparseVector,
         PointStruct,
     )
@@ -104,6 +78,13 @@ class DynamicToolRouter:
         self._encoder_backend: str = "none"  # "hf" | "openai" | "none"
         self._hf_model = None
         self._oai_client = None
+        self._qdrant_mode = "off"
+        self._qdrant_error: Optional[str] = None
+        self._collection = "agent_skills"
+        self._dense_name = "dense"
+        self._sparse_name = "sparse"
+        self._dense_dims = 768
+        self._skills_path: Optional[Path] = None
 
         # BM25 stats cache — populated once after indexing, invalidated on re-index
         self._vocab:    dict[str, int] = {}
@@ -121,24 +102,58 @@ class DynamicToolRouter:
     # Encoder initialisation (HuggingFace → OpenAI fallback)
     # ------------------------------------------------------------------
 
+    def _qdrant_cfg(self):
+        return get_settings().qdrant
+
+    def _embedding_cfg(self):
+        return get_settings().embeddings
+
+    def _secret(self, key: str) -> str:
+        return str(_read_json(secrets_path()).get(key, "") or "")
+
     def _init_encoder(self) -> None:
-        if _ST_AVAILABLE:
+        cfg = self._embedding_cfg()
+        backend = (cfg.backend or "auto").strip().lower()
+        if backend == "none":
+            print("[ToolRegistry] Embeddings disabled — using keyword-only fallback.")
+            self._encoder_backend = "none"
+            return
+
+        hf_token = self._secret("hf") or os.getenv("HF_TOKEN", "")
+        cache = models_cache_path() / "hf"
+        cache.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("HF_HOME", str(cache))
+
+        want_hf = backend in {"auto", "hf"}
+        want_openai = backend in {"auto", "openai"}
+
+        if want_hf and _ST_AVAILABLE:
             try:
                 self._hf_model = SentenceTransformer(
-                    HF_MODEL, token=HF_TOKEN or None
+                    cfg.hf_model, token=hf_token or None
                 )
                 self._encoder_backend = "hf"
-                print(f"[ToolRegistry] Encoder: HuggingFace {HF_MODEL} (768-dim, local)")
+                print(f"[ToolRegistry] Encoder: HuggingFace {cfg.hf_model} (768-dim, local)")
                 return
             except Exception as exc:
                 print(f"[ToolRegistry] HuggingFace encoder unavailable: {exc}")
+                if backend == "hf":
+                    self._encoder_backend = "none"
+                    return
 
-        if OPENAI_API_KEY:
+        openai_key = (
+            get_settings().provider("openai")
+            and get_settings().provider("openai").api_key
+        ) or (
+            get_settings().provider("gpt4o")
+            and get_settings().provider("gpt4o").api_key
+        ) or os.getenv("OPENAI_API_KEY", "")
+        if want_openai and openai_key:
             try:
                 from openai import OpenAI
-                self._oai_client = OpenAI(api_key=OPENAI_API_KEY)
+                self._oai_client = OpenAI(api_key=openai_key)
                 self._encoder_backend = "openai"
-                print(f"[ToolRegistry] Encoder: OpenAI {OPENAI_EMBEDDING_MODEL} (fallback)")
+                print(f"[ToolRegistry] Encoder: OpenAI {cfg.openai_model} (fallback)")
                 return
             except Exception as exc:
                 print(f"[ToolRegistry] OpenAI encoder unavailable: {exc}")
@@ -151,10 +166,11 @@ class DynamicToolRouter:
         if self._encoder_backend == "hf":
             return self._hf_model.encode(text, normalize_embeddings=True).tolist()
         if self._encoder_backend == "openai":
+            cfg = self._embedding_cfg()
             r = self._oai_client.embeddings.create(
-                model=OPENAI_EMBEDDING_MODEL,
+                model=cfg.openai_model,
                 input=text,
-                dimensions=OPENAI_EMBEDDING_DIMS,
+                dimensions=cfg.openai_dims,
             )
             return r.data[0].embedding
         return []
@@ -170,10 +186,11 @@ class DynamicToolRouter:
                 HF_QUERY_PREFIX + text, normalize_embeddings=True
             ).tolist()
         if self._encoder_backend == "openai":
+            cfg = self._embedding_cfg()
             r = self._oai_client.embeddings.create(
-                model=OPENAI_EMBEDDING_MODEL,
+                model=cfg.openai_model,
                 input=text,
-                dimensions=OPENAI_EMBEDDING_DIMS,
+                dimensions=cfg.openai_dims,
             )
             return r.data[0].embedding
         return []
@@ -183,34 +200,82 @@ class DynamicToolRouter:
     # ------------------------------------------------------------------
 
     def _init_qdrant(self) -> None:
+        cfg = self._qdrant_cfg()
+        self._qdrant_mode = cfg.mode
+        self._collection = cfg.collection or "agent_skills"
+        self._dense_name = cfg.dense_name or "dense"
+        self._sparse_name = cfg.sparse_name or "sparse"
+        self._dense_dims = int(cfg.dense_dims or 768)
+        if cfg.mode == "off":
+            print("[ToolRegistry] Qdrant disabled — keyword fallback active.")
+            return
         if not _QDRANT_AVAILABLE:
+            self._qdrant_error = "qdrant-client not installed"
             print("[ToolRegistry] qdrant-client not installed — vector search disabled.")
             return
-        if not QDRANT_URL:
-            print("[ToolRegistry] QDRANT_URL not set — vector search disabled.")
-            return
         try:
-            self._client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY or None)
+            if cfg.mode == "http":
+                if not cfg.url:
+                    raise RuntimeError("qdrant.mode=http but url is empty")
+                self._client = QdrantClient(
+                    url=cfg.url,
+                    api_key=cfg.api_key or None,
+                )
+                location = cfg.url
+            else:
+                path = cfg.path or str(qdrant_path())
+                Path(path).mkdir(parents=True, exist_ok=True)
+                self._client = QdrantClient(path=path)
+                location = path
             self._ensure_collection()
-            print(f"[ToolRegistry] Connected to Qdrant: {QDRANT_URL} | collection={COLLECTION}")
+            print(
+                f"[ToolRegistry] Connected to Qdrant ({cfg.mode}): {location} "
+                f"| collection={self._collection}"
+            )
         except Exception as exc:
+            self._qdrant_error = str(exc)
             print(f"[ToolRegistry] Qdrant connection failed: {exc} — keyword fallback active.")
             self._client = None
 
     def _ensure_collection(self) -> None:
         """Create the Qdrant collection only if it does not already exist."""
         existing = {c.name for c in self._client.get_collections().collections}
-        if COLLECTION not in existing:
+        if self._collection not in existing:
             self._client.create_collection(
-                collection_name=COLLECTION,
+                collection_name=self._collection,
                 vectors_config={
-                    DENSE_NAME: VectorParams(size=DENSE_DIMS, distance=Distance.COSINE),
+                    self._dense_name: VectorParams(
+                        size=self._dense_dims, distance=Distance.COSINE
+                    ),
                 },
                 sparse_vectors_config={
-                    SPARSE_NAME: SparseVectorParams(),
+                    self._sparse_name: SparseVectorParams(),
                 },
             )
-            print(f"[ToolRegistry] Created Qdrant collection '{COLLECTION}'.")
+            print(f"[ToolRegistry] Created Qdrant collection '{self._collection}'.")
+
+    def status(self) -> dict:
+        return {
+            "mode": self._qdrant_mode,
+            "reachable": self._client is not None,
+            "error": self._qdrant_error,
+            "encoder": self._encoder_backend,
+            "collection": self._collection,
+            "skill_count": len(self._skills),
+        }
+
+    def _skills_hash(self, file_path: Path) -> str:
+        digest = hashlib.sha256(file_path.read_bytes()).hexdigest()
+        return f"{digest}:{self._encoder_backend}:{self._collection}"
+
+    def _index_meta_path(self) -> Path:
+        cfg = self._qdrant_cfg()
+        root = Path(cfg.path or qdrant_path())
+        return root / "skills_index.json"
+
+    def _should_reindex(self, file_path: Path) -> bool:
+        meta = _read_json(self._index_meta_path())
+        return meta.get("hash") != self._skills_hash(file_path)
 
     # ------------------------------------------------------------------
     # Parsing & indexing
@@ -235,7 +300,9 @@ class DynamicToolRouter:
         Returns:
             Number of skills indexed.
         """
-        content = Path(file_path).read_text(encoding="utf-8")
+        path = Path(file_path)
+        self._skills_path = path
+        content = path.read_text(encoding="utf-8")
         blocks = re.findall(
             r"<!-- SKILL_START:\s*(\S+?)\s*-->(.*?)<!-- SKILL_END -->",
             content,
@@ -268,7 +335,7 @@ class DynamicToolRouter:
         self._rebuild_bm25_stats()
 
         # Upsert into Qdrant using the now-stable cached stats
-        if self._client and self._encoder_backend != "none":
+        if self._client and self._encoder_backend != "none" and self._should_reindex(path):
             points = []
             for skill in self._skills:
                 dense_vec = self._encode_doc(skill["raw_markdown"])
@@ -277,8 +344,8 @@ class DynamicToolRouter:
                     PointStruct(
                         id=skill["id"],
                         vector={
-                            DENSE_NAME: dense_vec,
-                            SPARSE_NAME: SparseVector(
+                            self._dense_name: dense_vec,
+                            self._sparse_name: SparseVector(
                                 indices=sparse_indices,
                                 values=sparse_values,
                             ),
@@ -291,7 +358,22 @@ class DynamicToolRouter:
                     )
                 )
             if points:
-                self._client.upsert(collection_name=COLLECTION, points=points)
+                try:
+                    self._client.upsert(collection_name=self._collection, points=points)
+                    meta_path = self._index_meta_path()
+                    meta_path.parent.mkdir(parents=True, exist_ok=True)
+                    meta_path.write_text(
+                        json.dumps({
+                            "hash": self._skills_hash(path),
+                            "count": len(points),
+                        }) + "\n",
+                        encoding="utf-8",
+                    )
+                except Exception as exc:
+                    print(f"[ToolRegistry] Qdrant upsert failed: {exc} — keyword fallback active.")
+                    self._qdrant_error = str(exc)
+        elif self._client and self._encoder_backend != "none":
+            print("[ToolRegistry] Skills index is current — skipping re-embed.")
 
         print(f"[ToolRegistry] Indexed {len(self._skills)} skills from {file_path}.")
         return len(self._skills)
@@ -371,15 +453,15 @@ class DynamicToolRouter:
         sparse_indices, sparse_values = self._bm25_query_vector(query_tokens)
 
         dense_hits = self._client.query_points(
-            collection_name=COLLECTION,
+            collection_name=self._collection,
             query=dense_vec,
-            using=DENSE_NAME,
+            using=self._dense_name,
             limit=top_k * 2,
         ).points
         sparse_hits = self._client.query_points(
-            collection_name=COLLECTION,
+            collection_name=self._collection,
             query=SparseVector(indices=sparse_indices, values=sparse_values),
-            using=SPARSE_NAME,
+            using=self._sparse_name,
             limit=top_k * 2,
         ).points
 
@@ -519,6 +601,26 @@ class DynamicToolRouter:
     # ------------------------------------------------------------------
     # Introspection helpers
     # ------------------------------------------------------------------
+
+    def close(self) -> None:
+        client = self._client
+        self._client = None
+        if client is None:
+            return
+        for closer in ("close", "stop"):
+            fn = getattr(client, closer, None)
+            if callable(fn):
+                try:
+                    fn()
+                    return
+                except Exception:
+                    pass
+        inner = getattr(client, "_client", None)
+        if inner is not None and hasattr(inner, "close"):
+            try:
+                inner.close()
+            except Exception:
+                pass
 
     def list_skills(self) -> list[str]:
         return [s["name"] for s in self._skills]

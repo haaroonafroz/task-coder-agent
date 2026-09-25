@@ -22,6 +22,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
 from src.llm_client import call_llm, ModelChoice, resolve_model_config
+from src.settings import get_settings
 from src.telemetry import span_llm_call, TelemetryContext
 from src.sandbox.commands import execute_contract
 from src.sandbox.context import get_sandbox_context
@@ -55,7 +56,6 @@ _CONFIG_DIR = _ROOT / "config"
 
 _VALIDATOR_MD = (_CONFIG_DIR / "validator.md").read_text()
 
-MAX_TOKENS_VALIDATOR = int(os.getenv("MAX_TOKENS_VALIDATOR", "48000"))
 MAX_RETRY_CYCLES     = 3
 
 
@@ -367,7 +367,7 @@ def run_validator(
     )
     with span_llm_call("validator", ms_id, span_model, session=session):
         result = call_llm(
-            prompt, model=model, max_tokens=MAX_TOKENS_VALIDATOR,
+            prompt, model=model, max_tokens=get_settings().roles.validator.max_tokens,
             json_mode=True, role="validator",
             stream_context=stream_context_for(
                 emitter,

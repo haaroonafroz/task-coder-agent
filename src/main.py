@@ -90,12 +90,12 @@ from src.decisions import save_pending_decision
 from src.agents.orchestrator import repair_plan_issues
 from src.agents.plan_lint import lint_plan
 from src.agents.mission_summary import build_mission_summary
+from src.settings import get_settings
 
 _CONFIG_DIR   = _ROOT / "config"
 _SKILLS_PATH  = _CONFIG_DIR / "skills.md"
 
 MAX_RETRY_CYCLES = 3
-MAX_REPLANS_PER_MILESTONE = int(os.getenv("MAX_REPLANS_PER_MILESTONE", "2"))
 _CORE_WORKER_TOOLS = (
     "read_file",
     "write_file",
@@ -865,10 +865,11 @@ class MissionsRuntime:
                     )
                     break
 
-                if replan_count >= MAX_REPLANS_PER_MILESTONE:
+                replan_budget = get_settings().runtime.max_replans_per_milestone
+                if replan_count >= replan_budget:
                     print(
                         f"  [Runtime] Replan budget exhausted for {ms_id} "
-                        f"({replan_count}/{MAX_REPLANS_PER_MILESTONE}). Halting."
+                        f"({replan_count}/{replan_budget}). Halting."
                     )
                     self._emitter.emit(
                         "milestone.failed",
@@ -2341,9 +2342,8 @@ def main() -> None:
     parser.add_argument("request", nargs="?", help="Coding request to execute")
     parser.add_argument(
         "--model",
-        choices=["auto", "local", "gemini", "gpt4o"],
-        default="local",
-        help="LLM backend to use (default: auto — tries local → gemini → gpt4o)",
+        default="auto",
+        help="LLM provider id or 'auto' (default: auto — walks configured fallbacks)",
     )
     parser.add_argument("--no-telemetry", action="store_true", help="Disable Arize Phoenix telemetry")
     parser.add_argument("--no-memory",    action="store_true", help="Disable Cognee memory layer")

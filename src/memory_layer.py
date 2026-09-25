@@ -40,10 +40,8 @@ _LEGACY_MEMORY_FILE = Path(__file__).parent.parent / "active_mission" / "memory_
 # Cognee is OPT-IN: it performs cloud-LLM graph extraction on every write,
 # which blocks the serial pipeline for tens of seconds per milestone and adds
 # token cost. The JSON store serves every read path in the runtime, so the
-# default backend is "json". Set MISSIONS_MEMORY_BACKEND=cognee to re-enable.
+# default backend is "json". Cognee is opt-in via settings.memory.backend.
 # ---------------------------------------------------------------------------
-_MEMORY_BACKEND = os.getenv("MISSIONS_MEMORY_BACKEND", "json").strip().lower()
-
 try:
     import cognee
     _COGNEE_INSTALLED = True
@@ -51,7 +49,14 @@ except ImportError:
     cognee = None  # type: ignore
     _COGNEE_INSTALLED = False
 
-_COGNEE_AVAILABLE = _COGNEE_INSTALLED and _MEMORY_BACKEND == "cognee"
+
+def _cognee_enabled() -> bool:
+    try:
+        from src.settings import get_settings
+        backend = get_settings().memory.backend
+    except Exception:
+        backend = os.getenv("MISSIONS_MEMORY_BACKEND", "json").strip().lower()
+    return _COGNEE_INSTALLED and backend == "cognee"
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +144,7 @@ class MissionMemory:
 
     def __init__(self, memory_file_path: Optional[Path] = None) -> None:
         self._memory_file = memory_file_path if memory_file_path is not None else _LEGACY_MEMORY_FILE
-        if _COGNEE_AVAILABLE:
+        if _cognee_enabled():
             self._backend = "cognee"
             print("[Memory] Cognee knowledge graph backend active.")
         else:
@@ -175,7 +180,7 @@ class MissionMemory:
             f"Status: {current_status}. "
             f"Metadata: {json.dumps(plan_meta)[:800]}."
         )
-        if _COGNEE_AVAILABLE:
+        if _cognee_enabled():
             try:
                 _submit_async(self._cognee_add_and_cognify(payload))
             except Exception as exc:
@@ -220,7 +225,7 @@ class MissionMemory:
         Returns:
             A string with known facts, or empty string if nothing found.
         """
-        if _COGNEE_AVAILABLE:
+        if _cognee_enabled():
             try:
                 result = _run_async(
                     self._cognee_search(
@@ -263,7 +268,7 @@ class MissionMemory:
             f"File {file_path} failed validation with error: {compile_error[:600]}. "
             f"Do not replicate this syntax or structure."
         )
-        if _COGNEE_AVAILABLE:
+        if _cognee_enabled():
             try:
                 _submit_async(self._cognee_add_and_cognify(payload))
             except Exception as exc:

@@ -25,12 +25,12 @@ Protocol notes (small-model optimised):
 
 from __future__ import annotations
 
-import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from src.llm_client import AgentRole, call_llm, ModelChoice, resolve_model_config
+from src.settings import get_settings
 from src.telemetry import span_llm_call, span_tool_call, TelemetryContext
 from src.tools import dispatch
 from src.tools.file_ops import get_created_files
@@ -71,21 +71,16 @@ _ROOT = Path(__file__).parent.parent.parent
 _CONFIG_DIR = _ROOT / "config"
 
 _WORKER_MD = (_CONFIG_DIR / "worker.md").read_text()
+_NON_JSON_RETRIES = 3
+MAX_BATCH_CALLS = 3
 
-MAX_TOKENS_WORKER     = int(os.getenv("MAX_TOKENS_WORKER", "12288"))
-MAX_WORKER_TOOL_CALLS = int(os.getenv("MAX_WORKER_TOOL_CALLS", "20"))
-MAX_BATCH_CALLS       = int(os.getenv("MAX_WORKER_BATCH_CALLS", "3"))
-MAX_HISTORY_TURNS     = int(os.getenv("MAX_WORKER_HISTORY_TURNS", "16"))
-AUTORUN_MAX           = int(os.getenv("WORKER_CONTRACT_AUTORUN_MAX", "8"))
-AUTORUN_STDOUT_CHARS  = int(os.getenv("WORKER_AUTORUN_STDOUT_CHARS", "600"))
-AUTORUN_STDERR_CHARS  = int(os.getenv("WORKER_AUTORUN_STDERR_CHARS", "400"))
-MAX_SAME_TOOL_FAILURES = int(os.getenv("MAX_SAME_TOOL_FAILURES", "2"))
-MAX_CONSECUTIVE_TOOL_FAILURES = int(
-    os.getenv("MAX_CONSECUTIVE_TOOL_FAILURES", "5")
-)
-_NON_JSON_RETRIES     = 3
-UI_NUDGE_AFTER = int(os.getenv("WORKER_UI_NUDGE_AFTER", "4"))
-UI_STRONG_NUDGE_AFTER = int(os.getenv("WORKER_UI_STRONG_NUDGE_AFTER", "8"))
+
+def _rt():
+    return get_settings().runtime
+
+
+def _worker_role():
+    return get_settings().roles.worker
 
 SEARCH_TOOLS_MD = """\
 ## Control tool: search_tools
@@ -157,8 +152,14 @@ def run_worker(
     """
     ms_id = milestone.get("id", "?")
     role_label = agent_role.upper()
-    tool_budget = max_tool_calls or MAX_WORKER_TOOL_CALLS
-    token_budget = max_tokens or MAX_TOKENS_WORKER
+    rt = _rt()
+    tool_budget = max_tool_calls or rt.max_worker_tool_calls
+    token_budget = max_tokens or _worker_role().max_tokens
+    batch_cap = rt.max_worker_batch_calls
+    history_turns = rt.max_worker_history_turns
+    autorun_max = rt.worker_contract_autorun_max
+    same_fail = rt.max_same_tool_failures
+    consec_fail = rt.max_consecutive_tool_failures
     profile_prompt = system_prompt or _WORKER_MD
     print(
         f"\n  [Phase 3] {role_label} — milestone {ms_id} "
@@ -213,7 +214,7 @@ def run_worker(
             + (_ui_worker_guidance_block() if is_ui_milestone else "")
             + SEARCH_TOOLS_MD
             + "Start now. Emit ONE JSON object (a tool call, a batch of up to "
-            f"{MAX_BATCH_CALLS} calls, complete, request_scope, or blocked)."
+            f"{batch_cap} calls, complete, request_scope, or blocked)."
         )
         conversation = [{"role": "user", "content": user_turn}]
 
@@ -259,7 +260,7 @@ def run_worker(
 
         # Safety valve only — the common path never trims, keeping the
         # rendered prompt append-only (prefix-cache friendly).
-        messages = trim_conversation(conversation, max_turns=MAX_HISTORY_TURNS)
+        messages = trim_conversation(conversation, max_turns=history_turns)
 
         span_model = (
             resolve_model_config(model, agent_role).model_name
@@ -486,16 +487,16 @@ def run_worker(
                 signature = tool_failure_signature(tool_name, tool_args, tool_result)
                 failure_counts[signature] = failure_counts.get(signature, 0) + 1
                 consecutive_failures += 1
-                if failure_counts[signature] >= MAX_SAME_TOOL_FAILURES:
+                if failure_counts[signature] >= same_fail:
                     breaker_reason = (
                         f"Repeated identical tool failure ({signature}) for "
                         f"`{tool_name}`. Do not retry the same call; use "
                         "search_tools or change the arguments."
                     )
                     break
-                if consecutive_failures >= MAX_CONSECUTIVE_TOOL_FAILURES:
+                if consecutive_failures >= consec_fail:
                     breaker_reason = (
-                        f"{MAX_CONSECUTIVE_TOOL_FAILURES} consecutive tool calls "
+                        f"{consec_fail} consecutive tool calls "
                         "failed. Stop guessing and request clarification."
                     )
                     break
@@ -605,7 +606,7 @@ def run_worker(
                 signature = tool_failure_signature(tool_name, tool_args, tool_result)
                 failure_counts[signature] = failure_counts.get(signature, 0) + 1
                 consecutive_failures += 1
-                if failure_counts[signature] >= MAX_SAME_TOOL_FAILURES:
+                if failure_counts[signature] >= same_fail:
                     if handoff_failure:
                         breaker_reason = None
                     else:
@@ -614,12 +615,12 @@ def run_worker(
                             f"`{tool_name}`. Do not retry the same call; use "
                             "search_tools or change the arguments."
                         )
-                elif consecutive_failures >= MAX_CONSECUTIVE_TOOL_FAILURES:
+                elif consecutive_failures >= consec_fail:
                     if handoff_failure:
                         breaker_reason = None
                     else:
                         breaker_reason = (
-                            f"{MAX_CONSECUTIVE_TOOL_FAILURES} consecutive tool calls "
+                            f"{consec_fail} consecutive tool calls "
                             "failed. Stop guessing and request clarification."
                         )
 
@@ -647,7 +648,7 @@ def run_worker(
             )
 
         # Harness-side contract auto-run: test feedback with zero LLM turns.
-        if wrote_files and autorun_count < AUTORUN_MAX:
+        if wrote_files and autorun_count < autorun_max:
             auto = _autorun_contract(contract, ms_id, emitter)
             if auto:
                 autorun_count += 1
@@ -741,9 +742,10 @@ def _extract_tool_calls(parsed: dict) -> tuple[list[dict], Optional[str], Option
         calls = [c for c in raw_calls if isinstance(c, dict)]
         if not calls:
             return [], 'The "calls" array must contain objects with "tool" and "args".', None
-        if len(calls) > MAX_BATCH_CALLS:
-            return calls[:MAX_BATCH_CALLS], None, (
-                f"NOTE: batch truncated to {MAX_BATCH_CALLS} calls — "
+        cap = _rt().max_worker_batch_calls
+        if len(calls) > cap:
+            return calls[:cap], None, (
+                f"NOTE: batch truncated to {cap} calls — "
                 "emit the remaining calls next turn."
             )
         return calls, None, None
@@ -789,8 +791,9 @@ def _autorun_contract(
             policy_denied=result.get("policy_denied", False),
         )
 
-    stdout_tail = (result.get("stdout", "") or "")[-AUTORUN_STDOUT_CHARS:]
-    stderr_tail = (result.get("stderr", "") or "")[-AUTORUN_STDERR_CHARS:]
+    rt = _rt()
+    stdout_tail = (result.get("stdout", "") or "")[-rt.worker_autorun_stdout_chars:]
+    stderr_tail = (result.get("stderr", "") or "")[-rt.worker_autorun_stderr_chars:]
     status_line = "PASS (exit 0)" if returncode == 0 else f"FAILING (exit {returncode})"
     return (
         f"## Auto-run of validation contract (harness, free feedback)\n"
@@ -980,16 +983,17 @@ def _ui_milestone_rules(ms: dict) -> str:
 
 
 def _ui_handoff_nudge(calls_since_write: int, total_ui_calls: int) -> str:
-    if total_ui_calls < UI_NUDGE_AFTER:
+    rt = _rt()
+    if total_ui_calls < rt.worker_ui_nudge_after:
         return ""
-    if calls_since_write >= UI_STRONG_NUDGE_AFTER:
+    if calls_since_write >= rt.worker_ui_strong_nudge_after:
         return (
             "## UI handoff reminder\n"
             "You have run many UI checks without changing code. Unless you are "
             "fixing a specific validator failure, signal `complete` now — the "
             "validator will run full browser smoke tests on its own server."
         )
-    if calls_since_write >= UI_NUDGE_AFTER:
+    if calls_since_write >= rt.worker_ui_nudge_after:
         return (
             "## UI handoff reminder\n"
             "Prefer targeted code fixes over repeated UI probes. When deliverables "

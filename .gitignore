@@ -1,5 +1,8 @@
 # Environment / secrets
 .env
+settings.json
+secrets.json
+qdrant/
 
 # Python
 *__pycache__*

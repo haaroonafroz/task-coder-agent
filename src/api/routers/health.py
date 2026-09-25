@@ -2,21 +2,39 @@
 
 from __future__ import annotations
 
-import os
-import socket
-
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends
 
 from src.api.deps import get_router, get_runtime
 from src.api.schemas import HealthResponse, ReadyResponse
-from src.llm_client import _ENDPOINTS
+from src.llm_client import probe_provider
+from src.sandbox.executor import _bwrap_available
+from src.settings import get_settings, resolve_home
 
 router = APIRouter(tags=["health"])
 
 
 @router.get("/health", response_model=HealthResponse)
-async def health() -> HealthResponse:
-    return HealthResponse(status="ok")
+async def health(router_obj=Depends(get_router)) -> HealthResponse:
+    settings = get_settings()
+    qdrant = {}
+    encoder = "none"
+    if hasattr(router_obj, "status"):
+        qdrant = router_obj.status()
+        encoder = qdrant.get("encoder", "none")
+    return HealthResponse(
+        status="ok",
+        home=str(resolve_home()),
+        qdrant=qdrant,
+        embeddings=encoder,
+        sandbox={
+            "executor": settings.runtime.sandbox.executor,
+            "mode": settings.runtime.sandbox.mode,
+            "bwrap": _bwrap_available(),
+            "require_bwrap": settings.runtime.sandbox.require_bwrap,
+            "jail": "bwrap" if _bwrap_available() else "policy-only",
+        },
+        providers_configured=len(settings.enabled_providers()),
+    )
 
 
 @router.get("/ready", response_model=ReadyResponse)
@@ -24,36 +42,42 @@ async def ready(
     runtime=Depends(get_runtime),
     router_obj=Depends(get_router),
 ) -> ReadyResponse:
-    """Check LLM endpoint reachability and Qdrant connection."""
+    """Check configured LLM providers and Qdrant — not every vendor on earth."""
     checks: dict[str, dict] = {}
+    settings = get_settings()
 
-    # LLM backends — TCP probe of each base_url host:port.
-    for key, cfg in _ENDPOINTS.items():
-        url = cfg.get("base_url", "")
-        reachable = False
-        err = None
-        try:
-            from urllib.parse import urlparse
-            parsed = urlparse(url)
-            host = parsed.hostname or "localhost"
-            port = parsed.port or (443 if parsed.scheme == "https" else 80)
-            with socket.create_connection((host, port), timeout=2):
-                reachable = True
-        except Exception as exc:  # noqa: BLE001
-            err = str(exc)
-        checks[key] = {"reachable": reachable, "error": err}
+    for provider in settings.enabled_providers():
+        ok, models, err = probe_provider(provider.base_url, provider.api_key, timeout=3.0)
+        checks[provider.id] = {
+            "reachable": ok,
+            "error": err,
+            "models": models[:8],
+        }
 
-    # Qdrant — router exposes the client.
     qdrant_ok = False
     qdrant_err = None
+    qdrant_mode = settings.qdrant.mode
     try:
-        client = getattr(router_obj, "_client", None)
-        if client is not None:
-            client.get_collections()
+        if qdrant_mode == "off":
             qdrant_ok = True
+            qdrant_err = "disabled (keyword fallback)"
+        else:
+            client = getattr(router_obj, "_client", None)
+            if client is not None:
+                client.get_collections()
+                qdrant_ok = True
+            else:
+                qdrant_err = getattr(router_obj, "_qdrant_error", None) or "not connected"
     except Exception as exc:  # noqa: BLE001
         qdrant_err = str(exc)
-    checks["qdrant"] = {"reachable": qdrant_ok, "error": qdrant_err}
+    checks["qdrant"] = {
+        "reachable": qdrant_ok,
+        "error": qdrant_err,
+        "mode": qdrant_mode,
+    }
 
-    ready_all = all(c.get("reachable") for c in checks.values())
+    llm_ok = True
+    if settings.enabled_providers():
+        llm_ok = any(c.get("reachable") for k, c in checks.items() if k != "qdrant")
+    ready_all = llm_ok and qdrant_ok
     return ReadyResponse(ready=ready_all, checks=checks)

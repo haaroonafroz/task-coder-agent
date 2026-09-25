@@ -14,6 +14,7 @@ from src.evals.store import load_report, save_report
 from src.evals.types import SessionEvalReport
 from src.llm_client import ModelChoice
 from src.session import SessionContext
+from src.settings import get_settings
 from src.telemetry import telemetry_context_from_session
 
 if TYPE_CHECKING:
@@ -21,11 +22,11 @@ if TYPE_CHECKING:
 
 
 def auto_eval_enabled() -> bool:
-    return os.getenv("MISSIONS_AUTO_EVAL", "false").strip().lower() == "true"
+    return bool(get_settings().observability.auto_eval)
 
 
 def phoenix_eval_export_enabled() -> bool:
-    return os.getenv("MISSIONS_EVAL_PHOENIX_EXPORT", "true").strip().lower() == "true"
+    return bool(get_settings().observability.eval_phoenix_export)
 
 
 def run_session_evals(

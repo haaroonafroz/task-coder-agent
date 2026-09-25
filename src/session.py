@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from src.llm_client import ModelChoice
+from src.settings import resolve_home
 from src.workspace.models import WorkspaceBinding
 from src.workspace.service import WorkspaceService, default_managed_root
 
@@ -41,11 +42,8 @@ _ROOT = Path(__file__).parent.parent
 
 
 def get_default_sessions_root() -> Path:
-    """Keep repository-local state by default, with an optional home override."""
-    task_coder_home = os.getenv("TASK_CODER_HOME", "").strip()
-    if task_coder_home:
-        return Path(task_coder_home).expanduser() / "sessions"
-    return _ROOT / "sessions"
+    """Session state lives under ``$TASK_CODER_HOME/sessions``."""
+    return resolve_home() / "sessions"
 
 
 _SESSIONS_ROOT = get_default_sessions_root()

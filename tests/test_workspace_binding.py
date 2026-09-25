@@ -129,7 +129,10 @@ def test_read_only_external_binding_denies_direct_file_writes(tmp_path: Path) ->
     assert not (project / "new.py").exists()
 
 
-def test_external_commands_fail_closed_without_bubblewrap(tmp_path: Path) -> None:
+def test_external_commands_fail_closed_without_bubblewrap(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("SANDBOX_REQUIRE_BWRAP", "true")
+    from src.settings.store import reset_settings
+    reset_settings()
     project = tmp_path / "project"
     project.mkdir()
     manager = SessionManager(tmp_path / "sessions")
@@ -148,6 +151,30 @@ def test_external_commands_fail_closed_without_bubblewrap(tmp_path: Path) -> Non
 
     assert result["success"] is False
     assert result["sandbox_denied"] is True
+
+
+def test_external_commands_run_natively_when_bwrap_not_required(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("SANDBOX_REQUIRE_BWRAP", "false")
+    from src.settings.store import reset_settings
+    reset_settings()
+    project = tmp_path / "project"
+    project.mkdir()
+    manager = SessionManager(tmp_path / "sessions")
+    session = manager.create_session(
+        "external",
+        workspace_kind="external",
+        workspace_path=str(project),
+    )
+    ctx = sandbox_from_session(session)
+    ctx.ensure_dirs()
+
+    result = SubprocessExecutor(ExecutorBackend.NATIVE).run_argv(
+        ["python", "--version"],
+        ctx=ctx,
+    )
+
+    assert result.get("sandbox_denied") is not True
+    assert result["success"] is True or result["returncode"] == 0
 
 
 def test_external_workspace_is_never_auto_committed(tmp_path: Path) -> None:

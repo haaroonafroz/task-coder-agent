@@ -135,14 +135,16 @@ def start_server(
     if sandbox is None:
         return {"success": False, "error": "No active sandbox context"}
     if getattr(sandbox, "sandbox_required", False) is True:
-        return {
-            "success": False,
-            "error": (
-                "Managed development servers are disabled for external workspaces "
-                "until they can run inside the required process sandbox."
-            ),
-            "sandbox_denied": True,
-        }
+        from src.sandbox.executor import _bwrap_available, _bwrap_required
+        if _bwrap_required() and not _bwrap_available():
+            return {
+                "success": False,
+                "error": (
+                    "Managed development servers are disabled for external "
+                    "workspaces when bubblewrap is required but unavailable."
+                ),
+                "sandbox_denied": True,
+            }
     _prune_dead_servers()
     if len(_PROCESSES) >= _MAX_SERVERS:
         return {

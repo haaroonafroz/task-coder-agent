@@ -2,42 +2,45 @@
 
 from __future__ import annotations
 
-import socket
-from urllib.parse import urlparse
-
 from fastapi import APIRouter, HTTPException
 
 from src.api.schemas import ModelInfo
-from src.llm_client import get_model_catalog
+from src.llm_client import get_model_catalog, probe_provider
+from src.settings import get_settings
 
 router = APIRouter(prefix="/models", tags=["models"])
 
 
-def _probe(url: str) -> tuple[bool, str | None]:
-    """TCP probe a base_url; return (reachable, error)."""
-    if not url:
-        return True, None
-    try:
-        parsed = urlparse(url)
-        host = parsed.hostname or "localhost"
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        with socket.create_connection((host, port), timeout=2):
-            return True, None
-    except Exception as exc:  # noqa: BLE001
-        return False, str(exc)
-
-
-def _to_model_info(entry: dict) -> ModelInfo:
-    reachable, err = _probe(entry.get("base_url", ""))
+def _to_model_info(entry: dict, *, probe: bool = True) -> ModelInfo:
+    discovered: list[str] = []
+    err = None
+    available = True
+    if entry["key"] == "auto":
+        available = bool(get_settings().fallback_ids())
+        if not available:
+            err = "No providers configured"
+    elif probe:
+        provider = get_settings().provider(entry["key"])
+        api_key = provider.api_key if provider else ""
+        ok, discovered, probe_err = probe_provider(
+            entry.get("base_url", ""), api_key, timeout=3.0
+        )
+        available = ok
+        err = probe_err
     return ModelInfo(
         key=entry["key"],
         model=entry.get("model", ""),
         base_url=entry.get("base_url", ""),
-        available=reachable if entry["key"] != "auto" else True,
+        available=available,
         error=err,
         models_by_role=entry.get("models_by_role", {}),
         thinking_by_role=entry.get("thinking_by_role", {}),
         context_length=entry.get("context_length"),
+        label=entry.get("label"),
+        adapter=entry.get("adapter"),
+        enabled=entry.get("enabled", True),
+        api_key_set=entry.get("api_key_set", False),
+        discovered_models=discovered,
     )
 
 

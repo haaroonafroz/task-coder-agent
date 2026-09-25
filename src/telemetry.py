@@ -23,25 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv(Path(__file__).parent.parent / ".env", override=False)
-except ImportError:
-    pass
-
-# ---------------------------------------------------------------------------
-# Read .env values
-# ---------------------------------------------------------------------------
-
-def _strip_protocol(host: str) -> str:
-    """Remove http:// or https:// prefix so the host is bare (e.g. 127.0.0.1)."""
-    return host.replace("https://", "").replace("http://", "").rstrip("/")
-
-
-_PHOENIX_HOST_RAW  = os.getenv("PHOENIX_HOST", "127.0.0.1")
-_PHOENIX_HOST      = _strip_protocol(_PHOENIX_HOST_RAW)
-_PHOENIX_PORT      = int(os.getenv("PHOENIX_PORT", "6006"))
-_PHOENIX_EXTERNAL  = os.getenv("PHOENIX_EXTERNAL", "false").strip().lower() == "true"
+from src.settings import get_settings
 
 _TRACER_NAME = "task-coder-agent"
 
@@ -121,10 +103,15 @@ def telemetry_context_from_session(session) -> Optional[TelemetryContext]:
     )
 
 
+def _strip_protocol(host: str) -> str:
+    """Remove http:// or https:// prefix so the host is bare (e.g. 127.0.0.1)."""
+    return host.replace("https://", "").replace("http://", "").rstrip("/")
+
+
 def initialize_observability(
-    host: str = _PHOENIX_HOST,
-    port: int = _PHOENIX_PORT,
-    external: bool = _PHOENIX_EXTERNAL,
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+    external: Optional[bool] = None,
     console_fallback: bool = True,
 ) -> Optional[object]:
     """
@@ -152,6 +139,15 @@ def initialize_observability(
         The Phoenix session object, or None if Phoenix is not available.
     """
     global _tracer_provider
+    obs = get_settings().observability
+    if host is None:
+        host = _strip_protocol(obs.phoenix_host)
+    else:
+        host = _strip_protocol(host)
+    if port is None:
+        port = obs.phoenix_port
+    if external is None:
+        external = obs.phoenix_external
 
     if not _OTEL_AVAILABLE:
         print("[Telemetry] opentelemetry-sdk not installed — observability disabled.")

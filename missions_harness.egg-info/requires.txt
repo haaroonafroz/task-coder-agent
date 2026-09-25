@@ -1,40 +1,24 @@
 openai>=1.30.0
-
 arize-phoenix>=4.0.0
 opentelemetry-sdk>=1.24.0
 opentelemetry-exporter-otlp-proto-http>=1.24.0
 openinference-instrumentation-openai>=0.1.12
-
-#   Primary encoder  : BAAI/bge-base-en-v1.5 (768-dim, local, via sentence-transformers)
-#   Fallback encoder : OpenAI text-embedding-3-small (768-dim, cloud)
-#   Vector store     : Qdrant Cloud (qdrant-client with HTTP API)
-
-# Python client for Qdrant 1.18.x (no 1.18.2 client on PyPI; server 1.18.2 is compatible)
 qdrant-client==1.18.0
 sentence-transformers>=3.0.0
-
 cognee>=0.1.15
-
 langgraph>=0.2.0
 langchain-core>=0.2.0
-
 pandas>=2.2.0
-numpy>=1.26.0,<2.0.0
+numpy<2.0.0,>=1.26.0
 scipy>=1.13.0
-
 matplotlib>=3.9.0
-
 flake8>=7.0.0
 black>=24.0.0
-
 pytest>=8.0.0
-
 huggingface_hub>=0.23.0
-
 tqdm>=4.66.0
 python-dotenv>=1.0.0
 json-repair>=0.30.0
-
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 pydantic>=2.6.0

@@ -1,0 +1,2 @@
+[console_scripts]
+missions = src.cli:main

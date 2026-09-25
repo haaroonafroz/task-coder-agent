@@ -1,3 +1,38 @@
+Metadata-Version: 2.4
+Name: missions-harness
+Version: 1.0.0
+Summary: Serial multi-agent coding harness with a local-first control UI.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: openai>=1.30.0
+Requires-Dist: arize-phoenix>=4.0.0
+Requires-Dist: opentelemetry-sdk>=1.24.0
+Requires-Dist: opentelemetry-exporter-otlp-proto-http>=1.24.0
+Requires-Dist: openinference-instrumentation-openai>=0.1.12
+Requires-Dist: qdrant-client==1.18.0
+Requires-Dist: sentence-transformers>=3.0.0
+Requires-Dist: cognee>=0.1.15
+Requires-Dist: langgraph>=0.2.0
+Requires-Dist: langchain-core>=0.2.0
+Requires-Dist: pandas>=2.2.0
+Requires-Dist: numpy<2.0.0,>=1.26.0
+Requires-Dist: scipy>=1.13.0
+Requires-Dist: matplotlib>=3.9.0
+Requires-Dist: flake8>=7.0.0
+Requires-Dist: black>=24.0.0
+Requires-Dist: pytest>=8.0.0
+Requires-Dist: huggingface_hub>=0.23.0
+Requires-Dist: tqdm>=4.66.0
+Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: json-repair>=0.30.0
+Requires-Dist: fastapi>=0.110.0
+Requires-Dist: uvicorn[standard]>=0.29.0
+Requires-Dist: pydantic>=2.6.0
+Requires-Dist: python-multipart>=0.0.9
+Requires-Dist: playwright>=1.49.0
+Dynamic: license-file
+
 # Missions Architecture — Self-Improving Multi-Agent Coding Runtime
 
 A serial multi-agent system for building software with **small local LLMs**. A

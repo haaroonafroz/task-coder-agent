@@ -234,6 +234,11 @@ class ModelInfo(BaseModel):
     models_by_role: dict[str, str] = Field(default_factory=dict)
     thinking_by_role: dict[str, str] = Field(default_factory=dict)
     context_length: Optional[int] = None
+    label: Optional[str] = None
+    adapter: Optional[str] = None
+    enabled: bool = True
+    api_key_set: bool = False
+    discovered_models: list[str] = Field(default_factory=list)
 
 
 class ToolParamSchema(BaseModel):
@@ -274,6 +279,11 @@ class UploadResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str  # "ok" | "degraded"
     version: str = "1"
+    home: str = ""
+    qdrant: dict[str, Any] = Field(default_factory=dict)
+    embeddings: str = "none"
+    sandbox: dict[str, Any] = Field(default_factory=dict)
+    providers_configured: int = 0
 
 
 class ReadyResponse(BaseModel):
@@ -305,3 +315,31 @@ class SessionEvalReportResponse(BaseModel):
     event_count: int
     deterministic_only: bool = True
     weights: dict[str, float] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+class SettingsResponse(BaseModel):
+    settings: dict[str, Any]
+    home: str
+    presets: list[dict[str, Any]] = Field(default_factory=list)
+    migrated_from_env: bool = False
+    container: bool = False
+
+
+class SettingsUpdate(BaseModel):
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProviderProbeRequest(BaseModel):
+    base_url: str
+    api_key: Optional[str] = None
+    provider_id: Optional[str] = None
+
+
+class ProviderProbeResponse(BaseModel):
+    ok: bool
+    models: list[str] = Field(default_factory=list)
+    error: Optional[str] = None

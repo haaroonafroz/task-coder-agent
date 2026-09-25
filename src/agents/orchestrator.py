@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from src.llm_client import call_llm, ModelChoice, resolve_model_config
+from src.settings import get_settings
 from src.telemetry import span_llm_call, TelemetryContext
 from src.agents.utils import parse_json_from_text, validate_plan_payload
 from src.agents.plan_ops import apply_plan_patch, PlanPatchError
@@ -47,7 +48,6 @@ _LEGACY_PLAN_PATH = _LEGACY_MISSION_DIR / "plan.json"
 
 _ORCHESTRATOR_MD = (_CONFIG_DIR / "orchestrator.md").read_text()
 
-MAX_TOKENS_ORCHESTRATOR = int(os.getenv("MAX_TOKENS_ORCHESTRATOR", "24576"))
 _JSON_CORRECTION_ATTEMPTS = 2
 
 
@@ -89,7 +89,7 @@ def _call_json_with_correction(
     for attempt in range(1 + _JSON_CORRECTION_ATTEMPTS):
         with span_llm_call(span_name, span_label, span_model, session=session):
             result = call_llm(
-                prompt, model=model, max_tokens=MAX_TOKENS_ORCHESTRATOR,
+                prompt, model=model, max_tokens=get_settings().roles.orchestrator.max_tokens,
                 json_mode=True, role=role,  # type: ignore[arg-type]
                 stream_context=stream_context_for(
                     emitter,

@@ -15,6 +15,7 @@ from src.agents.tool_diagnostics import compact_tool_result, event_diagnostics
 from src.agents.utils import parse_agent_turn, trim_conversation
 from src.events import EventEmitter
 from src.llm_client import ModelChoice, call_llm, resolve_model_config
+from src.settings import get_settings
 from src.run_control import ensure_not_cancelled
 from src.telemetry import TelemetryContext, span_llm_call, span_tool_call
 from src.tools import dispatch
@@ -35,8 +36,7 @@ _REVIEW_TOOLS = frozenset({
     "run_shellscript",
 })
 
-MAX_REVIEW_TOOL_CALLS = int(os.getenv("MAX_REVIEW_TOOL_CALLS", "12"))
-MAX_TOKENS_REVIEWER = int(os.getenv("MAX_TOKENS_REVIEWER", "16384"))
+from src.settings import get_settings
 _NON_JSON_RETRIES = 4
 _MAX_BATCH = 3
 
@@ -82,6 +82,8 @@ def run_code_review(
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> ReviewReport:
     """Inspect code with read-only tools and return a normalized report."""
+    review_budget = get_settings().runtime.max_review_tool_calls
+    review_tokens = get_settings().roles.reviewer.max_tokens
     orientation = build_workspace_orientation(
         workspace_root, user_request, previous_plan
     )
@@ -109,7 +111,7 @@ def run_code_review(
     if emitter:
         emitter.emit("review.started", phase=phase)
 
-    while tool_calls < MAX_REVIEW_TOOL_CALLS:
+    while tool_calls < review_budget:
         ensure_not_cancelled(cancel_check)
         span_model = (
             resolve_model_config(model, "reviewer").model_name
@@ -120,7 +122,7 @@ def run_code_review(
             result = call_llm(
                 messages=trim_conversation(conversation, max_turns=16),
                 model=model,
-                max_tokens=MAX_TOKENS_REVIEWER,
+                max_tokens=review_tokens,
                 system_prompt=_CODE_REVIEW_MD,
                 json_mode=True,
                 role="reviewer",
@@ -229,7 +231,7 @@ def run_code_review(
                 f"Tool result for `{tool_name}`:\n```json\n"
                 f"{compact_tool_result(tool_result)}\n```"
             )
-            if tool_calls >= MAX_REVIEW_TOOL_CALLS:
+            if tool_calls >= review_budget:
                 break
 
         feedback = "\n\n".join(outputs)
@@ -246,7 +248,7 @@ def run_code_review(
         ])
 
     raise RuntimeError(
-        f"Code Review exhausted {MAX_REVIEW_TOOL_CALLS} read-only tool calls "
+        f"Code Review exhausted {review_budget} read-only tool calls "
         "without returning a report."
     )
 
