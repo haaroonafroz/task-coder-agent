@@ -18,19 +18,21 @@ from src.llm_client import ModelChoice, call_llm, resolve_model_config
 from src.run_control import ensure_not_cancelled
 from src.telemetry import TelemetryContext, span_llm_call, span_tool_call
 from src.tools import dispatch
-from src.tools.tool_contracts import validate_tool_call
+from src.tools.tool_contracts import normalize_tool_args, validate_tool_call
 
 _CONFIG_DIR = Path(__file__).parent.parent.parent / "config"
 _CODE_REVIEW_MD = (_CONFIG_DIR / "code_review.md").read_text(encoding="utf-8")
 
 _REVIEW_TOOLS = frozenset({
     "project_info",
+    "probe_dependency",
     "list_directory",
     "search_grep",
     "read_file",
     "git_diff",
     "view_git_log",
     "run_checks",
+    "run_shellscript",
 })
 
 MAX_REVIEW_TOOL_CALLS = int(os.getenv("MAX_REVIEW_TOOL_CALLS", "12"))
@@ -41,11 +43,14 @@ _MAX_BATCH = 3
 _TOOLS_MD = """\
 ## Read-only tools
 
-Use only: project_info, list_directory, search_grep, read_file, git_diff,
-view_git_log, run_checks.
+Use only: project_info, probe_dependency, list_directory, search_grep, read_file,
+git_diff, view_git_log, run_checks, run_shellscript.
 
 Search before reading large files. You cannot write, patch, install, commit, or
-start services.
+start services. run_shellscript uses the read-only `review` profile: dependency
+presence probes (`python -c` with importlib find_spec, `python -m pip show/list`),
+`git status/diff/log`, `rg`, and listing only. Use probe_dependency first instead
+of importing heavy packages directly.
 
 ### Tool call format (required)
 
@@ -177,7 +182,7 @@ def run_code_review(
         outputs: list[str] = []
         for call in calls:
             tool_name = str(call.get("tool", "") or "")
-            args = call.get("args", {}) or {}
+            args = normalize_tool_args(tool_name, call.get("args", {}) or {})
             reasoning = str(call.get("reasoning", "") or "")
             if tool_name not in _REVIEW_TOOLS:
                 tool_result = {

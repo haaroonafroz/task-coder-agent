@@ -94,6 +94,30 @@ class MessageCreate(BaseModel):
     model: Optional[ModelChoice] = None
     run_kind: Literal["auto", "new", "resume", "repair"] = "auto"
     execution_route: ExecutionRoute = "auto"
+    review_fix_mode: Literal["auto", "ask"] = "ask"
+
+
+class PendingDecisionResponse(BaseModel):
+    type: str
+    title: str
+    summary: str
+    options: list[str] = Field(default_factory=list)
+    session_id: str
+    created_at: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class DecisionCreate(BaseModel):
+    action: Literal[
+        "apply_fix", "dismiss", "escalate_mission", "run_smoke", "setup_env"
+    ]
+
+
+class DecisionResolveResponse(BaseModel):
+    action: str
+    session_id: str
+    run_id: Optional[str] = None
+    detail: str = ""
 
 
 class MessageResponse(BaseModel):
@@ -115,13 +139,14 @@ class RunCreate(BaseModel):
     model: Optional[ModelChoice] = None
     run_kind: Literal["auto", "new", "resume", "repair"] = "auto"
     execution_route: ExecutionRoute = "auto"
+    review_fix_mode: Literal["auto", "ask"] = "ask"
 
 
 class RunResponse(BaseModel):
     run_id: str
     session_id: str
     request: str
-    status: str  # queued | running | completed | partial | failed | error | cancelled
+    status: str  # queued | running | completed | partial | failed | error | cancelled | awaiting_decision
     model: str
     queued_at: str
     started_at: Optional[str] = None
@@ -131,6 +156,7 @@ class RunResponse(BaseModel):
     run_kind: str = "auto"
     execution_route: str = "auto"
     plan_id: Optional[str] = None
+    review_fix_mode: str = "ask"
 
 
 # ---------------------------------------------------------------------------

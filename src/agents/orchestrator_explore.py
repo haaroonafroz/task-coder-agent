@@ -15,7 +15,7 @@ from src.events import EventEmitter
 from src.llm_client import ModelChoice, call_llm, resolve_model_config
 from src.telemetry import span_llm_call, span_tool_call, TelemetryContext
 from src.tools import dispatch
-from src.tools.tool_contracts import validate_tool_call
+from src.tools.tool_contracts import normalize_tool_args, validate_tool_call
 from src.agents.llm_stream_events import stream_context_for
 
 _ORCHESTRATOR_READ_TOOLS = frozenset({
@@ -205,6 +205,14 @@ def run_orchestration_explore(
             f"```json\n{json.dumps(previous_plan, indent=2)[:8000]}\n```\n\n"
         )
     if triage_report:
+        brief_text = triage_report.get("escalation_brief_text")
+        if brief_text:
+            user_turn += (
+                "## Escalation Brief (authoritative — verified earlier this run)\n"
+                f"{brief_text}\n\n"
+                "Treat the brief as established fact. Do not re-derive its "
+                "findings; plan the remaining work.\n\n"
+            )
         user_turn += (
             "## Read-only Triage Report\n"
             f"```json\n{json.dumps(triage_report, indent=2)[:8000]}\n```\n\n"
@@ -296,7 +304,7 @@ def run_orchestration_explore(
         batch_results: list[str] = []
         for call in calls:
             tool_name = str(call.get("tool", "") or "")
-            tool_args = call.get("args", {}) or {}
+            tool_args = normalize_tool_args(tool_name, call.get("args", {}) or {})
             reasoning = str(call.get("reasoning", "") or "")
 
             if tool_name not in _ORCHESTRATOR_READ_TOOLS:

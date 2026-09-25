@@ -30,6 +30,7 @@ async def create_run(
         model=body.model,
         run_kind=body.run_kind,
         execution_route=body.execution_route,
+        review_fix_mode=body.review_fix_mode,
     )
     return RunResponse(**rec.to_dict())
 

@@ -227,6 +227,14 @@ def run_orchestration(
         if orientation_block:
             prompt += f"{orientation_block}\n\n"
         if triage_report:
+            brief_text = triage_report.get("escalation_brief_text")
+            if brief_text:
+                prompt += (
+                    "## Escalation Brief (authoritative — verified earlier this run)\n"
+                    f"{brief_text}\n\n"
+                    "Treat the brief as established fact. Do not re-derive its "
+                    "findings; plan the remaining work.\n\n"
+                )
             prompt += (
                 "## Read-only Triage Report\n"
                 f"```json\n{json.dumps(triage_report, indent=2)[:12000]}\n```\n\n"

@@ -60,6 +60,39 @@ class SandboxContext:
         if self.workspace_kind == "managed":
             self.workspace_root.mkdir(parents=True, exist_ok=True)
 
+    def ensure_project_venv(self, *, with_pip: bool = True) -> Path:
+        """Ensure a venv *inside* the attached external project; bind to it.
+
+        Reuse order: already-bound project venv → ``<root>/.venv`` →
+        ``<root>/venv`` → create ``<root>/.venv``. The context is updated in
+        place so dependency checks and installs in the same run immediately
+        see the project interpreter. Managed sessions never reach here.
+        """
+        import subprocess
+
+        if self.workspace_kind != "external":
+            return self.ensure_venv()
+        if self.workspace_mode == "read_only":
+            raise RuntimeError(
+                "Cannot create or use a project venv for a read-only workspace"
+            )
+        if self.uses_project_environment and self.venv_python.exists():
+            return self.venv_python
+        for name in (".venv", "venv"):
+            candidate = self.workspace_root / name / "bin" / "python"
+            if candidate.is_file():
+                self.venv_path = candidate.parent.parent
+                self.uses_project_environment = True
+                return candidate
+        venv_path = self.workspace_root / ".venv"
+        argv = [str(self._system_python()), "-m", "venv", str(venv_path)]
+        if not with_pip:
+            argv.append("--without-pip")
+        subprocess.run(argv, check=True, capture_output=True, text=True)
+        self.venv_path = venv_path
+        self.uses_project_environment = True
+        return self.venv_python
+
     def ensure_venv(self) -> Path:
         """Create session-local venv if missing; return python path."""
         import subprocess

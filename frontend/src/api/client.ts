@@ -17,6 +17,9 @@ import type {
   ExecutionRoute,
   ModelChoice,
   RunKind,
+  ReviewFixMode,
+  DecisionAction,
+  PendingDecision,
   WorkspaceScope,
   WorkspaceAccessMode,
   WorkspaceKind,
@@ -95,6 +98,7 @@ export const api = {
       model?: ModelChoice;
       run_kind?: RunKind;
       execution_route?: ExecutionRoute;
+      review_fix_mode?: ReviewFixMode;
     }
   ): Promise<Message> {
     return req(`/sessions/${sid}/messages`, {
@@ -115,6 +119,27 @@ export const api = {
 
   cancelRun(sid: string, rid: string): Promise<Run> {
     return req(`/sessions/${sid}/runs/${rid}/cancel`, { method: "POST" });
+  },
+
+  // ---- HITL decisions ----
+
+  async getDecision(sid: string): Promise<PendingDecision | null> {
+    try {
+      return await req(`/sessions/${sid}/decisions`);
+    } catch (e) {
+      if (String(e).includes("API 404")) return null;
+      throw e;
+    }
+  },
+
+  resolveDecision(
+    sid: string,
+    action: DecisionAction
+  ): Promise<{ action: string; session_id: string; run_id: string | null; detail: string }> {
+    return req(`/sessions/${sid}/decisions`, {
+      method: "POST",
+      body: JSON.stringify({ action }),
+    });
   },
 
   // ---- Plan ----

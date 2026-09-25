@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -78,10 +79,14 @@ from src.agents import (
 )
 from src.agents.contracts import (
     RouteDecision,
+    build_mission_brief,
     hotfix_milestone_from_review,
     hotfix_milestone_from_route,
     normalize_route_decision,
 )
+from src.agents.escalation import deterministic_guard, run_escalation_triage
+from src.agents.fix_verifier import run_fix_verification
+from src.decisions import save_pending_decision
 from src.agents.orchestrator import repair_plan_issues
 from src.agents.plan_lint import lint_plan
 from src.agents.mission_summary import build_mission_summary
@@ -100,6 +105,7 @@ _CORE_WORKER_TOOLS = (
     "run_pytest",
     "run_linter",
     "project_info",
+    "probe_dependency",
     "run_checks",
 )
 _UI_HINTS = ("frontend", "react", "vite", "streamlit", "browser", "web app")
@@ -181,6 +187,54 @@ def _is_test_milestone(milestone: dict) -> bool:
     )
 
 
+def _normalize_failure_signature(errors: list, fix_guidance: str = "") -> str:
+    """Reduce a FAIL verdict to a stable signature for repeat detection.
+
+    Line numbers, memory addresses, and absolute paths change cosmetically
+    between identical failures — normalize them away so only a genuinely
+    different error produces a different signature. Empty errors yield ""
+    (never trips the breaker).
+    """
+    if not errors:
+        return ""
+    text = " | ".join(str(e) for e in errors)
+    if fix_guidance:
+        text += " || " + str(fix_guidance)[:300]
+    text = text.lower()
+    text = re.sub(r"0x[0-9a-f]+", "0x#", text)
+    text = re.sub(r"[\\/][\w.\-~]+(?:[\\/][\w.\-~]+)+", "<path>", text)
+    text = re.sub(r"\d+", "#", text)
+    return " ".join(text.split())
+
+
+def _map_fix_verification(
+    verification: dict[str, Any],
+) -> tuple[str, list[str], str]:
+    """Map a FixVerifier verdict onto the worker retry loop.
+
+    Returns (loop_verdict, errors, fix_guidance):
+    - VERIFIED → PASS. UNVERIFIED → PASS as well: the verifier could not
+      prove failure (missing tests/toolchain), so burning retries is wrong;
+      the post-PASS verify step owns the setup_env/run_smoke pause.
+    - NEEDS_REWORK → FAIL with the verifier's guidance (retry).
+    - ESCALATE_TO_MISSION → ESCALATE (caller returns a REPLAN handoff, which
+      the hotfix routes already forward to escalation-triage + mission brief).
+    """
+    verification = verification or {}
+    verdict = str(verification.get("verdict", "UNVERIFIED"))
+    if verdict == "NEEDS_REWORK":
+        summary = str(
+            verification.get("summary", "") or "fix did not satisfy criteria"
+        )
+        guidance = str(
+            verification.get("fix_guidance", "") or verification.get("summary", "")
+        )
+        return "FAIL", [summary], guidance
+    if verdict == "ESCALATE_TO_MISSION":
+        return "ESCALATE", [], ""
+    return "PASS", [], ""
+
+
 def _format_review_summary(
     report: dict[str, Any],
     *,
@@ -222,6 +276,36 @@ def _format_review_summary(
     return "\n".join(lines)
 
 
+_INFRA_GAP_MARKERS = (
+    "no module named pytest",
+    "pytest: command not found",
+    "no module named ",
+    "pip install",
+    "connection refused",
+    "network is unreachable",
+    "temporary failure in name resolution",
+    "environment prospect",
+)
+
+
+def _infra_gap_note(error_tail: list[str]) -> str:
+    """Detect a toolchain/environment gap (vs a code defect) in error text.
+
+    An infra REPLAN (e.g. validator demanding pytest in a bare venv) must
+    feed FixVerifier/UNVERIFIED rather than mission escalation — the code
+    change may be fine, only the harness to prove it is missing.
+    """
+    haystack = "\n".join(str(line) for line in error_tail).lower()
+    for marker in _INFRA_GAP_MARKERS:
+        if marker in haystack:
+            return (
+                "Validator failure looks like a missing toolchain/dependency "
+                f"(matched {marker!r}), not a code defect. Prefer UNVERIFIED "
+                "over mission escalation."
+            )
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -239,13 +323,17 @@ class MilestoneHandoff:
     elapsed_ms: float
     error_log: list[str] = field(default_factory=list)
     failure_signature: str = ""  # deterministic fingerprint for replan dedup
+    # Hotfix route only: in-loop FixVerifier verdict (VERIFIED | NEEDS_REWORK |
+    # UNVERIFIED | ESCALATE_TO_MISSION dict). Lets the post-PASS verify step
+    # reuse the verdict instead of re-running the verifier LLM call.
+    verification: Optional[dict[str, Any]] = None
 
 
 @dataclass
 class MissionResult:
     mission_id: str
     title: str
-    status: str            # "completed" | "partial" | "failed" | "cancelled"
+    status: str  # "completed" | "partial" | "failed" | "cancelled" | "awaiting_decision"
     milestones_passed: int
     milestones_total: int
     handoffs: list[MilestoneHandoff]
@@ -257,6 +345,7 @@ class MissionResult:
     summary_text: str = ""
     failure_reason: str = ""
     execution_route: str = "mission"
+    pending_decision: Optional[dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +382,9 @@ class MissionsRuntime:
         self._cancel_check: Optional[Callable[[], bool]] = None
         self._active_run_kind = "new"
         self._active_execution_route = "mission"
+        self._active_review_fix_mode = "ask"
         self._active_run_id: Optional[str] = None
+        self._escalation_brief: Optional[dict[str, Any]] = None
 
     def _check_cancelled(self) -> None:
         """Raise if the active run received a cancel request."""
@@ -310,6 +401,8 @@ class MissionsRuntime:
         cancel_check: Optional[Callable[[], bool]] = None,
         run_kind: str = "auto",
         execution_route: str = "auto",
+        review_fix_mode: str = "ask",
+        review_fix_packet: Optional[dict[str, Any]] = None,
         run_id: Optional[str] = None,
     ) -> MissionResult:
         """
@@ -333,6 +426,10 @@ class MissionsRuntime:
         t_mission_start = time.perf_counter()
         self._cancel_check = cancel_check
         self._active_run_id = run_id
+        self._active_review_fix_mode = (
+            review_fix_mode if review_fix_mode in ("auto", "ask") else "ask"
+        )
+        self._escalation_brief = None
 
         # Resolve or create the session
         if session is None:
@@ -398,6 +495,7 @@ class MissionsRuntime:
                     parent_plan_id=parent_plan_id,
                     previous_plan=previous_plan,
                     requested_route=execution_route,
+                    review_fix_packet=review_fix_packet,
                 )
             except RunCancelledError:
                 return self._finish_cancelled(session, t_mission_start)
@@ -498,12 +596,32 @@ class MissionsRuntime:
         parent_plan_id: Optional[str],
         previous_plan: dict[str, Any],
         requested_route: str,
+        review_fix_packet: Optional[dict[str, Any]] = None,
     ) -> MissionResult:
         """Run orchestration + the milestone loop + summary inside a span."""
         self._check_cancelled()
 
         self._active_run_kind = run_kind
         triage_report: Optional[dict[str, Any]] = None
+
+        # HITL follow-ups (apply_fix / run_smoke / setup_env) execute their
+        # stored packet directly — no re-triage, no re-review. Escalation
+        # from a packet falls straight through to the mission path below.
+        if review_fix_packet is not None:
+            packet_result = self._run_packet_run(
+                user_request, session, review_fix_packet,
+                t_mission_start, run_kind=run_kind,
+            )
+            if packet_result is not None:
+                return packet_result
+            triage_report = self._merge_escalation_brief(
+                triage_report,
+                route="packet",
+                review_report=(
+                    review_fix_packet.get("report")
+                    or review_fix_packet.get("review_report")
+                ),
+            )
 
         # Lifecycle and execution intent are orthogonal. Crash recovery always
         # resumes the current mission; other requests are routed by a focused
@@ -514,6 +632,13 @@ class MissionsRuntime:
                 confidence="high",
                 rationale="Pending milestones require crash-safe resume.",
                 source="lifecycle",
+            )
+        elif review_fix_packet is not None:
+            route_decision = RouteDecision(
+                route="mission",
+                confidence="high",
+                rationale="Follow-up packet escalated to a planned mission.",
+                source="packet",
             )
         else:
             deterministic_route = requested_route
@@ -585,7 +710,11 @@ class MissionsRuntime:
             )
             if focused is not None:
                 return focused
-            # A scope/replan handoff escalates once to the full mission path.
+            # The hotfix route stashed a MissionBrief (or escalated at guard
+            # level); either way the mission path inherits focused context.
+            triage_report = self._merge_escalation_brief(
+                triage_report, route="hotfix"
+            )
             self._active_execution_route = "mission"
 
         if route_decision.route == "review":
@@ -598,12 +727,11 @@ class MissionsRuntime:
             )
             if focused is not None:
                 return focused
-            triage_report = {
-                **(triage_report or {}),
-                "route": "mission",
-                "summary": "Code review found broad changes requiring a planned mission.",
-                "review_report": review_report or {},
-            }
+            triage_report = self._merge_escalation_brief(
+                triage_report,
+                route="review",
+                review_report=review_report,
+            )
             self._active_execution_route = "mission"
 
         # Phase 1 — Orchestration (graceful failure: no uncaught tracebacks)
@@ -949,6 +1077,450 @@ class MissionsRuntime:
     # Focused execution routes
     # ------------------------------------------------------------------
 
+    def _merge_escalation_brief(
+        self,
+        triage_report: Optional[dict[str, Any]],
+        *,
+        route: str,
+        review_report: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Fold a stashed MissionBrief into orchestration-bound triage context.
+
+        The orchestrator already receives the full triage JSON, so the brief
+        (structured + rendered text) rides along — the mission planner starts
+        from verified review/hotfix evidence instead of the raw request.
+        """
+        brief = self._escalation_brief
+        self._escalation_brief = None
+        base = dict(triage_report or {})
+        if brief is None:
+            base.update({
+                "route": "mission",
+                "summary": (
+                    f"The {route} route escalated to a planned mission "
+                    "without a structured brief (guard-level escalation)."
+                ),
+            })
+        else:
+            base.update({
+                "route": "mission",
+                "summary": (
+                    "Escalated to a planned mission. Read MISSION BRIEF first — "
+                    "it carries verified review/hotfix context. Do not re-derive "
+                    "what is already established there."
+                ),
+                "mission_brief": brief,
+                "escalation_brief_text": brief.get("briefing", ""),
+            })
+        if review_report:
+            base["review_report"] = review_report
+        return base
+
+    def _pause_for_decision(
+        self,
+        session: SessionContext,
+        started_at: float,
+        title: str,
+        execution_route: str,
+        decision_type: str,
+        decision_title: str,
+        summary: str,
+        options: list[str],
+        payload: dict[str, Any],
+        handoffs: Optional[list[MilestoneHandoff]] = None,
+    ) -> MissionResult:
+        """Persist a HITL decision and finish the run as awaiting_decision."""
+        pending = save_pending_decision(
+            session,
+            {
+                "type": decision_type,
+                "title": decision_title,
+                "summary": summary,
+                "options": options,
+                "payload": payload,
+            },
+        )
+        self._persist_run_artifact(session, "pending_decision", pending)
+        self._emitter.emit(
+            "run.awaiting_decision",
+            decision_type=decision_type,
+            title=decision_title,
+            options=options,
+        )
+        return self._finish_focused_result(
+            session=session,
+            started_at=started_at,
+            title=title,
+            execution_route=execution_route,
+            handoffs=handoffs or [],
+            plan_id=None,
+            status_override="awaiting_decision",
+            summary_override=summary,
+            pending_decision=pending,
+        )
+
+    def _escalate_hotfix_failure(
+        self,
+        user_request: str,
+        session: SessionContext,
+        *,
+        origin: str,  # "hotfix" | "review_fix"
+        target_files: list[str],
+        handoff: MilestoneHandoff,
+        review_report: Optional[dict[str, Any]] = None,
+        started_at: Optional[float] = None,
+        milestone: Optional[dict[str, Any]] = None,
+    ) -> Optional[MissionResult]:
+        """Route a failed focused packet via LLM escalation triage.
+
+        Returns a finished MissionResult (HITL pause) when the triage says
+        the mission path is not warranted, otherwise stashes a MissionBrief
+        and returns None so the caller falls through to the full mission
+        path. File count never decides — the LLM triage does, with a
+        deterministic guard downgrading only sensitive high-risk stays.
+        """
+        started = started_at if started_at is not None else time.perf_counter()
+        error_tail = handoff.error_log[-4:] if handoff.error_log else []
+        packet = milestone or {"target_files": target_files}
+        diff_summary = (
+            f"origin={origin} verdict={handoff.verdict} "
+            f"files_modified={handoff.files_modified}\n"
+            "error_tail:\n" + "\n".join(str(line) for line in error_tail)
+            + "\n" + _infra_gap_note(error_tail)
+        )
+        triage = run_escalation_triage(
+            review_report=review_report or {},
+            hotfix_packet=packet,
+            hotfix_handoff=asdict(handoff),
+            diff_summary=diff_summary,
+            project_profile=session.project_profile,
+            model=self.model,
+            session=self._telemetry_ctx,
+            emitter=self._emitter,
+        )
+        decision = deterministic_guard(triage, target_files=target_files)
+        self._persist_run_artifact(session, "escalation_decision", decision)
+
+        if decision.get("decision") == "escalate_mission":
+            self._stash_mission_brief(
+                user_request, session, origin=origin,
+                target_files=target_files, handoff=handoff,
+                review_report=review_report,
+                rationale=str(decision.get("reason", "")),
+                escalation=decision,
+            )
+            return None
+        # stay_hotfix after retries means the bounded track is stuck but the
+        # work is still local — pause for a human call instead of silently
+        # escalating to a mission.
+        return self._pause_for_decision(
+            session, started, "Focused fix",
+            origin if origin != "hotfix" else "hotfix",
+            decision_type="hotfix_followup",
+            decision_title="Hotfix stalled — how should we proceed?",
+            summary=(
+                f"The focused fix ended with verdict {handoff.verdict}. "
+                f"Escalation triage says the work is still bounded: "
+                f"{decision.get('reason', '')}"
+            ),
+            options=["apply_fix", "escalate_mission", "dismiss"],
+            payload={
+                "kind": "hotfix_retry",
+                "milestone": milestone,
+                "target_files": target_files,
+                "verdict": handoff.verdict,
+                "errors": error_tail,
+                "review_report": review_report or {},
+                "triage_rationale": decision.get("reason", ""),
+            },
+            handoffs=[handoff],
+        )
+
+    def _stash_mission_brief(
+        self,
+        user_request: str,
+        session: SessionContext,
+        *,
+        origin: str,
+        target_files: list[str],
+        handoff: MilestoneHandoff,
+        review_report: Optional[dict[str, Any]],
+        rationale: str,
+        verification: Optional[dict[str, Any]] = None,
+        escalation: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Build the orchestrator-bound brief for a mission escalation."""
+        escalation = escalation or {"reason": rationale}
+        brief = build_mission_brief(
+            original_request=user_request,
+            review_report=review_report,
+            hotfix_packet={
+                "target_files": target_files,
+                "origin": origin,
+            },
+            hotfix_handoff=asdict(handoff),
+            verification=verification,
+            escalation=escalation,
+        )
+        self._escalation_brief = brief
+        self._persist_run_artifact(session, "mission_brief", brief)
+        self._emitter.emit(
+            "hotfix.escalated" if origin == "hotfix" else "review.escalated",
+            reason="escalation_triage",
+            affected_files=target_files,
+            escalated_from=origin,
+        )
+
+    def _verify_hotfix_result(
+        self,
+        user_request: str,
+        session: SessionContext,
+        *,
+        origin: str,
+        milestone: dict[str, Any],
+        handoff: MilestoneHandoff,
+        review_report: Optional[dict[str, Any]],
+        started_at: float,
+        verification: Optional[dict[str, Any]] = None,
+    ) -> Optional[MissionResult]:
+        """Run FixVerifier over a PASS hotfix; map VERIFIED/* to outcomes.
+
+        UNVERIFIED (missing tests/toolchain — including the 'user says do the
+        tests' path) never auto-escalates to a mission; it pauses with
+        setup_env / run_smoke options. Returns None only when the verdict
+        routes to the mission path (brief stashed).
+
+        Pass the in-loop verification to skip re-running the verifier when
+        the milestone is the packet the loop already verified (callers pass
+        handoff.verification; the setup_env re-verify path passes None so a
+        fresh verdict is computed against the repaired toolchain).
+        """
+        started = started_at
+        touched = sorted(set(handoff.files_modified) | set(milestone.get("target_files", [])))
+        if verification is None:
+            verification = run_fix_verification(
+                review_report=review_report or {},
+                hotfix_packet=milestone,
+                hotfix_handoff=asdict(handoff),
+                model=self.model,
+                session=self._telemetry_ctx,
+                emitter=self._emitter,
+            )
+        self._persist_run_artifact(session, "fix_verification", verification)
+        verdict = str(verification.get("verdict", "UNVERIFIED"))
+
+        title = "Focused hotfix" if origin == "hotfix" else "Code review"
+        if verdict == "VERIFIED":
+            summary = _format_review_summary(
+                review_report or {"verdict": "n/a", "summary": user_request, "findings": []},
+                handoff=handoff,
+            )
+            summary += (
+                "\n\nFix verification: VERIFIED — "
+                f"{verification.get('summary', '')}"
+            )
+            return self._finish_focused_result(
+                session=session,
+                started_at=started_at,
+                title=title,
+                execution_route=origin,
+                handoffs=[handoff],
+                plan_id=None,
+                summary_override=summary,
+            )
+        if verdict == "ESCALATE_TO_MISSION":
+            self._stash_mission_brief(
+                user_request, session, origin=origin,
+                target_files=touched, handoff=handoff,
+                review_report=review_report,
+                rationale=str(
+                    verification.get("escalation_reason")
+                    or verification.get("summary", "")
+                ),
+                verification=verification,
+                escalation={"reason": verification.get("escalation_reason", "")},
+            )
+            return None
+        if verdict == "NEEDS_REWORK":
+            if self._active_review_fix_mode == "auto":
+                # Headless mode: let escalation triage decide rework routing.
+                escalated = self._escalate_hotfix_failure(
+                    user_request, session, origin=origin,
+                    target_files=touched, handoff=handoff,
+                    review_report=review_report,
+                    started_at=started,
+                    milestone=milestone,
+                )
+                if escalated is not None:
+                    return escalated
+                return None
+            return self._pause_for_decision(
+                session, started_at, title, origin,
+                decision_type="fix_followup",
+                decision_title="Fix needs rework — how should we proceed?",
+                summary=(
+                    "The fix landed but verification says NEEDS_REWORK: "
+                    f"{verification.get('summary', '')} "
+                    f"Guidance: {verification.get('fix_guidance', '')}"
+                ),
+                options=["apply_fix", "escalate_mission", "dismiss"],
+                payload={
+                    "kind": "fix_rework",
+                    "milestone": milestone,
+                    "target_files": touched,
+                    "verdict": handoff.verdict,
+                    "verification": verification,
+                    "review_report": review_report or {},
+                },
+                handoffs=[handoff],
+            )
+        # UNVERIFIED — infra gap, not a scope signal. Pause with the
+        # "user says do the tests" path (setup_env / run_smoke); never
+        # auto-escalate to a mission.
+        missing = verification.get("missing_checks", [])
+        return self._pause_for_decision(
+            session, started_at, title, origin,
+            decision_type="fix_unverified",
+            decision_title="Fix landed but could not be verified — set up tests?",
+            summary=(
+                f"Files changed: {', '.join(touched) or '(none)'}. "
+                f"Verification is UNVERIFIED: {verification.get('summary', '')} "
+                f"Missing checks: {', '.join(missing) or 'none listed'}."
+            ),
+            options=["run_smoke", "setup_env", "escalate_mission", "dismiss"],
+            payload={
+                "kind": "fix_unverified",
+                "milestone": milestone,
+                "target_files": touched,
+                "touched_files": touched,
+                "verdict": handoff.verdict,
+                "missing_checks": missing,
+                "packages": missing,
+                "verification": verification,
+                "review_report": review_report or {},
+            },
+            handoffs=[handoff],
+        )
+
+    def _run_packet_run(
+        self,
+        user_request: str,
+        session: SessionContext,
+        packet: dict[str, Any],
+        started_at: float,
+        *,
+        run_kind: str,
+    ) -> Optional[MissionResult]:
+        """Execute a stored HITL follow-up packet (no re-triage, no re-review).
+
+        Kinds: ``review_fix`` (approved milestone), ``smoke`` (run the suite,
+        fix only trivial breakage), ``setup_env`` (install missing test deps
+        via the ``pip`` shell profile, then re-verify). Returns None when the
+        packet escalates (brief stashed) so the caller falls to the mission.
+        """
+        kind = str(packet.get("kind") or "review_fix")
+        report = packet.get("report") or packet.get("review_report") or {}
+        self._emitter.emit(
+            "packet.started", kind=kind,
+            target_files=packet.get("target_files", []),
+        )
+
+        if kind == "setup_env":
+            packages = packet.get("packages") or packet.get("missing_checks") or []
+            milestone = {
+                "id": "SETUP-ENV",
+                "title": "Set up test environment for verification",
+                "description": (
+                    "Install the missing test dependencies into the session "
+                    f"virtualenv: {', '.join(str(p) for p in packages) or '(see missing checks)'}. "
+                    "Use run_shellscript with profile='pip' "
+                    "(e.g. python -m pip install pytest). Do NOT modify any "
+                    "project code — this packet only repairs the toolchain."
+                ),
+                "depends_on": [],
+                "target_files": [],
+                "acceptance_criteria": [
+                    "The missing test dependencies import successfully.",
+                    "No project source files were modified.",
+                ],
+                "validation_profile": "auto",
+                "status": "pending",
+                "route": "packet",
+            }
+        elif kind == "smoke":
+            touched = packet.get("touched_files") or packet.get("target_files") or []
+            milestone = {
+                "id": "SMOKE",
+                "title": "Run smoke checks for the recent fix",
+                "description": (
+                    "Run the project's test suite and linters over the recent "
+                    "change. Fix only trivial breakage directly caused by the "
+                    f"recent change. Touched files: {', '.join(touched)}."
+                ),
+                "depends_on": [],
+                "target_files": list(touched),
+                "acceptance_criteria": [
+                    "Test suite and linters pass for the touched area.",
+                ],
+                "validation_profile": "auto",
+                "status": "pending",
+                "route": "packet",
+            }
+        else:  # review_fix — the exact milestone approved by the user
+            milestone = dict(packet.get("milestone") or {})
+            if not milestone:
+                return self._pause_for_decision(
+                    session, started_at, "Follow-up fix", "review",
+                    decision_type="hotfix_followup",
+                    decision_title="Approved fix packet is empty",
+                    summary="The approved fix packet carried no milestone; nothing to execute.",
+                    options=["escalate_mission", "dismiss"],
+                    payload={"kind": kind, "review_report": report},
+                )
+
+        plan = {
+            "mission_id": f"packet-{uuid.uuid4().hex[:10]}",
+            "title": f"Follow-up: {kind}",
+            "run_kind": run_kind,
+            "execution_route": "review",
+            "milestones": [milestone],
+        }
+        self._persist_run_artifact(session, "followup_packet", milestone)
+        handoff = self._execute_milestone(
+            milestone, plan, session, agent_profile="hotfix",
+            review_report=report if isinstance(report, dict) else {},
+        )
+        self._persist_run_artifact(session, "followup_handoff", asdict(handoff))
+
+        if handoff.verdict in {"REPLAN", "BLOCKED", "FAIL"}:
+            return self._escalate_hotfix_failure(
+                user_request, session, origin="review_fix",
+                target_files=list(milestone.get("target_files", [])),
+                handoff=handoff,
+                review_report=report if isinstance(report, dict) else {},
+                started_at=started_at,
+                milestone=milestone,
+            )
+
+        verify_milestone = milestone
+        if kind == "setup_env":
+            # Re-verify the original touched files now the toolchain exists.
+            verify_milestone = {
+                "target_files": packet.get("touched_files")
+                or packet.get("target_files") or [],
+            }
+        return self._verify_hotfix_result(
+            user_request, session, origin="review_fix",
+            milestone=verify_milestone, handoff=handoff,
+            review_report=report if isinstance(report, dict) else {},
+            started_at=started_at,
+            # setup_env re-verifies different files with a repaired toolchain:
+            # only reuse the in-loop verdict for the packet it verified.
+            verification=(
+                handoff.verification if verify_milestone is milestone else None
+            ),
+        )
+
     def _run_hotfix_route(
         self,
         user_request: str,
@@ -957,11 +1529,16 @@ class MissionsRuntime:
         previous_plan: dict[str, Any],
         started_at: float,
     ) -> Optional[MissionResult]:
-        """Run one scoped Hotfix packet, or return None to escalate to mission."""
-        if not decision.candidate_files or len(decision.candidate_files) > 3:
+        """Run one scoped Hotfix packet, or return None to escalate to mission.
+
+        Entry requires only that triage named target files — packet width
+        never decides escalation. Failures route through LLM escalation
+        triage; PASS packets go through FixVerifier.
+        """
+        if not decision.candidate_files:
             self._emitter.emit(
                 "hotfix.escalated",
-                reason="scope_not_local",
+                reason="no_targets",
                 candidate_files=decision.candidate_files,
             )
             return None
@@ -977,25 +1554,25 @@ class MissionsRuntime:
         }
         self._persist_run_artifact(session, "hotfix_packet", milestone)
         handoff = self._execute_milestone(
-            milestone, plan, session, agent_profile="hotfix"
+            milestone, plan, session, agent_profile="hotfix",
+            review_report=None,
         )
         self._persist_run_artifact(session, "hotfix_handoff", asdict(handoff))
 
-        if handoff.verdict in {"REPLAN", "BLOCKED"}:
-            self._emitter.emit(
-                "hotfix.escalated",
-                reason=handoff.verdict.lower(),
-                errors=handoff.error_log[-2:],
+        if handoff.verdict in {"REPLAN", "BLOCKED", "FAIL"}:
+            return self._escalate_hotfix_failure(
+                user_request, session, origin="hotfix",
+                target_files=list(decision.candidate_files),
+                handoff=handoff,
+                started_at=started_at,
+                milestone=milestone,
             )
-            return None
 
-        return self._finish_focused_result(
-            session=session,
-            started_at=started_at,
-            title="Focused hotfix",
-            execution_route="hotfix",
-            handoffs=[handoff],
-            plan_id=previous_plan.get("plan_id"),
+        return self._verify_hotfix_result(
+            user_request, session, origin="hotfix",
+            milestone=milestone, handoff=handoff,
+            review_report=None, started_at=started_at,
+            verification=handoff.verification,
         )
 
     def _run_review_route(
@@ -1072,15 +1649,36 @@ class MissionsRuntime:
             )
 
         milestone = hotfix_milestone_from_review(report)
-        if not milestone.get("target_files") or len(milestone["target_files"]) > 3:
+        if not milestone.get("target_files"):
             self._emitter.emit(
                 "review.escalated",
-                reason="broad_findings",
-                affected_files=milestone.get("target_files", []),
+                reason="no_actionable_targets",
+                affected_files=[],
             )
             return None, report_dict
 
         self._persist_run_artifact(session, "review_fix_packet", milestone)
+
+        # HITL gate: in ask mode (default) a review with actionable findings
+        # pauses so the user chooses fix vs mission vs dismiss. Auto mode
+        # preserves the old fire-and-forget review→fix behaviour.
+        if self._active_review_fix_mode != "auto":
+            summary = _format_review_summary(report_dict)
+            pending_result = self._pause_for_decision(
+                session, started_at, "Code review", "review",
+                decision_type="review_fix",
+                decision_title="Review found actionable defects — apply the fix?",
+                summary=summary,
+                options=["apply_fix", "escalate_mission", "dismiss"],
+                payload={
+                    "kind": "review_fix",
+                    "milestone": milestone,
+                    "target_files": milestone.get("target_files", []),
+                    "review_report": report_dict,
+                },
+            )
+            return pending_result, report_dict
+
         plan = {
             "mission_id": f"review-fix-{uuid.uuid4().hex[:10]}",
             "plan_id": previous_plan.get("plan_id"),
@@ -1090,68 +1688,32 @@ class MissionsRuntime:
             "milestones": [milestone],
         }
         handoff = self._execute_milestone(
-            milestone, plan, session, agent_profile="hotfix"
+            milestone, plan, session, agent_profile="hotfix",
+            review_report=report_dict,
         )
-        if handoff.verdict in {"REPLAN", "BLOCKED"}:
-            self._emitter.emit(
-                "review.escalated",
-                reason=handoff.verdict.lower(),
-                affected_files=milestone.get("target_files", []),
+        self._persist_run_artifact(session, "review_fix_handoff", asdict(handoff))
+        if handoff.verdict in {"REPLAN", "BLOCKED", "FAIL"}:
+            return (
+                self._escalate_hotfix_failure(
+                    user_request, session, origin="review_fix",
+                    target_files=list(milestone.get("target_files", [])),
+                    handoff=handoff,
+                    review_report=report_dict,
+                    started_at=started_at,
+                    milestone=milestone,
+                ),
+                report_dict,
             )
-            return None, report_dict
 
-        verification: Optional[dict[str, Any]] = None
-        status_override: Optional[str] = None
-        failure_reason = ""
-        if handoff.verdict == "PASS":
-            try:
-                verified = run_code_review(
-                    user_request="Verify the attempted fixes from the prior review.",
-                    workspace_root=session.workspace_root,
-                    model=self.model,
-                    previous_plan=previous_plan,
-                    verification_of=report_dict,
-                    emitter=self._emitter,
-                    session=self._telemetry_ctx,
-                    cancel_check=self._cancel_check,
-                )
-                verification = verified.to_dict()
-                self._persist_run_artifact(
-                    session, "review_verification", verification
-                )
-                if verified.actionable_findings:
-                    status_override = "partial"
-                    failure_reason = (
-                        "The implementation passed validation, but reviewer "
-                        "verification still found actionable defects."
-                    )
-            except RunCancelledError:
-                raise
-            except Exception as exc:
-                verification = {"error": str(exc)}
-                self._persist_run_artifact(
-                    session, "review_verification", verification
-                )
-
-        summary = _format_review_summary(
-            report_dict,
-            handoff=handoff,
-            verification=verification,
+        # PASS packets go through FixVerifier (deterministic checks + focused
+        # LLM verdict) instead of a second full review pass.
+        verified = self._verify_hotfix_result(
+            user_request, session, origin="review_fix",
+            milestone=milestone, handoff=handoff,
+            review_report=report_dict, started_at=started_at,
+            verification=handoff.verification,
         )
-        return (
-            self._finish_focused_result(
-                session=session,
-                started_at=started_at,
-                title="Code review",
-                execution_route="review",
-                handoffs=[handoff],
-                plan_id=previous_plan.get("plan_id"),
-                status_override=status_override,
-                summary_override=summary,
-                failure_reason=failure_reason,
-            ),
-            report_dict,
-        )
+        return verified, report_dict
 
     def _finish_focused_result(
         self,
@@ -1165,6 +1727,7 @@ class MissionsRuntime:
         status_override: Optional[str] = None,
         summary_override: Optional[str] = None,
         failure_reason: str = "",
+        pending_decision: Optional[dict[str, Any]] = None,
     ) -> MissionResult:
         elapsed_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
         passed = sum(1 for handoff in handoffs if handoff.verdict == "PASS")
@@ -1187,6 +1750,7 @@ class MissionsRuntime:
             run_kind=self._active_run_kind,
             plan_id=plan_id,
             execution_route=execution_route,
+            pending_decision=pending_decision,
         )
         if summary_override is not None:
             result.summary_text = summary_override
@@ -1268,6 +1832,7 @@ class MissionsRuntime:
         session: SessionContext,
         *,
         agent_profile: str = "worker",
+        review_report: Optional[dict[str, Any]] = None,
     ) -> MilestoneHandoff:
         """
         Run the full Phase 2 → 3 → 4 loop for a single milestone.
@@ -1278,6 +1843,9 @@ class MissionsRuntime:
         t_start  = time.perf_counter()
         retry_count = 0
         error_log: list[str] = []
+        # Signature of the previous FAIL verdict — an identical repeat means
+        # the worker is stuck, so stop burning retry cycles (see FAIL branch).
+        prev_failure_sig: Optional[str] = None
 
         is_test = _is_test_milestone(milestone)
         set_allow_test_edits(is_test)
@@ -1458,18 +2026,70 @@ class MissionsRuntime:
                     error_log=error_log,
                 )
 
-            # Phase 4 — Adversarial validation
-            print(f"\n  [Phase 4] ADVERSARIAL VALIDATION — milestone {ms_id}…")
-            verdict_data = run_validator(
-                milestone=milestone,
-                worker_result=worker_result,
-                retry_count=retry_count,
-                is_test_milestone=is_test,
-                model=self.model,
-                emitter=self._emitter,
-                session=self._telemetry_ctx,
-                plan=plan,
-            )
+            # Phase 4 — validation. The hotfix route uses the FixVerifier
+            # (diff + fix criteria, no test contracts, REPLAN impossible);
+            # the mission route uses the adversarial contract validator.
+            loop_verification: Optional[dict[str, Any]] = None
+            if agent_profile == "hotfix":
+                print(f"\n  [Phase 4] FIX VERIFICATION — milestone {ms_id}…")
+                loop_verification = run_fix_verification(
+                    review_report=review_report or {},
+                    hotfix_packet=milestone,
+                    hotfix_handoff={
+                        "files_modified": worker_result.get("files_modified", []),
+                        "summary": worker_result.get("summary", ""),
+                    },
+                    model=self.model,
+                    session=self._telemetry_ctx,
+                    emitter=self._emitter,
+                )
+                self._persist_run_artifact(session, "fix_verification", loop_verification)
+                loop_verdict, v_errors, v_guidance = _map_fix_verification(
+                    loop_verification
+                )
+                if loop_verdict == "ESCALATE":
+                    reason = str(
+                        loop_verification.get("escalation_reason", "")
+                        or loop_verification.get("summary", "")
+                    )
+                    error_log.append(f"FixVerifier escalated to mission: {reason}")
+                    print(f"\n  [!] FixVerifier ESCALATE_TO_MISSION: {reason}")
+                    elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+                    return MilestoneHandoff(
+                        milestone_id=ms_id, title=ms_title,
+                        worker_summary=worker_result.get("summary", ""),
+                        files_modified=worker_result.get("files_modified", []),
+                        tool_calls_made=worker_result.get("tool_calls", 0),
+                        retry_count=retry_count, verdict="REPLAN",
+                        commit_hash="", elapsed_ms=round(elapsed_ms, 2),
+                        error_log=error_log,
+                        verification=loop_verification,
+                    )
+                if loop_verdict == "FAIL":
+                    verdict_data = {
+                        "verdict": "FAIL",
+                        "errors": v_errors,
+                        "fix_guidance": v_guidance,
+                    }
+                else:
+                    verdict_data = {
+                        "verdict": "PASS",
+                        "validation_details": str(
+                            loop_verification.get("summary", "")
+                        ),
+                    }
+            else:
+                print(f"\n  [Phase 4] ADVERSARIAL VALIDATION — milestone {ms_id}…")
+                verdict_data = run_validator(
+                    milestone=milestone,
+                    worker_result=worker_result,
+                    retry_count=retry_count,
+                    is_test_milestone=is_test,
+                    model=self.model,
+                    emitter=self._emitter,
+                    session=self._telemetry_ctx,
+                    plan=plan,
+                )
             verdict = verdict_data.get("verdict", "FAIL")
 
             if verdict == "PASS":
@@ -1505,6 +2125,7 @@ class MissionsRuntime:
                     retry_count=retry_count, verdict="PASS",
                     commit_hash=commit_hash, elapsed_ms=round(elapsed_ms, 2),
                     error_log=error_log,
+                    verification=loop_verification,
                 )
 
             if verdict == "REPLAN":
@@ -1557,6 +2178,22 @@ class MissionsRuntime:
             error_log.append(error_summary)
             print(f"\n  [✗] Milestone {ms_id} FAILED (retry {retry_count + 1}/{MAX_RETRY_CYCLES})")
             print(f"      Errors: {'; '.join(errors[:3])}")
+
+            # Repeat circuit-breaker: an identical normalized failure twice in
+            # a row means the worker is stuck (same fix attempted, same error).
+            # Stop early instead of burning the remaining retry budget.
+            failure_sig = _normalize_failure_signature(errors, fix_guidance)
+            if failure_sig and failure_sig == prev_failure_sig:
+                error_log.append(
+                    "Repeated identical failure — stopping retries early. "
+                    f"Signature: {failure_sig[:200]}"
+                )
+                print(
+                    f"  [!] Identical failure repeated — "
+                    f"stopping retries early ({retry_count + 1}/{MAX_RETRY_CYCLES} used)."
+                )
+                break
+            prev_failure_sig = failure_sig
 
             if self._emitter:
                 self._emitter.emit(
@@ -1738,6 +2375,15 @@ def main() -> None:
         help="Agent profile route (default: auto, selected by triage)",
     )
     parser.add_argument(
+        "--review-fix-mode",
+        choices=["ask", "auto"],
+        default="ask",
+        help=(
+            "Review HITL gate: 'ask' pauses when review finds actionable "
+            "defects; 'auto' applies fixes without asking (default: ask)"
+        ),
+    )
+    parser.add_argument(
         "--list-sessions",
         action="store_true",
         help="List existing sessions and exit",
@@ -1829,8 +2475,9 @@ def main() -> None:
         session=session,
         run_kind=args.run_kind,
         execution_route=args.execution_route,
+        review_fix_mode=args.review_fix_mode,
     )
-    sys.exit(0 if result.status == "completed" else 1)
+    sys.exit(0 if result.status in ("completed", "awaiting_decision") else 1)
 
 
 if __name__ == "__main__":

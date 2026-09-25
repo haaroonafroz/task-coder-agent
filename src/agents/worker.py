@@ -34,7 +34,7 @@ from src.llm_client import AgentRole, call_llm, ModelChoice, resolve_model_confi
 from src.telemetry import span_llm_call, span_tool_call, TelemetryContext
 from src.tools import dispatch
 from src.tools.file_ops import get_created_files
-from src.tools.tool_contracts import validate_tool_call
+from src.tools.tool_contracts import normalize_tool_args, validate_tool_call
 from src.tools.paths import normalize_workspace_path, get_workspace_root
 from src.events import EventEmitter
 from src.run_control import RunCancelledError, ensure_not_cancelled
@@ -49,7 +49,10 @@ from src.sandbox.commands import execute_contract
 from src.sandbox.context import get_sandbox_context
 from src.sandbox.process_manager import stop_server
 from src.agents.llm_stream_events import stream_context_for
-from src.agents.validation_compiler import compile_validation_contract
+from src.agents.validation_compiler import (
+    classify_validation_target,
+    compile_validation_contract,
+)
 from src.sandbox.dependency_check import (
     check_target_file_dependencies,
     format_missing_dependency_message,
@@ -441,7 +444,10 @@ def run_worker(
             tool_name = call.get("tool", "")
             if not isinstance(tool_name, str):
                 tool_name = repr(tool_name)
-            tool_args = call.get("args", {}) or {}
+            tool_args = normalize_tool_args(
+                tool_name if isinstance(tool_name, str) else "",
+                call.get("args", {}) or {},
+            )
             reasoning = call.get("reasoning", "")
 
             if not tool_name:
@@ -794,6 +800,39 @@ def _autorun_contract(
     )
 
 
+def _drop_redundant_constraints(constraints: str, error_feedback: str) -> str:
+    """Drop constraint lines whose error text is already in the failure report.
+
+    The retry message carries both the validator's failure report AND the
+    persisted negative-constraints block, but the most recent constraints were
+    logged FROM that same failure — so the worker receives identical text
+    twice. Lines whose core error text (wrapper stripped) already appears in
+    the failure report are removed; novel constraints from older attempts or
+    other files are kept.
+    """
+    stripped = constraints.strip()
+    if not stripped:
+        return ""
+    lines = stripped.splitlines()
+    header, body = lines[0], lines[1:]
+    feedback = " ".join(error_feedback.split())
+    kept = []
+    for line in body:
+        core = line.strip()
+        if core.startswith("- "):
+            core = core[2:]
+        if "failed validation with error:" in core:
+            core = core.split("failed validation with error:", 1)[1]
+        core = core.rsplit("Do not replicate", 1)[0]
+        core = " ".join(core.split()).strip().rstrip(".")
+        if len(core) > 40 and core in feedback:
+            continue
+        kept.append(line)
+    if not kept:
+        return ""
+    return header + "\n" + "\n".join(kept)
+
+
 def _retry_entry_message(
     error_feedback: Optional[str],
     memory: Any,
@@ -810,7 +849,10 @@ def _retry_entry_message(
         parts.append(f"\n### Validator failure report\n{error_feedback}")
     constraints = _memory_constraints_block(memory, milestone)
     if constraints.strip():
-        parts.append(constraints)
+        if error_feedback:
+            constraints = _drop_redundant_constraints(constraints, error_feedback)
+        if constraints.strip():
+            parts.append(constraints)
     _, missing = target_files_exist(target_files)
     if missing:
         parts.append(f"\nFiles still missing on disk: {missing}")
@@ -903,26 +945,14 @@ def _worker_milestone_brief(ms: dict) -> str:
     )
 
 
-_UI_HINTS = ("ui", "html", "frontend", "react", "vite", "streamlit", "browser", "web")
-
-
 def _is_ui_milestone(milestone: dict, contract: dict) -> bool:
-    profile = str(milestone.get("validation_profile", "")).lower()
-    if profile == "ui":
+    """Worker-side UI check: explicit profile, compiled contract, or structure."""
+    if str(milestone.get("validation_profile", "")).lower() == "ui":
         return True
     if str(contract.get("type", "")).lower() == "ui_smoke":
         return True
-    text = " ".join(
-        [
-            str(milestone.get("title", "")),
-            str(milestone.get("description", "")),
-            " ".join(str(item) for item in milestone.get("acceptance_criteria", [])),
-        ]
-    ).lower()
-    targets = [str(path).lower() for path in milestone.get("target_files", [])]
-    return any(hint in text for hint in _UI_HINTS) or any(
-        path.endswith((".html", ".jsx", ".tsx", ".vue")) for path in targets
-    )
+    profile, _reason = classify_validation_target(milestone)
+    return profile == "ui"
 
 
 def _ui_worker_guidance_block() -> str:

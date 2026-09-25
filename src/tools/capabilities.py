@@ -61,6 +61,40 @@ def _detect_ecosystems(root: Path) -> tuple[list[str], list[str]]:
     return sorted(ecosystems), sorted(manifests)
 
 
+def probe_dependency(package_name: str) -> dict[str, Any]:
+    """Check whether a dependency is importable without importing heavy modules.
+
+    Uses importlib find_spec (no side effects) plus the active interpreter's
+    pip show version when available. Safe for read-only review shells.
+    """
+    import importlib.util
+
+    name = (package_name or "").strip()
+    if not name:
+        return {"success": False, "error": "package_name is required"}
+    base = name.split("[")[0].strip().split()[0]
+    if not base or len(base) > 120:
+        return {"success": False, "error": f"Invalid package name: {package_name!r}"}
+    spec = importlib.util.find_spec(base.replace("-", "_"))
+    found = spec is not None
+    if not found and "-" in base:
+        found = importlib.util.find_spec(base.replace("-", "_").replace("_", "")) is not None
+    result: dict[str, Any] = {
+        "success": True,
+        "package": base,
+        "installed": found,
+        "version": None,
+    }
+    if found:
+        try:
+            from importlib.metadata import version as _version
+
+            result["version"] = _version(base)
+        except Exception:
+            result["version"] = None
+    return result
+
+
 def project_info(max_entries: int = 80) -> dict[str, Any]:
     """Return a bounded, deterministic summary of the current workspace."""
     root = _workspace()

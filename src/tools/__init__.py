@@ -12,7 +12,7 @@ from typing import Any, Callable
 from src.tools.file_ops import read_file, write_file, patch_file, list_directory
 from src.tools.git_ops import git_commit, git_diff, view_git_log
 from src.tools.system_ops import run_pytest, run_linter, install_dependency, search_grep, run_shellscript, uninstall_dependency
-from src.tools.capabilities import project_info, run_checks
+from src.tools.capabilities import probe_dependency, project_info, run_checks
 from src.tools.ui import inspect_ui, serve_app
 from src.tools.paths import normalize_shell_command, normalize_workspace_path
 
@@ -34,6 +34,7 @@ _TOOLS: dict[str, Callable[..., dict[str, Any]]] = {
     "uninstall_dependency": lambda args: uninstall_dependency(**args),
     "run_shellscript":    lambda args: run_shellscript(**args),
     "project_info":       lambda args: project_info(**args),
+    "probe_dependency":   lambda args: probe_dependency(**args),
     "run_checks":         lambda args: run_checks(**args),
     "serve_app":          lambda args: serve_app(**args),
     "inspect_ui":         lambda args: inspect_ui(**args),

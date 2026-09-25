@@ -3,6 +3,23 @@
 export type ModelChoice = "auto" | "local" | "gemini" | "gpt4o";
 export type RunKind = "auto" | "new" | "resume" | "repair";
 export type ExecutionRoute = "auto" | "mission" | "hotfix" | "review";
+export type ReviewFixMode = "ask" | "auto";
+export type DecisionAction =
+  | "apply_fix"
+  | "dismiss"
+  | "escalate_mission"
+  | "run_smoke"
+  | "setup_env";
+
+export interface PendingDecision {
+  type: string;
+  title: string;
+  summary: string;
+  options: DecisionAction[];
+  session_id: string;
+  created_at: string;
+  payload: Record<string, unknown>;
+}
 export type WorkspaceKind = "managed" | "external";
 export type WorkspaceAccessMode = "read_write" | "read_only";
 
@@ -60,7 +77,15 @@ export interface Run {
   run_id: string;
   session_id: string;
   request: string;
-  status: "queued" | "running" | "completed" | "partial" | "failed" | "error" | "cancelled";
+  status:
+    | "queued"
+    | "running"
+    | "completed"
+    | "partial"
+    | "failed"
+    | "error"
+    | "cancelled"
+    | "awaiting_decision";
   model: string;
   queued_at: string;
   started_at: string | null;
@@ -69,6 +94,7 @@ export interface Run {
   error: string | null;
   run_kind: RunKind;
   execution_route?: ExecutionRoute;
+  review_fix_mode?: ReviewFixMode;
   plan_id: string | null;
 }
 

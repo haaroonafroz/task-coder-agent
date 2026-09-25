@@ -362,16 +362,38 @@ def patch_file(file_path: str, search_string: str, replace_string: str) -> dict[
 # list_directory
 # ---------------------------------------------------------------------------
 
+# Directories never worth rendering into an LLM prompt. A single project
+# .venv (torch: ~40k files) once inflated a worker prompt to 304k tokens and
+# killed a run against a 128k context window. Skipped dirs are still listed
+# by name (so the model knows a venv exists) but never recursed into.
+_SKIP_TREE_DIRS = frozenset({
+    ".git", ".hg", ".svn",
+    ".venv", "venv", ".tox", "__pycache__",
+    "node_modules", ".next", ".nuxt",
+    "target", "dist", "build",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".ipynb_checkpoints",
+    "wandb",
+})
+
+# Hard ceiling on rendered tree size; every worker turn inlines the tree.
+_MAX_TREE_CHARS = 60_000
+
+
 def list_directory(target_dir: str = ".", max_depth: int = 6) -> dict[str, Any]:
     """
     Recursively list all files and subdirectories inside target_dir.
+
+    Generated/environment directories (venvs, caches, build output, VCS)
+    are listed by name but not recursed into, and the rendered tree is
+    capped at 60k chars — prompts inlining the tree must stay small.
 
     Args:
         target_dir: Directory relative to workspace/ (. = workspace root).
         max_depth:  Maximum recursion depth (default 6).
 
     Returns:
-        {"success": True, "tree": "<indented text tree>", "count": <int>, "cwd": ...}
+        {"success": True, "tree": "<indented text tree>", "count": <int>,
+         "truncated": bool, "cwd": ...}
         {"success": False, "error": "<message>"}
     """
     try:
@@ -387,10 +409,11 @@ def list_directory(target_dir: str = ".", max_depth: int = 6) -> dict[str, Any]:
 
     lines: list[str] = []
     count = 0
+    truncated = False
     rel_root = _path_info(target)["workspace_relative_path"]
 
     def _walk(path: Path, depth: int, prefix: str) -> None:
-        nonlocal count
+        nonlocal count, truncated
         if depth > max_depth:
             lines.append(f"{prefix}... (max depth reached)")
             return
@@ -404,6 +427,10 @@ def list_directory(target_dir: str = ".", max_depth: int = 6) -> dict[str, Any]:
             return
         for i, entry in enumerate(entries):
             connector = "└── " if i == len(entries) - 1 else "├── "
+            if entry.is_dir() and entry.name in _SKIP_TREE_DIRS:
+                lines.append(f"{prefix}{connector}{entry.name}/ (contents hidden)")
+                count += 1
+                continue
             lines.append(f"{prefix}{connector}{entry.name}{'/' if entry.is_dir() else ''}")
             count += 1
             if entry.is_dir():
@@ -414,10 +441,20 @@ def list_directory(target_dir: str = ".", max_depth: int = 6) -> dict[str, Any]:
     lines.append(f"{display_root}/")
     _walk(target, 0, "")
 
+    tree = "\n".join(lines) if count else f"{display_root}/\n(empty)"
+    if len(tree) > _MAX_TREE_CHARS:
+        tree = (
+            tree[:_MAX_TREE_CHARS]
+            + f"\n... (tree truncated at {_MAX_TREE_CHARS} chars; "
+            + "use list_directory on a subdirectory for detail)"
+        )
+        truncated = True
+
     return {
         "success": True,
-        "tree": "\n".join(lines) if count else f"{display_root}/\n(empty)",
+        "tree": tree,
         "count": count,
+        "truncated": truncated,
         "target_dir": rel_root,
         **_path_info(get_workspace_root()),
     }

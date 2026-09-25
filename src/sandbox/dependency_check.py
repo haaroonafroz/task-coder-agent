@@ -299,14 +299,24 @@ def check_target_file_dependencies(
     )
 
 
+def active_env_label(ctx: Optional[SandboxContext] = None) -> str:
+    """Human-readable name of the interpreter deps are checked against."""
+    sandbox = ctx or get_sandbox_context()
+    if sandbox is not None and getattr(sandbox, "uses_project_environment", False):
+        return "project venv (.venv)"
+    return "session venv"
+
+
 def format_missing_dependency_message(report: DependencyReport) -> str:
     """Human-readable guidance for worker/validator failures."""
+    env = active_env_label()
     parts: list[str] = []
     if report.missing_packages:
         pkg_list = ", ".join(report.missing_packages)
         parts.append(
-            f"Missing third-party packages in the session venv: {pkg_list}. "
-            f"Call install_dependency for each package before signalling complete."
+            f"Missing third-party packages in the {env}: {pkg_list}. "
+            f"Call install_dependency for each package before signalling complete "
+            f"(it targets the {env})."
         )
     if report.errors:
         parts.append("Dependency scan errors: " + "; ".join(report.errors))

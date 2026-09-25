@@ -108,6 +108,7 @@ def _register_routers(app: FastAPI) -> None:
         sessions,
         messages,
         runs,
+        decisions,
         events,
         workspace,
         models,
@@ -123,6 +124,7 @@ def _register_routers(app: FastAPI) -> None:
     app.include_router(sessions.router, prefix=prefix)
     app.include_router(messages.router, prefix=prefix)
     app.include_router(runs.router, prefix=prefix)
+    app.include_router(decisions.router, prefix=prefix)
     app.include_router(events.router, prefix=prefix)
     app.include_router(workspace.router, prefix=prefix)
     app.include_router(models.router, prefix=prefix)
