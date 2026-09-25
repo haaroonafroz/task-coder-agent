@@ -3,6 +3,9 @@
 settings.json
 secrets.json
 qdrant/
+.cursor
+.pytest_cache
+*.egg-info*
 
 # Python
 *__pycache__*
