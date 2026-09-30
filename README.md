@@ -261,7 +261,7 @@ are *values*. The client maps them onto whatever wire fields the model accepts.
 
 ### `settings.json` / `secrets.json`
 
-Minimal OpenAI + local example (keys stay in `secrets.json` only):
+The following `settings.json` can be used as-is or configured according to user prefernces. It contains examples of locally served as well as cloud API LLM providers. The `id` item is also used as is in the `secrets.json` to map the API key (shown later in the example `secrets.json`):
 
 ```json
 {
@@ -269,33 +269,169 @@ Minimal OpenAI + local example (keys stay in `secrets.json` only):
     "providers": [
       {
         "id": "local",
-        "label": "llama.cpp",
-        "base_url": "http://127.0.0.1:8001/v1",
+        "label": "llama.cpp (local)",
+        "base_url": "http://localhost:8001/v1",
         "adapter": "llamacpp_qwen",
         "model": "qwen3.8-27b-mtp",
-        "enabled": true,
+        "models_by_role": {},
         "compat": "auto",
+        "enabled": true,
         "context_length": 32768
       },
       {
+        "id": "gemini",
+        "label": "Gemini",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "adapter": "gemini_openai",
+        "model": "gemini-3.1-flash-lite",
+        "models_by_role": {},
+        "compat": "auto",
+        "enabled": true,
+        "context_length": null
+      },
+      {
         "id": "gpt4o",
-        "label": "OpenAI",
+        "label": "OpenAI (gpt4o)",
         "base_url": "https://api.openai.com/v1",
         "adapter": "openai",
         "model": "gpt-4o",
+        "models_by_role": {
+          "worker": "gpt-4o-mini",
+          "hotfix": "gpt-4o-mini"
+        },
+        "compat": "auto",
         "enabled": true,
-        "compat": "auto"
+        "context_length": null
+      },
+      {
+        "id": "gpt-6-luna",
+        "label": "OpenAI (gpt-6-luna)",
+        "base_url": "https://api.openai.com/v1",
+        "adapter": "openai",
+        "model": "gpt-6-luna",
+        "models_by_role": {
+          "worker": "gpt-6-luna",
+          "hotfix": "gpt-6-luna"
+        },
+        "compat": "auto",
+        "enabled": true,
+        "context_length": null
       }
     ],
-    "default_provider": "auto",
-    "fallback_order": ["local", "gpt4o"]
+    "default_provider": "local",
+    "fallback_order": [
+      "local",
+      "gemini",
+      "gpt4o"
+    ],
+    "seed": 42,
+    "context_length": 32768
+  },
+  "roles": {
+    "triage": {
+      "temperature": 0.7,
+      "top_p": 0.95,
+      "max_tokens": 8192,
+      "thinking": "low",
+      "thinking_enabled": true
+    },
+    "orchestrator": {
+      "temperature": 0.7,
+      "top_p": 0.95,
+      "max_tokens": 24576,
+      "thinking": "xhigh",
+      "thinking_enabled": true
+    },
+    "worker": {
+      "temperature": 0.7,
+      "top_p": 0.8,
+      "max_tokens": 12289,
+      "thinking": "minimal",
+      "thinking_enabled": true
+    },
+    "hotfix": {
+      "temperature": 0.7,
+      "top_p": 0.8,
+      "max_tokens": 12288,
+      "thinking": "low",
+      "thinking_enabled": true
+    },
+    "reviewer": {
+      "temperature": 0.7,
+      "top_p": 0.95,
+      "max_tokens": 16384,
+      "thinking": "medium",
+      "thinking_enabled": true
+    },
+    "validator": {
+      "temperature": 0.6,
+      "top_p": 0.95,
+      "max_tokens": 16384,
+      "thinking": "medium",
+      "thinking_enabled": true
+    }
+  },
+  "qdrant": {
+    "mode": "http",
+    "path": "~/.missions/qdrant", //for locally hosted qdrant collection
+    "url": "https://....cloud.qdrant.io", // cloud hosted qdrant collection
+    "collection": "agent_skills",
+    "dense_name": "dense",
+    "sparse_name": "sparse",
+    "dense_dims": 768
+  },
+  "embeddings": {
+    "backend": "auto",
+    "hf_model": "BAAI/bge-base-en-v1.5",
+    "openai_model": "text-embedding-3-small",
+    "openai_dims": 768
+  },
+  "runtime": {
+    "max_worker_batch_calls": 3,
+    "max_worker_history_turns": 40,
+    "max_worker_tool_calls": 100,
+    "worker_contract_autorun_max": 8,
+    "worker_autorun_stdout_chars": 600,
+    "worker_autorun_stderr_chars": 400,
+    "max_same_tool_failures": 2,
+    "max_consecutive_tool_failures": 5,
+    "max_replans_per_milestone": 2,
+    "max_hotfix_tool_calls": 100,
+    "max_review_tool_calls": 150,
+    "worker_ui_nudge_after": 4,
+    "worker_ui_strong_nudge_after": 8,
+    "max_orchestrator_explore_calls": 50,
+    "max_orchestrator_explore_light": 25,
+    "orchestrator_explore_enabled": true,
+    "log_level": "ERROR",
+    "sandbox": {
+      "executor": "auto",
+      "mode": "balanced",
+      "require_bwrap": false
+    }
+  },
+  "observability": {
+    "api_telemetry": true,
+    "phoenix_host": "http://127.0.0.1",
+    "phoenix_port": 6006,
+    "phoenix_external": true,
+    "auto_eval": false,
+    "eval_llm_judge": false,
+    "eval_phoenix_export": true
+  },
+  "memory": {
+    "backend": "json"
   }
 }
 ```
+Example `secrets.json`
 
 ```json
 {
-  "provider.gpt4o": "sk-..."
+  "provider.gpt4o": "sk-...",
+  "provider.gpt-6-luna": "sk-...",
+  "qdrant": "<Qdrant API key if using cloud hosting>", //optional
+  "hf": "<huggingface token for downloading models>", //optional
 }
 ```
 
