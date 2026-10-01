@@ -2731,7 +2731,7 @@ def main() -> None:
         "--chat-mode",
         choices=["ask", "plan", "build"],
         default="build",
-        help="Ask (no tools), Plan (orchestrator only), or Build (full pipeline)",
+        help="Ask (read-only tools), Plan (orchestrator only), or Build (full pipeline)",
     )
     parser.add_argument(
         "--review-fix-mode",

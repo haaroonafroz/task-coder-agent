@@ -12,7 +12,7 @@ from typing import Optional
 from src.sandbox.context import SandboxContext, get_sandbox_context
 from src.sandbox.env import resolve_python
 from src.sandbox.executor import get_executor
-from src.tools.paths import get_workspace_root, normalize_workspace_path
+from src.tools.paths import get_workspace_root, resolve_workspace_path
 
 # Pre-installed harness dev tools — not worker-installed mission deps.
 _PREINSTALLED = frozenset({"pytest", "flake8", "black", "mypy", "ruff", "_pytest"})
@@ -62,14 +62,7 @@ def _stdlib_top_level() -> frozenset[str]:
 
 
 def _resolve_target_path(rel: str, workspace_root: Path) -> Path:
-    p = Path(normalize_workspace_path(rel))
-    if p.is_absolute():
-        return p
-    resolved = (workspace_root / p).resolve()
-    root_resolved = workspace_root.resolve()
-    if root_resolved not in resolved.parents and resolved != root_resolved:
-        raise ValueError(f"Path escapes workspace: {rel}")
-    return resolved
+    return resolve_workspace_path(rel, root=workspace_root)
 
 
 def _local_module_names(workspace_root: Path) -> frozenset[str]:
