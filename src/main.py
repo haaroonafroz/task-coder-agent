@@ -1265,7 +1265,7 @@ class MissionsRuntime:
         telemetry_ctx,
         t_mission_start: float,
     ) -> MissionResult:
-        """No-tool conversation turn; updates the rolling preference brief."""
+        """Read-only conversation turn; updates the rolling preference brief."""
         self._active_execution_route = "mission"
         if self._emitter:
             self._emitter.emit("ask.started")
@@ -1276,7 +1276,10 @@ class MissionsRuntime:
             recent_messages=self._load_chat_log(session),
             telemetry=telemetry_ctx,
             emitter=self._emitter,
+            cancel_check=self._cancel_check,
         )
+        if self._emitter:
+            self._emitter.emit("ask.replied", chars=len(reply), answer=reply)
         try:
             compact_conversation(
                 session=session,
@@ -1305,8 +1308,6 @@ class MissionsRuntime:
             execution_route="mission",
         )
         self._session_manager.update_status(session, "paused")
-        if self._emitter:
-            self._emitter.emit("ask.replied", chars=len(reply))
         unregister_emitter(session.session_id)
         self._telemetry_ctx = None
         return result

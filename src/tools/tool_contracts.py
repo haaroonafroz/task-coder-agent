@@ -29,7 +29,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "search_grep": {
         "required": {"query": str},
-        "optional": {"target_dir": str},
+        "optional": {"target_dir": str, "max_results": int},
     },
     "run_pytest": {
         "required": {"test_path": str},

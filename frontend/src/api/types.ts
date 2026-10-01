@@ -325,6 +325,8 @@ export interface ToolCallEntry {
   reasoning?: string;
   ts: string;
   milestone_id?: string;
+  args?: Record<string, unknown>;
+  success?: boolean;
 }
 
 export interface AgentTurn {

@@ -319,6 +319,10 @@ body.is-resizing {
   border: none;
 }
 
+.message.system-message .markdown {
+  color: inherit;
+}
+
 .message.mission-summary {
   max-width: 96%;
   margin: 0 auto 12px;
@@ -469,6 +473,15 @@ body.is-resizing {
 
 .output-block {
   margin-top: 8px;
+  text-align: left;
+  color: var(--text-primary);
+}
+
+.output-block .markdown,
+.mission-summary-body .markdown,
+.decision-banner-summary .markdown {
+  text-align: left;
+  color: var(--text-primary);
 }
 
 .output-block pre {
@@ -611,13 +624,18 @@ body.is-resizing {
 }
 
 .tool-call-row {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
   padding: 6px 8px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: rgba(255, 255, 255, 0.02);
+}
+
+.tool-call-row summary {
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  user-select: none;
 }
 
 .tool-call-name {
@@ -629,6 +647,19 @@ body.is-resizing {
 .tool-call-reason {
   font-size: 12px;
   color: var(--text-muted);
+}
+
+.tool-call-json {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  border-radius: 6px;
 }
 
 .llm-stats-bar {

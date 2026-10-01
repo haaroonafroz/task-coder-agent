@@ -19,9 +19,12 @@ class LLMStreamContext:
     milestone_id: str = ""
     phase: str = ""
     output_kind: str = "text"
+    visible: bool = True
     call_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
 
     def start(self, *, model_used: str, thinking_level: Optional[str]) -> None:
+        if not self.visible:
+            return
         payload: dict[str, Any] = {
             "call_id": self.call_id,
             "role": self.role,
@@ -36,7 +39,7 @@ class LLMStreamContext:
         self.emitter.emit("llm.stream.start", **payload)
 
     def delta(self, channel: str, text: str) -> None:
-        if not text:
+        if not text or not self.visible:
             return
         self.emitter.emit(
             "llm.stream.delta",
@@ -82,8 +85,18 @@ class LLMStreamContext:
         if self.phase:
             shared["phase"] = self.phase
 
-        self.emitter.emit("llm.stream.end", **shared)
-        self.emitter.emit("llm.call", **shared)
+        if self.visible:
+            self.emitter.emit("llm.stream.end", **shared)
+            self.emitter.emit("llm.call", **shared)
+        else:
+            # Protocol-only calls (for example Ask tool selection) stay out of
+            # chat while still contributing to sidebar usage telemetry.
+            metrics_only = {
+                key: value
+                for key, value in shared.items()
+                if key not in {"thinking_preview", "output_preview"}
+            }
+            self.emitter.emit("llm.call", **metrics_only)
         try:
             from src.session_usage import record_session_tokens
 
@@ -104,6 +117,7 @@ def stream_context_for(
     milestone_id: str = "",
     phase: str = "",
     output_kind: str = "text",
+    visible: bool = True,
 ) -> Optional[LLMStreamContext]:
     if emitter is None:
         return None
@@ -113,4 +127,5 @@ def stream_context_for(
         milestone_id=milestone_id,
         phase=phase,
         output_kind=output_kind,
+        visible=visible,
     )

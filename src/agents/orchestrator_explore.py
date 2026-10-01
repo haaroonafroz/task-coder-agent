@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from src.agents.tool_diagnostics import compact_tool_result, event_diagnostics
+from src.agents.tool_diagnostics import compact_event_args, compact_tool_result, event_diagnostics
 from src.agents.utils import parse_agent_turn, validate_plan_payload, trim_conversation
 from src.events import EventEmitter
 from src.llm_client import ModelChoice, call_llm, span_model_name
@@ -334,6 +334,7 @@ def run_orchestration_explore(
                 emitter.emit(
                     "tool.called",
                     tool=tool_name,
+                    args=compact_event_args(tool_args),
                     args_keys=list(tool_args.keys()),
                     reasoning=reasoning,
                     call_index=tool_call_count + 1,

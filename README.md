@@ -502,10 +502,12 @@ Open `http://127.0.0.1:8088`.
 The composer dropdown is a **session chat mode**, separate from review/hotfix
 routing. The model cannot switch modes from inside a prompt.
 
-- **Ask** (default in the UI): conversation only. No tools, no file writes, no
-  shell. Use it to capture stack/preferences before a build, and to question a
-  completed mission afterward. A rolling `conversation_brief.json` is what Plan
-  and Build see — not the full transcript.
+- **Ask** (default in the UI): conversation plus a bounded set of read-only
+  workspace tools. It can inspect files, search code, and view project/Git
+  context, but cannot write, install, run commands, or start services. Use it
+  to capture preferences before a build and to question the current code or a
+  completed mission afterward. A rolling `conversation_brief.json` is what
+  Plan and Build see — not the full transcript.
 - **Plan**: only the orchestrator (plus optional read-only explore) runs. The
   draft is shown as a plan card. Send changes to patch it, or approve with
   **Build** / a short phrase (`lgtm`, `go`, `build`). Workers do not start.

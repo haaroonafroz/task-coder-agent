@@ -114,3 +114,19 @@ def event_diagnostics(
 def compact_tool_result(result: dict[str, Any], limit: int = 4000) -> str:
     """Serialize a result for the Worker while preserving useful diagnostics."""
     return json.dumps(result, indent=2, default=str)[:limit]
+
+
+_MAX_EVENT_ARG_CHARS = 400
+
+
+def compact_event_args(args: Any) -> dict[str, Any]:
+    """Bound tool arguments for SSE / UI display without dumping file bodies."""
+    if not isinstance(args, dict):
+        return {}
+    compact: dict[str, Any] = {}
+    for key, value in args.items():
+        if isinstance(value, str) and len(value) > _MAX_EVENT_ARG_CHARS:
+            compact[key] = value[:_MAX_EVENT_ARG_CHARS] + "…"
+        else:
+            compact[key] = value
+    return compact

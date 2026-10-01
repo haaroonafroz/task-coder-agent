@@ -65,6 +65,8 @@ export function openEventStream(
     "verify_hotfix.completed",
     "tool.called",
     "tool.result",
+    "ask.started",
+    "ask.replied",
     "validation.started",
     "validation.contract_run",
     "validation.spec_gaming",

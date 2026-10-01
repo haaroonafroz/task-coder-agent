@@ -54,6 +54,11 @@ const MODE_COPY: Record<ChatMode, { placeholder: string; button: string; empty: 
   },
 };
 
+function isExitCommand(value: string): boolean {
+  const trimmed = value.trim().toLowerCase();
+  return trimmed === "/exit" || trimmed.startsWith("/exit ");
+}
+
 export function ChatPanel({
   session,
   messages,
@@ -117,12 +122,13 @@ export function ChatPanel({
 
   const handleSend = () => {
     const trimmed = input.trim();
-    if (!trimmed || sending) return;
-    if (trimmed === "/exit" || trimmed.toLowerCase().startsWith("/exit ")) {
+    if (!trimmed) return;
+    if (isExitCommand(trimmed)) {
       setInput("");
       onCancelRun?.();
       return;
     }
+    if (sending) return;
     onSend(trimmed, true, model, reviewFixMode, chatMode);
     setInput("");
   };
@@ -263,10 +269,17 @@ export function ChatPanel({
           </span>
           <button
             className="primary"
-            disabled={sending || !input.trim()}
+            disabled={
+              !input.trim()
+              || (sending && !isExitCommand(input))
+            }
             onClick={handleSend}
           >
-            {sending ? "Sending..." : copy.button}
+            {sending && isExitCommand(input)
+              ? "Stop"
+              : sending
+                ? "Sending..."
+                : copy.button}
           </button>
         </div>
       </div>

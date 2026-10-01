@@ -11,7 +11,7 @@ from typing import Any, Callable, Optional
 from src.agents.contracts import ReviewReport, normalize_review_report
 from src.agents.llm_stream_events import stream_context_for
 from src.agents.orchestrator_explore import build_workspace_orientation
-from src.agents.tool_diagnostics import compact_tool_result, event_diagnostics
+from src.agents.tool_diagnostics import compact_event_args, compact_tool_result, event_diagnostics
 from src.agents.utils import parse_agent_turn, trim_conversation
 from src.events import EventEmitter
 from src.llm_client import ModelChoice, call_llm, span_model_name
@@ -204,6 +204,7 @@ def run_code_review(
                             role="reviewer",
                             phase=phase,
                             tool=tool_name,
+                            args=compact_event_args(args),
                             args_keys=list(args.keys()),
                             reasoning=reasoning,
                             call_index=tool_calls + 1,

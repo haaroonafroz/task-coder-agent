@@ -59,6 +59,7 @@ from src.sandbox.dependency_check import (
     planned_module_names,
 )
 from src.agents.tool_diagnostics import (
+    compact_event_args,
     compact_tool_result,
     event_diagnostics,
     tool_failure_signature,
@@ -510,6 +511,7 @@ def run_worker(
                     "tool.called",
                     milestone_id=ms_id,
                     tool=tool_name,
+                    args=compact_event_args(tool_args),
                     args_keys=list(tool_args.keys()),
                     reasoning=reasoning,
                     call_index=tool_call_count + 1,
