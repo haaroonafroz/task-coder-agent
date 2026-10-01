@@ -31,7 +31,8 @@ from src.settings.schema import RoleSettings
 # ---------------------------------------------------------------------------
 ModelChoice = str  # "auto" or a provider id
 AgentRole = Literal[
-    "triage", "orchestrator", "worker", "hotfix", "reviewer", "validator"
+    "triage", "orchestrator", "worker", "hotfix", "reviewer", "validator",
+    "ask", "compact",
 ]
 ThinkingLevel = Literal["off", "minimal", "low", "medium", "high", "xhigh"]
 TokenField = Literal["max_tokens", "max_completion_tokens"]
@@ -242,7 +243,8 @@ def get_model_catalog() -> list[dict[str, Any]]:
     """Return the configured provider catalog, with a synthetic ``auto`` entry."""
     settings = get_settings()
     roles = (
-        "triage", "orchestrator", "worker", "hotfix", "reviewer", "validator"
+        "triage", "orchestrator", "worker", "hotfix", "reviewer", "validator",
+        "ask", "compact",
     )
     entries: list[dict[str, Any]] = []
     for provider in settings.llm.providers:

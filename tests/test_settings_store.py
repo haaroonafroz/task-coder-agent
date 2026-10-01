@@ -18,6 +18,8 @@ def test_defaults_boot_without_env(tmp_path: Path, monkeypatch) -> None:
     assert settings.llm.providers == []
     assert settings.roles.worker.temperature == 0.5
     assert settings.roles.worker.max_tokens == 12288
+    assert settings.roles.ask.max_tokens == 4096
+    assert settings.roles.compact.thinking_enabled is False
 
 
 def test_migrate_from_env_file(tmp_path: Path) -> None:

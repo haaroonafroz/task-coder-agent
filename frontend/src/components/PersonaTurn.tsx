@@ -1,5 +1,6 @@
 import type { AgentTurn, ToolCallEntry } from "../api/types";
 import { LLMStatsBar } from "./LLMStatsBar";
+import { Markdown } from "./Markdown";
 import { formatTs, personaLabel } from "../hooks/useChatTurns";
 
 interface Props {
@@ -29,6 +30,7 @@ function formatOutput(text: string, outputKind?: string): string {
 export function PersonaTurn({ turn, contextLength }: Props) {
   const hasThinking = turn.thinking.trim().length > 0;
   const output = formatOutput(turn.output, turn.metrics?.output_kind);
+  const isJson = turn.metrics?.output_kind === "json";
 
   return (
     <div className={`message agent-turn ${turn.streaming ? "streaming" : ""}`}>
@@ -46,7 +48,7 @@ export function PersonaTurn({ turn, contextLength }: Props) {
 
       {output && (
         <div className="output-block">
-          <pre>{output}</pre>
+          {isJson ? <pre>{output}</pre> : <Markdown text={output} />}
         </div>
       )}
 

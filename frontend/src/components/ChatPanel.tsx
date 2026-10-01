@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type {
+  ChatMode,
   DecisionAction,
   PendingDecision,
   ReviewFixMode,
@@ -8,9 +9,11 @@ import type {
   ModelChoice,
   SSEEvent,
 } from "../api/types";
+import { api } from "../api/client";
 import { ModelSelect } from "./ModelSelect";
 import { PersonaTurn } from "./PersonaTurn";
 import { DecisionBanner } from "./DecisionBanner";
+import { Markdown } from "./Markdown";
 import { useModels } from "../hooks";
 import { buildChatItems, formatTs, missionStatusLabel } from "../hooks/useChatTurns";
 
@@ -27,9 +30,29 @@ interface Props {
     triggerRun: boolean,
     model?: string,
     reviewFixMode?: ReviewFixMode,
+    chatMode?: ChatMode,
   ) => void;
   onResolveDecision: (action: DecisionAction) => void;
+  onCancelRun?: () => void;
 }
+
+const MODE_COPY: Record<ChatMode, { placeholder: string; button: string; empty: string }> = {
+  ask: {
+    placeholder: "Ask about the project, preferences, or a completed build…",
+    button: "Send",
+    empty: "Ask mode — talk through what to build. Switch to Plan or Build when you are ready.",
+  },
+  plan: {
+    placeholder: "Describe the mission, or type changes to the draft plan…",
+    button: "Update plan",
+    empty: "Plan mode — the orchestrator drafts milestones. Approve to build, or send changes.",
+  },
+  build: {
+    placeholder: "Describe what to build or fix…",
+    button: "Send & Run",
+    empty: "No messages yet. Send a request below to start a mission.",
+  },
+};
 
 export function ChatPanel({
   session,
@@ -41,10 +64,12 @@ export function ChatPanel({
   resolvingDecision,
   onSend,
   onResolveDecision,
+  onCancelRun,
 }: Props) {
   const [input, setInput] = useState("");
   const [model, setModel] = useState<ModelChoice>("auto");
   const [reviewFixMode, setReviewFixMode] = useState<ReviewFixMode>("ask");
+  const [chatMode, setChatMode] = useState<ChatMode>("ask");
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const { models } = useModels();
 
@@ -72,12 +97,33 @@ export function ChatPanel({
   }, [session, models]);
 
   useEffect(() => {
+    if (!session) return;
+    const next = session.chat_mode;
+    if (next === "ask" || next === "plan" || next === "build") {
+      setChatMode(next);
+    }
+  }, [session]);
+
+  useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [feed]);
 
+  const persistMode = (next: ChatMode) => {
+    setChatMode(next);
+    if (session) {
+      void api.patchSession(session.session_id, { chat_mode: next } as Partial<Session>);
+    }
+  };
+
   const handleSend = () => {
-    if (!input.trim() || sending) return;
-    onSend(input.trim(), true, model, reviewFixMode);
+    const trimmed = input.trim();
+    if (!trimmed || sending) return;
+    if (trimmed === "/exit" || trimmed.toLowerCase().startsWith("/exit ")) {
+      setInput("");
+      onCancelRun?.();
+      return;
+    }
+    onSend(trimmed, true, model, reviewFixMode, chatMode);
     setInput("");
   };
 
@@ -88,6 +134,8 @@ export function ChatPanel({
       </div>
     );
   }
+
+  const copy = MODE_COPY[chatMode];
 
   return (
     <div className="panel chat-container">
@@ -110,7 +158,7 @@ export function ChatPanel({
       <div className="chat-messages">
         {feed.length === 0 && (
           <div className="empty-state" style={{ fontSize: 12 }}>
-            No messages yet. Send a request below to start a mission.
+            {copy.empty}
           </div>
         )}
         {feed.map((item) => {
@@ -126,7 +174,7 @@ export function ChatPanel({
           if (item.kind === "system") {
             return (
               <div key={item.id} className="message system-message">
-                <div className="content">{item.content}</div>
+                <div className="content"><Markdown text={item.content} /></div>
                 <div className="ts">{formatTs(item.ts)}</div>
               </div>
             );
@@ -140,7 +188,9 @@ export function ChatPanel({
                     {missionStatusLabel(item.status)}
                   </span>
                 </div>
-                <pre className="mission-summary-body">{item.content}</pre>
+                <div className="mission-summary-body">
+                  <Markdown text={item.content} />
+                </div>
                 <div className="ts">{formatTs(item.ts)}</div>
               </div>
             );
@@ -175,35 +225,48 @@ export function ChatPanel({
                 handleSend();
               }
             }}
-            placeholder="Describe what to build or fix..."
+            placeholder={copy.placeholder}
             rows={2}
           />
         </div>
         <div className="composer-row" style={{ justifyContent: "space-between" }}>
-          <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <select
+              className="chat-mode-select"
+              value={chatMode}
+              onChange={(e) => persistMode(e.target.value as ChatMode)}
+              aria-label="Chat mode"
+              title="Ask: converse only. Plan: orchestrator draft. Build: full mission."
+            >
+              <option value="ask">Ask</option>
+              <option value="plan">Plan</option>
+              <option value="build">Build</option>
+            </select>
             <ModelSelect
               className="model-select"
               value={model}
               models={models}
               onChange={setModel}
             />
-            <select
-              value={reviewFixMode}
-              onChange={(e) => setReviewFixMode(e.target.value as ReviewFixMode)}
-              aria-label="Review fix mode"
-              title="Ask: pause when review finds defects. Auto: apply fixes without asking."
-              style={{ fontSize: 12 }}
-            >
-              <option value="ask">Review fixes: ask me</option>
-              <option value="auto">Review fixes: auto-apply</option>
-            </select>
+            {chatMode === "build" && (
+              <select
+                value={reviewFixMode}
+                onChange={(e) => setReviewFixMode(e.target.value as ReviewFixMode)}
+                aria-label="Review fix mode"
+                title="Ask: pause when review finds defects. Auto: apply fixes without asking."
+                style={{ fontSize: 12 }}
+              >
+                <option value="ask">Review fixes: ask me</option>
+                <option value="auto">Review fixes: auto-apply</option>
+              </select>
+            )}
           </span>
           <button
             className="primary"
             disabled={sending || !input.trim()}
             onClick={handleSend}
           >
-            {sending ? "Sending..." : "Send & Run"}
+            {sending ? "Sending..." : copy.button}
           </button>
         </div>
       </div>

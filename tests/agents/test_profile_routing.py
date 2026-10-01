@@ -183,6 +183,8 @@ def test_reviewer_denies_write_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 def test_api_schemas_accept_execution_route_override():
     assert MessageCreate(content="review this", execution_route="review").execution_route == "review"
     assert RunCreate(request="fix this", execution_route="hotfix").execution_route == "hotfix"
+    assert MessageCreate(content="hello").chat_mode == "build"
+    assert MessageCreate(content="hello", chat_mode="plan").chat_mode == "plan"
 
 
 def test_triage_contract_requires_route_fields():

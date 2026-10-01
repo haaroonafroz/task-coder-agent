@@ -486,14 +486,35 @@ Open `http://127.0.0.1:8088`.
 
 - **Sessions:** create a managed greenfield workspace or attach an existing
   folder (read/write or read-only).
-- **Chat:** user messages, streaming agent turns, mission recap. Per-turn stats
-  (prefill / generated / context bar) sit under each agent bubble.
+- **Chat:** Ask / Plan / Build mode dropdown, user messages, streaming agent
+  turns, mission recap. Per-turn stats (prefill / generated / context bar) sit
+  under each agent bubble.
 - **Run inspector (right):** current stage, **session token totals**, expandable
   **By agent** breakdown (tokens + tool counts), milestone events, workspace
   files.
 - **Stop:** cancels the current run cooperatively at the next agent checkpoint
-  (does not kill `missions serve` or the model server).
+  (does not kill `missions serve` or the model server). Type `/exit` in chat
+  to cancel the current run the same way.
 - **Settings:** providers, role knobs, Qdrant, sandbox.
+
+### Chat modes
+
+The composer dropdown is a **session chat mode**, separate from review/hotfix
+routing. The model cannot switch modes from inside a prompt.
+
+- **Ask** (default in the UI): conversation only. No tools, no file writes, no
+  shell. Use it to capture stack/preferences before a build, and to question a
+  completed mission afterward. A rolling `conversation_brief.json` is what Plan
+  and Build see — not the full transcript.
+- **Plan**: only the orchestrator (plus optional read-only explore) runs. The
+  draft is shown as a plan card. Send changes to patch it, or approve with
+  **Build** / a short phrase (`lgtm`, `go`, `build`). Workers do not start.
+- **Build**: the existing serial pipeline. If a draft plan is waiting, Build
+  executes it without re-planning. API clients that omit `chat_mode` still
+  **build**, so older callers keep today’s behavior.
+
+`python -m src.main --chat-mode ask|plan|build "..."` selects the same modes
+from the CLI (default `build`).
 
 Mockups of the control UI (not live captures):
 

@@ -18,6 +18,7 @@ import type {
   ModelChoice,
   RunKind,
   ReviewFixMode,
+  ChatMode,
   DecisionAction,
   PendingDecision,
   WorkspaceScope,
@@ -100,6 +101,7 @@ export const api = {
       run_kind?: RunKind;
       execution_route?: ExecutionRoute;
       review_fix_mode?: ReviewFixMode;
+      chat_mode?: ChatMode;
     }
   ): Promise<Message> {
     return req(`/sessions/${sid}/messages`, {

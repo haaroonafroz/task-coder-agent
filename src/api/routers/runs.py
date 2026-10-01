@@ -11,6 +11,7 @@ from src.api.deps import (
 )
 from src.api.run_queue import CancelNotAllowedError, RunQueue
 from src.api.schemas import RunCreate, RunResponse
+from src.chat_mode import normalize_chat_mode
 from src.session import SessionManager
 
 router = APIRouter(prefix="/sessions/{sid}/runs", tags=["runs"])
@@ -31,6 +32,8 @@ async def create_run(
         run_kind=body.run_kind,
         execution_route=body.execution_route,
         review_fix_mode=body.review_fix_mode,
+        chat_mode=normalize_chat_mode(body.chat_mode, default="build"),
+        skip_orchestration=bool(body.skip_orchestration),
     )
     return RunResponse(**rec.to_dict())
 

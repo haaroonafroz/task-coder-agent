@@ -184,6 +184,7 @@ def run_orchestration_explore(
     explore_mode: str,
     session: Optional[TelemetryContext],
     emitter: Optional[EventEmitter],
+    preference_brief: str = "",
 ) -> dict[str, Any]:
     """Exploration loop ending in a validated plan JSON object."""
     budget = explore_budget(explore_mode)
@@ -196,8 +197,15 @@ def run_orchestration_explore(
         f"{orientation_block}\n\n"
         f"## Run Mode\n{run_kind}\n\n"
         f"## Parent Plan\n{parent_plan_id or '(none)'}\n\n"
-        f"## User Request\n{user_request}\n\n"
     )
+    pref = (preference_brief or "").strip()
+    if pref:
+        user_turn += (
+            "## User Preferences (authoritative — captured in Ask mode)\n"
+            f"{pref}\n\n"
+            "Treat these as established product constraints. Do not re-ask them.\n\n"
+        )
+    user_turn += f"## User Request\n{user_request}\n\n"
     if previous_plan:
         user_turn += (
             "## Previous Plan (summary)\n"

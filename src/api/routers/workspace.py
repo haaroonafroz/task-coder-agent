@@ -46,6 +46,7 @@ async def get_plan(
         mission_id=plan.get("mission_id"),
         title=plan.get("title"),
         milestones=plan.get("milestones", []),
+        approval_state=plan.get("approval_state"),
     )
 
 

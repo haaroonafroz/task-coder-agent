@@ -32,7 +32,9 @@ function asRole(value: unknown): AgentRole {
     role === "reviewer" ||
     role === "validator" ||
     role === "verify_hotfix" ||
-    role === "triage"
+    role === "triage" ||
+    role === "ask" ||
+    role === "compact"
   ) {
     return role;
   }
@@ -112,7 +114,9 @@ function systemLine(ev: SSEEvent): string {
 function isRunSummaryMessage(message: Message, missionSummary?: string): boolean {
   if (message.role !== "assistant") return false;
   if (missionSummary && message.content.trim() === missionSummary.trim()) return true;
-  return message.content.startsWith("Run finished");
+  if (message.content.startsWith("Run finished")) return true;
+  if (message.content.startsWith("Decision resolved")) return true;
+  return false;
 }
 
 function latestMissionSummary(events: SSEEvent[]): string {
@@ -253,6 +257,7 @@ export function buildChatItems(messages: Message[], events: SSEEvent[]): ChatIte
     }
 
     if (ev.type === "mission.complete") {
+      if (asString(data.status) === "awaiting_decision") continue;
       const summary = asString(data.summary_text) || missionSummaryFallback(ev);
       items.push({
         kind: "mission_summary",
@@ -359,7 +364,27 @@ export function buildChatItems(messages: Message[], events: SSEEvent[]): ChatIte
   }
 
   for (const turn of turns.values()) {
+    if (turn.role === "compact") continue;
     items.push(turn);
+  }
+
+  const shownAsk = new Set(
+    [...turns.values()]
+      .filter((turn) => turn.role === "ask")
+      .map((turn) => turn.output.trim())
+      .filter(Boolean),
+  );
+  for (const message of messages) {
+    if (message.role !== "assistant") continue;
+    if (isRunSummaryMessage(message, missionSummaryText)) continue;
+    const content = message.content.trim();
+    if (!content || shownAsk.has(content)) continue;
+    items.push({
+      kind: "system",
+      id: `assistant-${message.id}`,
+      ts: message.ts,
+      content,
+    });
   }
 
   return items.sort((a, b) => a.ts.localeCompare(b.ts));
@@ -374,6 +399,8 @@ export function personaLabel(turn: AgentTurn): string {
     validator: "Validator",
     verify_hotfix: "Verify-Hotfix",
     triage: "Triage",
+    ask: "Ask",
+    compact: "Compact",
   };
   const base = roleLabels[turn.role];
   if (turn.milestone_id) return `${base} · ${turn.milestone_id}`;
