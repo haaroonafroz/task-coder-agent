@@ -15,6 +15,7 @@ from src.api.deps import (
 from src.api.messages import MessageStore
 from src.api.run_queue import RunQueue
 from src.api.schemas import MessageCreate, MessageResponse
+from src.chat_mode import normalize_chat_mode
 from src.session import SessionManager
 
 router = APIRouter(prefix="/sessions/{sid}/messages", tags=["messages"])
@@ -29,6 +30,9 @@ async def create_message(
     run_queue: RunQueue = Depends(get_run_queue),
 ) -> MessageResponse:
     ctx = require_session(sid, manager)
+    chat_mode = normalize_chat_mode(body.chat_mode, default="build")
+    ctx.chat_mode = chat_mode
+    manager._save_meta(ctx)
     run_id: Optional[str] = None
     if body.trigger_run:
         rec = run_queue.enqueue(
@@ -38,11 +42,13 @@ async def create_message(
             run_kind=body.run_kind,
             execution_route=body.execution_route,
             review_fix_mode=body.review_fix_mode,
+            chat_mode=chat_mode,
         )
         run_id = rec.run_id
     msg = message_store.append(ctx, "user", body.content, run_id=run_id)
     msg["run_kind"] = body.run_kind
     msg["execution_route"] = body.execution_route
+    msg["chat_mode"] = chat_mode
     return MessageResponse(**msg)
 
 

@@ -139,6 +139,7 @@ def run_orchestration(
     workspace_root: Optional[Path] = None,
     session: Optional[TelemetryContext] = None,
     emitter: Optional[EventEmitter] = None,
+    preference_brief: str = "",
 ) -> dict:
     """
     Decompose a user request into a structured milestone plan.
@@ -207,6 +208,7 @@ def run_orchestration(
                 explore_mode=explore_mode,
                 session=session,
                 emitter=emitter,
+                preference_brief=preference_brief,
             )
         except RuntimeError as exc:
             print(f"  [Orchestrator] Exploration failed ({exc}) — single-shot fallback.")
@@ -219,6 +221,7 @@ def run_orchestration(
             f"---\n\n"
             f"## Run Mode\n{run_kind}\n\n"
             f"## Parent Plan\n{parent_plan_id or '(none)'}\n\n"
+            f"{_preference_section(preference_brief)}"
             f"User Request:\n{user_request}\n\n"
         )
         if orientation_block:
@@ -267,6 +270,8 @@ def run_orchestration(
     plan["mission_id"] = model_mission_id
     plan["plan_id"] = f"{run_kind}-{uuid.uuid4().hex[:12]}"
     plan["run_kind"] = run_kind
+    if preference_brief.strip():
+        plan["user_preferences"] = preference_brief.strip()[:4000]
     plan["parent_plan_id"] = parent_plan_id
     plan["request_hash"] = hashlib.sha256(
         user_request.encode("utf-8")
@@ -341,6 +346,58 @@ def _replan_prompt(current_plan: dict, replan_guidance: str) -> str:
         f"{_PATCH_FORMAT_GUIDE}\n"
         f"Output the plan patch JSON now:"
     )
+
+
+def _preference_section(preference_brief: str) -> str:
+    text = (preference_brief or "").strip()
+    if not text:
+        return ""
+    return (
+        "## User Preferences (authoritative — captured in Ask mode)\n"
+        f"{text}\n\n"
+        "Treat these as established product constraints. Do not re-ask them.\n\n"
+    )
+
+
+def adjust_plan_from_user(
+    current_plan: dict,
+    user_request: str,
+    model: ModelChoice,
+    plan_path: Path,
+    *,
+    preference_brief: str = "",
+    session: Optional[TelemetryContext] = None,
+    emitter: Optional[EventEmitter] = None,
+) -> dict:
+    """Patch a draft plan from a user's adjustment request. No explore, no workers."""
+    print("\n[Plan] USER ADJUSTMENT — Orchestrator patching draft…")
+    body = (
+        "### User requested these plan changes\n"
+        f"{user_request}\n\n"
+        "Patch the draft plan to match. Do not start implementation. "
+        "Keep completed milestones immutable."
+    )
+    pref = _preference_section(preference_brief)
+    if pref:
+        body += f"\n{pref}"
+    patched = _request_plan_patch(
+        _apply_ops_prompt(
+            current_plan,
+            guidance_header="User Plan Adjustment",
+            guidance_body=body,
+        ),
+        current_plan,
+        model,
+        span_label="USER_ADJUST",
+        session=session,
+        emitter=emitter,
+    )
+    patched["approval_state"] = "draft"
+    if preference_brief.strip():
+        patched["user_preferences"] = preference_brief.strip()[:4000]
+    plan_path.write_text(json.dumps(patched, indent=2), encoding="utf-8")
+    print("  [Orchestrator] Draft plan patched and saved.")
+    return patched
 
 
 def _apply_ops_prompt(

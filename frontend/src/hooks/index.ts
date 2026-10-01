@@ -15,6 +15,7 @@ import type {
   DecisionAction,
   PendingDecision,
   ReviewFixMode,
+  ChatMode,
 } from "../api/types";
 
 // ---- Sessions ----
@@ -98,6 +99,7 @@ export function useMessages(sid: string | null) {
       triggerRun: boolean,
       model?: string,
       reviewFixMode?: ReviewFixMode,
+      chatMode?: ChatMode,
     ) => {
       if (!sid) return null;
       setSending(true);
@@ -107,6 +109,7 @@ export function useMessages(sid: string | null) {
           trigger_run: triggerRun,
           model: model as "auto" | "local" | "gemini" | "gpt4o" | undefined,
           review_fix_mode: reviewFixMode,
+          chat_mode: chatMode,
         });
         setMessages((prev) => [...prev, msg]);
         return msg;

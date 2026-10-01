@@ -26,7 +26,7 @@ import queue
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict, fields
 from pathlib import Path
 from typing import Any, Optional
 
@@ -59,6 +59,8 @@ class RunRecord:
     run_kind: str = "auto"
     execution_route: str = "auto"
     review_fix_mode: str = "ask"
+    chat_mode: str = "build"
+    skip_orchestration: bool = False
     plan_id: Optional[str] = None
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
@@ -67,6 +69,13 @@ class RunRecord:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+_RUN_RECORD_FIELDS = {item.name for item in fields(RunRecord)}
+
+
+def _run_record_from_dict(data: dict[str, Any]) -> RunRecord:
+    return RunRecord(**{key: value for key, value in data.items() if key in _RUN_RECORD_FIELDS})
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +111,7 @@ class RunRegistry:
         for entry in runs_dir.glob("*.json"):
             try:
                 data = json.loads(entry.read_text(encoding="utf-8"))
-                rec = RunRecord(**data)
+                rec = _run_record_from_dict(data)
                 if rec.run_id not in self._runs:
                     self._runs[rec.run_id] = rec
                     self._by_session.setdefault(session_id, []).append(rec.run_id)
@@ -121,6 +130,8 @@ class RunRegistry:
         run_kind: str = "auto",
         execution_route: str = "auto",
         review_fix_mode: str = "ask",
+        chat_mode: str = "build",
+        skip_orchestration: bool = False,
     ) -> RunRecord:
         run_id = uuid.uuid4().hex[:12]
         rec = RunRecord(
@@ -133,6 +144,8 @@ class RunRegistry:
             run_kind=run_kind,
             execution_route=execution_route,
             review_fix_mode=review_fix_mode or "ask",
+            chat_mode=chat_mode or "build",
+            skip_orchestration=bool(skip_orchestration),
         )
         with self._lock:
             self._runs[run_id] = rec
@@ -155,7 +168,7 @@ class RunRegistry:
                 continue
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
-                rec = RunRecord(**data)
+                rec = _run_record_from_dict(data)
                 with self._lock:
                     self._runs[run_id] = rec
                     self._by_session.setdefault(rec.session_id, []).append(run_id)
@@ -199,7 +212,7 @@ class RunRegistry:
                     data = json.loads(entry.read_text(encoding="utf-8"))
                     if data.get("status") not in ("queued", "running"):
                         continue
-                    rec = RunRecord(**data)
+                    rec = _run_record_from_dict(data)
                     rec.status = "cancelled"
                     rec.finished_at = time.strftime("%Y-%m-%dT%H:%M:%S")
                     rec.error = "Run interrupted by server restart"
@@ -286,6 +299,8 @@ class RunQueue:
         run_kind: str = "auto",
         execution_route: str = "auto",
         review_fix_mode: str = "ask",
+        chat_mode: str = "build",
+        skip_orchestration: bool = False,
     ) -> RunRecord:
         """Create a run record and submit it to the serial worker."""
         chosen_model = model or ctx.selected_model or "auto"
@@ -296,6 +311,8 @@ class RunQueue:
             run_kind=run_kind,
             execution_route=execution_route,
             review_fix_mode=review_fix_mode or "ask",
+            chat_mode=chat_mode or "build",
+            skip_orchestration=bool(skip_orchestration),
         )
         self._queue.put((rec, ctx, chosen_model, None))
         return rec
@@ -436,6 +453,8 @@ class RunQueue:
                     run_kind=rec.run_kind,
                     execution_route=rec.execution_route,
                     review_fix_mode=getattr(rec, "review_fix_mode", "ask") or "ask",
+                    chat_mode=getattr(rec, "chat_mode", "build") or "build",
+                    skip_orchestration=bool(getattr(rec, "skip_orchestration", False)),
                     review_fix_packet=packet,
                     run_id=rec.run_id,
                 )

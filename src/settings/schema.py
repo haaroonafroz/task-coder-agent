@@ -21,7 +21,8 @@ SandboxExecutorName = Literal["auto", "bwrap", "native"]
 SandboxModeName = Literal["strict", "balanced", "permissive"]
 MemoryBackendName = Literal["json", "cognee"]
 AgentRoleName = Literal[
-    "triage", "orchestrator", "worker", "hotfix", "reviewer", "validator"
+    "triage", "orchestrator", "worker", "hotfix", "reviewer", "validator",
+    "ask", "compact",
 ]
 
 
@@ -108,6 +109,18 @@ class RolesSettings(BaseModel):
         default_factory=lambda: RoleSettings(
             temperature=0.6, top_p=0.95, max_tokens=16384,
             thinking="medium", thinking_enabled=True,
+        )
+    )
+    ask: RoleSettings = Field(
+        default_factory=lambda: RoleSettings(
+            temperature=0.5, top_p=0.9, max_tokens=4096,
+            thinking="low", thinking_enabled=True,
+        )
+    )
+    compact: RoleSettings = Field(
+        default_factory=lambda: RoleSettings(
+            temperature=0.2, top_p=0.8, max_tokens=2048,
+            thinking="off", thinking_enabled=False,
         )
     )
 

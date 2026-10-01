@@ -32,11 +32,18 @@ function asRole(value: unknown): AgentRole {
     role === "reviewer" ||
     role === "validator" ||
     role === "verify_hotfix" ||
-    role === "triage"
+    role === "triage" ||
+    role === "ask" ||
+    role === "compact"
   ) {
     return role;
   }
   return "worker";
+}
+
+function asArgs(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
 }
 
 function metricsFromData(data: Record<string, unknown>, callId: string): LLMMetrics {
@@ -88,6 +95,131 @@ function ensureTurn(
   return turn;
 }
 
+function tryParseJson(text: string): Record<string, unknown> | null {
+  const stripped = text.trim();
+  if (!stripped.startsWith("{") && !stripped.includes("{")) return null;
+  const candidates = [stripped];
+  const fence = stripped.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
+  if (fence?.[1]) candidates.push(fence[1]);
+  const start = stripped.indexOf("{");
+  const end = stripped.lastIndexOf("}");
+  if (start >= 0 && end > start) candidates.push(stripped.slice(start, end + 1));
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+function protocolCallsFromParsed(parsed: Record<string, unknown>, ts: string): ToolCallEntry[] {
+  const rawCalls = Array.isArray(parsed.calls) ? parsed.calls : parsed.tool ? [parsed] : [];
+  const calls: ToolCallEntry[] = [];
+  for (const item of rawCalls) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const row = item as Record<string, unknown>;
+    const tool = asString(row.tool || row.name);
+    if (!tool) continue;
+    calls.push({
+      tool,
+      reasoning: asString(row.reasoning) || undefined,
+      ts,
+      args: asArgs(row.args ?? row.arguments),
+    });
+  }
+  return calls;
+}
+
+function visibleTextFromParsed(parsed: Record<string, unknown>): string | null {
+  const answer = parsed.answer;
+  if (typeof answer === "string" && answer.trim()) return answer;
+
+  if (parsed.tool || Array.isArray(parsed.calls)) return "";
+
+  const status = asString(parsed.status);
+  if (status === "complete") {
+    const summary = asString(parsed.summary);
+    return summary || "Milestone complete.";
+  }
+  if (status === "blocked" || status === "request_scope") {
+    return asString(parsed.reason) || asString(parsed.clarification) || status;
+  }
+
+  if (asString(parsed.action) === "review") {
+    const report = asArgs(parsed.report);
+    if (!report) return "";
+    const verdict = asString(report.verdict) || "review";
+    const summary = asString(report.summary);
+    return summary ? `**${verdict}** — ${summary}` : `**${verdict}**`;
+  }
+  if (asString(parsed.action) === "plan") {
+    const plan = asArgs(parsed.plan);
+    if (!plan) return "";
+    const title = asString(plan.title) || "Plan";
+    const milestones = Array.isArray(plan.milestones) ? plan.milestones : [];
+    const lines = [`**${title}**`, ""];
+    for (const item of milestones) {
+      if (!item || typeof item !== "object") continue;
+      const ms = item as Record<string, unknown>;
+      lines.push(`- **${asString(ms.id) || "M"}** — ${asString(ms.title)}`);
+    }
+    return lines.join("\n").trim();
+  }
+  if (typeof parsed.summary === "string" && parsed.summary.trim()) {
+    return parsed.summary;
+  }
+  return null;
+}
+
+function applyProtocolBuffer(turn: AgentTurn, buffer: string): void {
+  const parsed = tryParseJson(buffer);
+  if (!parsed) return;
+  const extracted = protocolCallsFromParsed(parsed, turn.ts);
+  for (const entry of extracted) mergeProtocolTool(turn, entry);
+  const visible = visibleTextFromParsed(parsed);
+  if (visible) turn.output = visible;
+}
+
+function mergeProtocolTool(turn: AgentTurn, entry: ToolCallEntry): void {
+  const duplicate = turn.tools.find(
+    (item) =>
+      item.tool === entry.tool
+      && (item.reasoning || "") === (entry.reasoning || "")
+      && JSON.stringify(item.args || {}) === JSON.stringify(entry.args || {}),
+  );
+  if (duplicate) {
+    if (entry.args && !duplicate.args) duplicate.args = entry.args;
+    return;
+  }
+  turn.tools.push(entry);
+}
+
+function mergeExecutedTool(turn: AgentTurn, entry: ToolCallEntry): void {
+  const pending = turn.tools.find((item) => item.tool === entry.tool && item.success === undefined);
+  if (pending) {
+    pending.ts = entry.ts;
+    pending.success = entry.success;
+    pending.milestone_id = pending.milestone_id || entry.milestone_id;
+    if (entry.reasoning) pending.reasoning = entry.reasoning;
+    if (entry.args) pending.args = entry.args;
+    return;
+  }
+  const same = turn.tools.find(
+    (item) => item.tool === entry.tool && (item.reasoning || "") === (entry.reasoning || ""),
+  );
+  if (same) {
+    if (entry.args && !same.args) same.args = entry.args;
+    if (entry.success !== undefined) same.success = entry.success;
+    return;
+  }
+  turn.tools.push(entry);
+}
+
 function systemLine(ev: SSEEvent): string {
   if (ev.type === "session.started") {
     const request = asString(ev.data.request);
@@ -112,7 +244,9 @@ function systemLine(ev: SSEEvent): string {
 function isRunSummaryMessage(message: Message, missionSummary?: string): boolean {
   if (message.role !== "assistant") return false;
   if (missionSummary && message.content.trim() === missionSummary.trim()) return true;
-  return message.content.startsWith("Run finished");
+  if (message.content.startsWith("Run finished")) return true;
+  if (message.content.startsWith("Decision resolved")) return true;
+  return false;
 }
 
 function latestMissionSummary(events: SSEEvent[]): string {
@@ -217,11 +351,31 @@ function hasValidatorLlmTurn(turns: Map<string, AgentTurn>, milestoneId: string)
   );
 }
 
+function resolveTurnId(
+  callId: string,
+  data: Record<string, unknown>,
+  askTurnId: string | null,
+  protocolCalls: Set<string>,
+): string {
+  if (asRole(data.role) === "ask" && askTurnId) return askTurnId;
+  if (protocolCalls.has(callId) && asRole(data.role) === "ask" && askTurnId) return askTurnId;
+  return callId;
+}
+
 export function buildChatItems(messages: Message[], events: SSEEvent[]): ChatItem[] {
   const turns = new Map<string, AgentTurn>();
   const finalized = new Set<string>();
+  const protocolCalls = new Set<string>();
+  const protocolBuffers = new Map<string, string>();
   const items: ChatItem[] = [];
   const missionSummaryText = latestMissionSummary(events);
+  const askAnswers = new Set(
+    events
+      .filter((ev) => ev.type === "ask.replied")
+      .map((ev) => asString(ev.data.answer).trim())
+      .filter(Boolean),
+  );
+  let askTurnId: string | null = null;
 
   for (const message of messages) {
     if (message.role === "user") {
@@ -252,8 +406,16 @@ export function buildChatItems(messages: Message[], events: SSEEvent[]): ChatIte
       continue;
     }
 
+    if (ev.type === "ask.started") {
+      askTurnId = `ask-${ev.index ?? index}`;
+      ensureTurn(turns, askTurnId, { role: "ask", phase: "reply" }, ev.ts).streaming = true;
+      continue;
+    }
+
     if (ev.type === "mission.complete") {
+      if (asString(data.status) === "awaiting_decision") continue;
       const summary = asString(data.summary_text) || missionSummaryFallback(ev);
+      if (askAnswers.has(summary.trim())) continue;
       items.push({
         kind: "mission_summary",
         id: `mission-${ev.index ?? index}`,
@@ -265,32 +427,73 @@ export function buildChatItems(messages: Message[], events: SSEEvent[]): ChatIte
       continue;
     }
 
+    if (ev.type === "ask.replied") {
+      const answer = asString(data.answer).trim();
+      if (!askTurnId) askTurnId = `ask-reply-${ev.index ?? index}`;
+      const turn = ensureTurn(turns, askTurnId, { role: "ask", phase: "reply" }, ev.ts);
+      if (answer) turn.output = answer;
+      turn.streaming = false;
+      continue;
+    }
+
     if (ev.type === "llm.stream.start") {
-      ensureTurn(turns, callId, data, ev.ts);
+      const role = asRole(data.role);
+      if (role === "compact") continue;
+      const isProtocol = asString(data.output_kind) === "json" || role === "ask";
+      if (isProtocol) protocolCalls.add(callId);
+      if (role === "ask" && !askTurnId) {
+        askTurnId = `ask-${ev.index ?? index}`;
+      }
+      const turnId = resolveTurnId(callId, data, askTurnId, protocolCalls);
+      const turn = ensureTurn(turns, turnId, data, ev.ts);
+      turn.streaming = true;
+      if (role === "ask") turn.phase = "reply";
       continue;
     }
 
     if (ev.type === "llm.stream.delta") {
-      const turn = ensureTurn(turns, callId, data, ev.ts);
+      if (asRole(data.role) === "compact") continue;
+      const turnId = resolveTurnId(callId, data, askTurnId, protocolCalls);
+      const turn = ensureTurn(turns, turnId, data, ev.ts);
       const channel = asString(data.channel);
       const text = asString(data.text);
-      if (channel === "thinking") turn.thinking += text;
-      else turn.output += text;
+      if (channel === "thinking") {
+        turn.thinking += text;
+      } else if (protocolCalls.has(callId) || asRole(data.role) === "ask") {
+        protocolBuffers.set(callId, (protocolBuffers.get(callId) || "") + text);
+        applyProtocolBuffer(turn, protocolBuffers.get(callId) || "");
+      } else {
+        turn.output += text;
+      }
       continue;
     }
 
     if (ev.type === "llm.stream.end" || ev.type === "llm.call") {
+      if (asRole(data.role) === "compact") continue;
       if (finalized.has(callId) && ev.type === "llm.call") continue;
-      const turn = ensureTurn(turns, callId, data, ev.ts);
-      turn.streaming = false;
-      turn.metrics = metricsFromData(data, callId);
-      if (!turn.thinking && turn.metrics.thinking_preview) {
-        turn.thinking = turn.metrics.thinking_preview;
+      const turnId = resolveTurnId(callId, data, askTurnId, protocolCalls);
+      const turn = ensureTurn(turns, turnId, data, ev.ts);
+      const isAsk = asRole(data.role) === "ask" || turn.role === "ask";
+      if (protocolCalls.has(callId) || isAsk) {
+        const buffer = protocolBuffers.get(callId) || asString(data.output_preview);
+        turn.metrics = metricsFromData(data, callId);
+        if (!turn.thinking && turn.metrics.thinking_preview) {
+          turn.thinking = turn.metrics.thinking_preview;
+        }
+        if (buffer) applyProtocolBuffer(turn, buffer);
+        if (isAsk && turn.output.trim()) turn.streaming = false;
+        else if (!isAsk) turn.streaming = false;
+      } else {
+        turn.streaming = false;
+        turn.metrics = metricsFromData(data, callId);
+        if (!turn.thinking && turn.metrics.thinking_preview) {
+          turn.thinking = turn.metrics.thinking_preview;
+        }
+        if (!turn.output && turn.metrics.output_preview) {
+          turn.output = turn.metrics.output_preview;
+        }
       }
-      if (!turn.output && turn.metrics.output_preview) {
-        turn.output = turn.metrics.output_preview;
-      }
-      finalized.add(callId);
+      if (ev.type === "llm.stream.end") finalized.add(callId);
       continue;
     }
 
@@ -300,15 +503,22 @@ export function buildChatItems(messages: Message[], events: SSEEvent[]): ChatIte
         reasoning: asString(data.reasoning) || undefined,
         ts: ev.ts,
         milestone_id: asString(data.milestone_id) || undefined,
+        args: asArgs(data.args),
       };
       const toolRole = asString(data.role);
+      if (toolRole === "ask") {
+        if (!askTurnId) askTurnId = `ask-tool-${ev.index ?? index}`;
+        const turn = ensureTurn(turns, askTurnId, { role: "ask", phase: "reply" }, ev.ts);
+        mergeExecutedTool(turn, entry);
+        continue;
+      }
       if (toolRole === "orchestrator" || toolRole === "reviewer" || toolRole === "hotfix") {
         const role = asRole(toolRole);
         const roleTurn = role === "orchestrator"
           ? findOrchestratorTurn(turns)
           : findRoleTurn(turns, role);
         if (roleTurn) {
-          roleTurn.tools.push(entry);
+          mergeExecutedTool(roleTurn, entry);
         } else {
           items.push({
             kind: "system",
@@ -323,7 +533,7 @@ export function buildChatItems(messages: Message[], events: SSEEvent[]): ChatIte
       } else {
         const workerTurn = findWorkerTurn(turns, entry.milestone_id);
         if (workerTurn) {
-          workerTurn.tools.push(entry);
+          mergeExecutedTool(workerTurn, entry);
         } else {
           items.push({
             kind: "system",
@@ -332,6 +542,27 @@ export function buildChatItems(messages: Message[], events: SSEEvent[]): ChatIte
             content: `${entry.tool}${entry.reasoning ? `: ${entry.reasoning}` : ""}`,
           });
         }
+      }
+      continue;
+    }
+
+    if (ev.type === "tool.result") {
+      const toolRole = asString(data.role);
+      const toolName = asString(data.tool);
+      const success = data.success === true;
+      const target =
+        toolRole === "ask" && askTurnId
+          ? turns.get(askTurnId)
+          : toolRole === "orchestrator"
+            ? findOrchestratorTurn(turns)
+            : toolRole === "reviewer" || toolRole === "hotfix"
+              ? findRoleTurn(turns, asRole(toolRole))
+              : findWorkerTurn(turns, asString(data.milestone_id) || undefined);
+      if (target && toolName) {
+        const pending = [...target.tools].reverse().find(
+          (item) => item.tool === toolName && item.success === undefined,
+        );
+        if (pending) pending.success = success;
       }
       continue;
     }
@@ -359,7 +590,50 @@ export function buildChatItems(messages: Message[], events: SSEEvent[]): ChatIte
   }
 
   for (const turn of turns.values()) {
+    if (turn.role === "compact") continue;
     items.push(turn);
+  }
+
+  const shownAsk = new Set(
+    [...turns.values()]
+      .filter((turn) => turn.role === "ask")
+      .map((turn) => turn.output.trim())
+      .filter(Boolean),
+  );
+  const askTurns = [...turns.values()]
+    .filter((turn) => turn.role === "ask")
+    .sort((a, b) => a.ts.localeCompare(b.ts));
+  for (const message of messages) {
+    if (message.role !== "assistant") continue;
+    if (isRunSummaryMessage(message, missionSummaryText)) continue;
+    const content = message.content.trim();
+    if (!content) continue;
+    const askTurn =
+      (askTurnId ? turns.get(askTurnId) : undefined)
+      || askTurns.find((turn) => !turn.output.trim())
+      || askTurns[askTurns.length - 1];
+    if (askTurn) {
+      if (!askTurn.output.trim() || askTurn.output.trim().startsWith("{")) {
+        askTurn.output = content;
+      }
+      askTurn.streaming = false;
+      continue;
+    }
+    if (shownAsk.has(content)) continue;
+    const fallbackId = `ask-message-${message.id}`;
+    turns.set(fallbackId, {
+      kind: "agent",
+      id: `turn-${fallbackId}`,
+      call_id: fallbackId,
+      role: "ask",
+      phase: "reply",
+      thinking: "",
+      output: content,
+      tools: [],
+      streaming: false,
+      ts: message.ts,
+    });
+    items.push(turns.get(fallbackId)!);
   }
 
   return items.sort((a, b) => a.ts.localeCompare(b.ts));
@@ -374,10 +648,12 @@ export function personaLabel(turn: AgentTurn): string {
     validator: "Validator",
     verify_hotfix: "Verify-Hotfix",
     triage: "Triage",
+    ask: "Ask",
+    compact: "Compact",
   };
   const base = roleLabels[turn.role];
   if (turn.milestone_id) return `${base} · ${turn.milestone_id}`;
-  if (turn.phase) return `${base} · ${turn.phase}`;
+  if (turn.phase && turn.role !== "ask") return `${base} · ${turn.phase}`;
   return base;
 }
 

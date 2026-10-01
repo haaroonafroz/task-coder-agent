@@ -7,6 +7,9 @@ from src.agents.tool_diagnostics import (
     event_diagnostics,
     tool_failure_signature,
 )
+from src.tools.git_ops import _filter_sensitive_diff
+from src.tools.paths import reset_workspace_root, set_workspace_root
+from src.tools.system_ops import search_grep
 from src.tools.tool_contracts import validate_tool_call
 
 
@@ -125,3 +128,63 @@ def test_failure_classifier_prioritizes_policy_and_timeout() -> None:
         "timed_out": True,
         "returncode": -1,
     }) == "timeout"
+
+
+def test_search_grep_filters_sensitive_files_from_rg_results(tmp_path, monkeypatch) -> None:
+    import src.tools.system_ops as system_ops
+
+    (tmp_path / "src").mkdir()
+    monkeypatch.setattr(
+        system_ops,
+        "_run_argv",
+        lambda *args, **kwargs: {
+            "returncode": 0,
+            "stdout": (
+                "src/app.py:1:API endpoint\n"
+                "secrets.json:2:API_KEY=should-not-leak\n"
+                "credentials.json:3:password=should-not-leak"
+            ),
+            "stderr": "",
+        },
+    )
+    set_workspace_root(tmp_path)
+    try:
+        result = search_grep("API|password", ".", max_results=20)
+    finally:
+        reset_workspace_root()
+
+    assert result["success"] is True
+    assert [match["file"] for match in result["matches"]] == ["src/app.py"]
+    assert "should-not-leak" not in str(result)
+
+
+def test_git_diff_drops_sensitive_file_sections() -> None:
+    raw = (
+        "diff --git a/src/app.py b/src/app.py\n"
+        "--- a/src/app.py\n"
+        "+++ b/src/app.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+        "diff --git a/secrets.json b/secrets.json\n"
+        "--- a/secrets.json\n"
+        "+++ b/secrets.json\n"
+        "@@ -1 +1 @@\n"
+        "-old-secret\n"
+        "+new-secret\n"
+    )
+
+    filtered = _filter_sensitive_diff(raw)
+
+    assert "src/app.py" in filtered
+    assert "secrets.json" not in filtered
+    assert "new-secret" not in filtered
+
+
+def test_compact_event_args_truncates_file_bodies() -> None:
+    from src.agents.tool_diagnostics import compact_event_args
+
+    compact = compact_event_args({"file_path": "app.py", "content": "x" * 2000})
+    assert compact["file_path"] == "app.py"
+    assert len(compact["content"]) < 500
+    assert str(compact["content"]).endswith("…")

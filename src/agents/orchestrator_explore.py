@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from src.agents.tool_diagnostics import compact_tool_result, event_diagnostics
+from src.agents.tool_diagnostics import compact_event_args, compact_tool_result, event_diagnostics
 from src.agents.utils import parse_agent_turn, validate_plan_payload, trim_conversation
 from src.events import EventEmitter
 from src.llm_client import ModelChoice, call_llm, span_model_name
@@ -184,6 +184,7 @@ def run_orchestration_explore(
     explore_mode: str,
     session: Optional[TelemetryContext],
     emitter: Optional[EventEmitter],
+    preference_brief: str = "",
 ) -> dict[str, Any]:
     """Exploration loop ending in a validated plan JSON object."""
     budget = explore_budget(explore_mode)
@@ -196,8 +197,15 @@ def run_orchestration_explore(
         f"{orientation_block}\n\n"
         f"## Run Mode\n{run_kind}\n\n"
         f"## Parent Plan\n{parent_plan_id or '(none)'}\n\n"
-        f"## User Request\n{user_request}\n\n"
     )
+    pref = (preference_brief or "").strip()
+    if pref:
+        user_turn += (
+            "## User Preferences (authoritative — captured in Ask mode)\n"
+            f"{pref}\n\n"
+            "Treat these as established product constraints. Do not re-ask them.\n\n"
+        )
+    user_turn += f"## User Request\n{user_request}\n\n"
     if previous_plan:
         user_turn += (
             "## Previous Plan (summary)\n"
@@ -326,6 +334,7 @@ def run_orchestration_explore(
                 emitter.emit(
                     "tool.called",
                     tool=tool_name,
+                    args=compact_event_args(tool_args),
                     args_keys=list(tool_args.keys()),
                     reasoning=reasoning,
                     call_index=tool_call_count + 1,

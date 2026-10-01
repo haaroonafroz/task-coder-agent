@@ -77,6 +77,9 @@ from src.agents import (
     run_validator,
     run_worker,
 )
+from src.agents.ask import run_ask
+from src.agents.compact import compact_conversation
+from src.agents.orchestrator import adjust_plan_from_user, repair_plan_issues
 from src.agents.contracts import (
     RouteDecision,
     build_mission_brief,
@@ -87,9 +90,21 @@ from src.agents.contracts import (
 from src.agents.escalation import deterministic_guard, run_escalation_triage
 from src.agents.fix_verifier import run_fix_verification
 from src.decisions import save_pending_decision
-from src.agents.orchestrator import repair_plan_issues
 from src.agents.plan_lint import lint_plan
 from src.agents.mission_summary import build_mission_summary
+from src.agents.briefs import (
+    build_mission_brief_from_run,
+    format_conversation_brief,
+    load_conversation_brief,
+    save_mission_brief,
+)
+from src.chat_mode import (
+    format_plan_card_summary,
+    is_plan_approval_phrase,
+    normalize_chat_mode,
+    plan_awaiting_approval,
+    plan_milestones_payload,
+)
 from src.settings import get_settings
 
 _CONFIG_DIR   = _ROOT / "config"
@@ -383,6 +398,8 @@ class MissionsRuntime:
         self._active_run_kind = "new"
         self._active_execution_route = "mission"
         self._active_review_fix_mode = "ask"
+        self._active_chat_mode = "build"
+        self._skip_orchestration = False
         self._active_run_id: Optional[str] = None
         self._escalation_brief: Optional[dict[str, Any]] = None
 
@@ -404,6 +421,8 @@ class MissionsRuntime:
         review_fix_mode: str = "ask",
         review_fix_packet: Optional[dict[str, Any]] = None,
         run_id: Optional[str] = None,
+        chat_mode: str = "build",
+        skip_orchestration: bool = False,
     ) -> MissionResult:
         """
         Execute a full mission from a user request inside a session.
@@ -429,6 +448,8 @@ class MissionsRuntime:
         self._active_review_fix_mode = (
             review_fix_mode if review_fix_mode in ("auto", "ask") else "ask"
         )
+        self._active_chat_mode = normalize_chat_mode(chat_mode, default="build")
+        self._skip_orchestration = bool(skip_orchestration)
         self._escalation_brief = None
 
         # Resolve or create the session
@@ -462,6 +483,7 @@ class MissionsRuntime:
             model=self.model,
             run_kind=effective_run_kind,
             workspace=str(session.workspace_root),
+            chat_mode=self._active_chat_mode,
         )
 
         print(f"\n{'='*70}")
@@ -565,7 +587,7 @@ class MissionsRuntime:
             return {}
         try:
             value = json.loads(session.plan_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, TypeError, AttributeError):
             return {}
         return value if isinstance(value, dict) else {}
 
@@ -603,6 +625,30 @@ class MissionsRuntime:
 
         self._active_run_kind = run_kind
         triage_report: Optional[dict[str, Any]] = None
+
+        if self._active_chat_mode == "ask":
+            return self._run_ask_mode(
+                user_request, session, telemetry_ctx, t_mission_start,
+            )
+
+        if self._active_chat_mode == "plan":
+            plan_result = self._run_plan_mode(
+                user_request,
+                session,
+                telemetry_ctx,
+                t_mission_start,
+                run_kind=run_kind,
+                parent_plan_id=parent_plan_id,
+                previous_plan=previous_plan,
+            )
+            if plan_result is not None:
+                return plan_result
+            # Approval phrase (or skip flag) — fall through to Build.
+            self._active_chat_mode = "build"
+            self._skip_orchestration = True
+            previous_plan = self._load_plan(session)
+            run_kind = "resume"
+            self._active_run_kind = run_kind
 
         # HITL follow-ups (apply_fix / run_smoke / setup_env) execute their
         # stored packet directly — no re-triage, no re-review. Escalation
@@ -735,6 +781,24 @@ class MissionsRuntime:
             self._active_execution_route = "mission"
 
         # Phase 1 — Orchestration (graceful failure: no uncaught tracebacks)
+        preference_brief = self._preference_brief_text(session)
+        skip_orch = self._skip_orchestration or (
+            self._active_chat_mode == "build"
+            and plan_awaiting_approval(previous_plan)
+        )
+        if skip_orch and previous_plan.get("milestones"):
+            run_kind = "resume"
+            self._active_run_kind = run_kind
+            previous_plan["approval_state"] = "executing"
+            if preference_brief:
+                previous_plan["user_preferences"] = preference_brief
+            try:
+                session.plan_path.write_text(
+                    json.dumps(previous_plan, indent=2), encoding="utf-8"
+                )
+            except OSError:
+                pass
+
         try:
             plan = run_orchestration(
                 user_request, self.model,
@@ -747,6 +811,7 @@ class MissionsRuntime:
                 workspace_root=session.workspace_root,
                 session=telemetry_ctx,
                 emitter=self._emitter,
+                preference_brief=preference_brief,
             )
         except Exception as exc:
             print(f"  [Orchestrator] Plan generation failed: {exc}")
@@ -767,6 +832,16 @@ class MissionsRuntime:
         # repair the rest with one Orchestrator patch pass — before a single
         # worker cycle is burned on a structurally broken plan.
         plan = self._lint_and_repair_plan(plan, session, telemetry_ctx)
+        if preference_brief:
+            plan["user_preferences"] = preference_brief
+        if self._active_chat_mode == "build":
+            plan["approval_state"] = "executing"
+            try:
+                session.plan_path.write_text(
+                    json.dumps(plan, indent=2), encoding="utf-8"
+                )
+            except OSError:
+                pass
 
         milestones = plan.get("milestones", [])
         mission_id = plan.get("mission_id", str(uuid.uuid4())[:8])
@@ -981,6 +1056,13 @@ class MissionsRuntime:
         )
         result.summary_text = summary["summary_text"]
         result.failure_reason = summary.get("failure_reason", "")
+        self._refresh_mission_brief(
+            session,
+            plan=plan,
+            status=status,
+            summary_text=result.summary_text,
+            files_modified=summary.get("files_modified", []),
+        )
 
         if self._emitter:
             self._emitter.emit(
@@ -1116,6 +1198,266 @@ class MissionsRuntime:
         if review_report:
             base["review_report"] = review_report
         return base
+
+    # ------------------------------------------------------------------
+    # Ask / Plan modes
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _preference_brief_text(session: SessionContext) -> str:
+        return format_conversation_brief(load_conversation_brief(session))
+
+    @staticmethod
+    def _load_chat_log(session: SessionContext) -> list[dict[str, Any]]:
+        path = session.state_root / "messages.jsonl"
+        if not path.exists():
+            return []
+        messages: list[dict[str, Any]] = []
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return []
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict):
+                messages.append(item)
+        return messages
+
+    def _refresh_mission_brief(
+        self,
+        session: SessionContext,
+        *,
+        plan: dict[str, Any],
+        status: str,
+        summary_text: str,
+        files_modified: Optional[list[str]] = None,
+    ) -> None:
+        brief = build_mission_brief_from_run(
+            plan=plan,
+            status=status,
+            summary_text=summary_text,
+            files_modified=files_modified,
+        )
+        try:
+            save_mission_brief(session, brief)
+        except (OSError, TypeError, AttributeError):
+            return
+        if isinstance(plan, dict) and plan.get("milestones") and status in (
+            "completed", "partial", "failed",
+        ):
+            plan["approval_state"] = "completed" if status == "completed" else status
+            try:
+                session.plan_path.write_text(
+                    json.dumps(plan, indent=2), encoding="utf-8"
+                )
+            except (OSError, TypeError, AttributeError):
+                pass
+
+    def _run_ask_mode(
+        self,
+        user_request: str,
+        session: SessionContext,
+        telemetry_ctx,
+        t_mission_start: float,
+    ) -> MissionResult:
+        """Read-only conversation turn; updates the rolling preference brief."""
+        self._active_execution_route = "mission"
+        if self._emitter:
+            self._emitter.emit("ask.started")
+        reply = run_ask(
+            user_request,
+            session=session,
+            model=self.model,
+            recent_messages=self._load_chat_log(session),
+            telemetry=telemetry_ctx,
+            emitter=self._emitter,
+            cancel_check=self._cancel_check,
+        )
+        if self._emitter:
+            self._emitter.emit("ask.replied", chars=len(reply), answer=reply)
+        try:
+            compact_conversation(
+                session=session,
+                user_request=user_request,
+                assistant_reply=reply,
+                model=self.model,
+                telemetry=telemetry_ctx,
+                emitter=self._emitter,
+            )
+        except Exception as exc:
+            print(f"  [Ask] Compact failed ({exc}) — keeping previous brief.")
+        elapsed_ms = round((time.perf_counter() - t_mission_start) * 1000.0, 2)
+        result = MissionResult(
+            mission_id=f"ask-{uuid.uuid4().hex[:10]}",
+            title=session.title,
+            status="completed",
+            milestones_passed=0,
+            milestones_total=0,
+            handoffs=[],
+            total_elapsed_ms=elapsed_ms,
+            model_used=self.model,
+            session_id=session.session_id,
+            run_kind="new",
+            plan_id=None,
+            summary_text=reply,
+            execution_route="mission",
+        )
+        self._session_manager.update_status(session, "paused")
+        unregister_emitter(session.session_id)
+        self._telemetry_ctx = None
+        return result
+
+    def _run_plan_mode(
+        self,
+        user_request: str,
+        session: SessionContext,
+        telemetry_ctx,
+        t_mission_start: float,
+        *,
+        run_kind: str,
+        parent_plan_id: Optional[str],
+        previous_plan: dict[str, Any],
+    ) -> Optional[MissionResult]:
+        """Orchestrator-only: emit or patch a draft plan, then pause for approval.
+
+        Returns None when the user approved the draft so Build can proceed.
+        """
+        self._active_execution_route = "mission"
+        preference_brief = self._preference_brief_text(session)
+        plan = previous_plan if isinstance(previous_plan, dict) else {}
+
+        if self._skip_orchestration and plan_awaiting_approval(plan):
+            return None
+        if is_plan_approval_phrase(user_request) and plan_awaiting_approval(plan):
+            plan["approval_state"] = "approved"
+            if preference_brief:
+                plan["user_preferences"] = preference_brief
+            try:
+                session.plan_path.write_text(
+                    json.dumps(plan, indent=2), encoding="utf-8"
+                )
+            except OSError as exc:
+                print(f"  [Plan] Could not persist approval: {exc}")
+            return None
+
+        if plan_awaiting_approval(plan):
+            try:
+                plan = adjust_plan_from_user(
+                    plan,
+                    user_request,
+                    self.model,
+                    session.plan_path,
+                    preference_brief=preference_brief,
+                    session=telemetry_ctx,
+                    emitter=self._emitter,
+                )
+            except Exception as exc:
+                print(f"  [Plan] Adjustment failed: {exc}")
+                if self._emitter:
+                    self._emitter.emit("mission.failed", phase="plan_adjust", error=str(exc))
+                return MissionResult(
+                    mission_id=str(plan.get("mission_id") or ""),
+                    title=str(plan.get("title") or session.title),
+                    status="failed",
+                    milestones_passed=0,
+                    milestones_total=len(plan.get("milestones") or []),
+                    handoffs=[],
+                    total_elapsed_ms=round(
+                        (time.perf_counter() - t_mission_start) * 1000.0, 2
+                    ),
+                    model_used=self.model,
+                    session_id=session.session_id,
+                    run_kind=run_kind,
+                    plan_id=str(plan.get("plan_id") or "") or None,
+                    summary_text=f"Could not adjust the plan: {exc}",
+                    execution_route="mission",
+                )
+            return self._pause_for_plan(session, plan, t_mission_start)
+
+        plan_kind = run_kind if run_kind in ("new", "repair") else "new"
+        try:
+            plan = run_orchestration(
+                user_request,
+                self.model,
+                plan_path=session.plan_path,
+                mission_dir=session.root,
+                run_kind=plan_kind,
+                parent_plan_id=parent_plan_id,
+                previous_plan=previous_plan,
+                workspace_root=session.workspace_root,
+                session=telemetry_ctx,
+                emitter=self._emitter,
+                preference_brief=preference_brief,
+            )
+            plan = self._lint_and_repair_plan(plan, session, telemetry_ctx)
+        except Exception as exc:
+            print(f"  [Plan] Orchestration failed: {exc}")
+            if self._emitter:
+                self._emitter.emit("mission.failed", phase="plan", error=str(exc))
+            return MissionResult(
+                mission_id="",
+                title=session.title,
+                status="failed",
+                milestones_passed=0,
+                milestones_total=0,
+                handoffs=[],
+                total_elapsed_ms=round(
+                    (time.perf_counter() - t_mission_start) * 1000.0, 2
+                ),
+                model_used=self.model,
+                session_id=session.session_id,
+                run_kind=plan_kind,
+                plan_id=None,
+                summary_text=f"Could not create a plan: {exc}",
+                execution_route="mission",
+            )
+        plan["approval_state"] = "draft"
+        if preference_brief:
+            plan["user_preferences"] = preference_brief
+        try:
+            session.plan_path.write_text(
+                json.dumps(plan, indent=2), encoding="utf-8"
+            )
+        except OSError as exc:
+            print(f"  [Plan] Could not persist draft: {exc}")
+        return self._pause_for_plan(session, plan, t_mission_start)
+
+    def _pause_for_plan(
+        self,
+        session: SessionContext,
+        plan: dict[str, Any],
+        started_at: float,
+    ) -> MissionResult:
+        title = str(plan.get("title") or session.title)
+        summary = format_plan_card_summary(plan)
+        if self._emitter:
+            self._emitter.emit(
+                "plan.ready",
+                title=title,
+                plan_id=str(plan.get("plan_id") or ""),
+                approval_state="draft",
+                milestones_total=len(plan.get("milestones") or []),
+            )
+        return self._pause_for_decision(
+            session=session,
+            started_at=started_at,
+            title=title,
+            execution_route="mission",
+            decision_type="plan_approval",
+            decision_title=title,
+            summary=summary,
+            options=["approve_plan", "dismiss"],
+            payload={
+                "plan_id": str(plan.get("plan_id") or plan.get("mission_id") or ""),
+                "title": title,
+                "milestones": plan_milestones_payload(plan),
+            },
+        )
 
     def _pause_for_decision(
         self,
@@ -1768,6 +2110,17 @@ class MissionsRuntime:
             result.summary_text = recap["summary_text"]
             result.failure_reason = recap.get("failure_reason", "")
 
+        if status != "awaiting_decision":
+            self._refresh_mission_brief(
+                session,
+                plan=self._load_plan(session),
+                status=status,
+                summary_text=result.summary_text,
+                files_modified=sorted({
+                    path for handoff in handoffs for path in handoff.files_modified
+                }),
+            )
+
         self._session_manager.update_status(session, status)
         self._emitter.emit(
             "mission.audit",
@@ -2375,6 +2728,12 @@ def main() -> None:
         help="Agent profile route (default: auto, selected by triage)",
     )
     parser.add_argument(
+        "--chat-mode",
+        choices=["ask", "plan", "build"],
+        default="build",
+        help="Ask (no tools), Plan (orchestrator only), or Build (full pipeline)",
+    )
+    parser.add_argument(
         "--review-fix-mode",
         choices=["ask", "auto"],
         default="ask",
@@ -2476,6 +2835,7 @@ def main() -> None:
         run_kind=args.run_kind,
         execution_route=args.execution_route,
         review_fix_mode=args.review_fix_mode,
+        chat_mode=args.chat_mode,
     )
     sys.exit(0 if result.status in ("completed", "awaiting_decision") else 1)
 

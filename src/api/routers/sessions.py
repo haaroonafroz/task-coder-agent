@@ -38,6 +38,7 @@ def _to_response(meta: dict) -> SessionResponse:
         status=meta.get("status", "created"),
         selected_model=meta.get("selected_model", "auto"),
         thinking_profile=meta.get("thinking_profile", "auto"),
+        chat_mode=meta.get("chat_mode", "ask"),
         created_at=meta.get("created_at", ""),
         phoenix_session_id=meta.get("phoenix_session_id"),
         phoenix_project=meta.get("phoenix_project"),
@@ -108,6 +109,8 @@ async def update_session(
         ctx.selected_model = body.selected_model
     if body.thinking_profile is not None:
         ctx.thinking_profile = body.thinking_profile
+    if body.chat_mode is not None:
+        ctx.chat_mode = body.chat_mode
     manager._save_meta(ctx)  # persist any field changes
     return _to_response(ctx.to_meta_dict())
 

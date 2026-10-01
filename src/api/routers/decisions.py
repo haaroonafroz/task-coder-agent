@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -68,7 +69,24 @@ async def resolve_decision(
 
     run_id: Optional[str] = None
     if body.action == "dismiss":
+        if pending.get("type") == "plan_approval":
+            _set_plan_approval_state(ctx, "dismissed")
         detail = "Decision dismissed — no further work started."
+    elif body.action == "approve_plan":
+        _set_plan_approval_state(ctx, "approved")
+        request = _plan_build_request(pending, payload)
+        rec = run_queue.enqueue(
+            ctx,
+            request,
+            run_kind="resume",
+            execution_route="mission",
+            chat_mode="build",
+            skip_orchestration=True,
+        )
+        run_id = rec.run_id
+        ctx.chat_mode = "build"
+        manager._save_meta(ctx)
+        detail = f"Approved plan — building (run {run_id})."
     elif body.action == "escalate_mission":
         request = _escalation_request(pending, payload)
         rec = run_queue.enqueue(
@@ -198,3 +216,22 @@ def _escalation_request(
         "Start from this evidence; do not re-derive what is already established."
     )
     return "\n".join(line for line in lines if line.strip())
+
+
+def _plan_build_request(pending: dict[str, Any], payload: dict[str, Any]) -> str:
+    title = str(payload.get("title") or pending.get("title") or "approved plan")
+    return f"Build the approved plan: {title}"
+
+
+def _set_plan_approval_state(ctx: SessionContext, state: str) -> None:
+    path = ctx.plan_path
+    if not path.exists():
+        return
+    try:
+        plan = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(plan, dict):
+        return
+    plan["approval_state"] = state
+    path.write_text(json.dumps(plan, indent=2), encoding="utf-8")

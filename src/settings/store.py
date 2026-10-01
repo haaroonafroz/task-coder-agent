@@ -193,7 +193,10 @@ def migrate_from_env_file(env_file: Path) -> tuple[MissionsSettings, dict[str, s
 
     global_temp = _as_float(env.get("LLM_TEMPERATURE", ""), 0.7)
     global_top_p = _as_float(env.get("LLM_TOP_P", ""), 0.95)
-    for role in ("triage", "orchestrator", "worker", "hotfix", "reviewer", "validator"):
+    for role in (
+        "triage", "orchestrator", "worker", "hotfix", "reviewer", "validator",
+        "ask", "compact",
+    ):
         role_cfg = settings.roles.for_role(role)
         role_cfg.temperature = _as_float(env.get(f"LLM_TEMPERATURE_{role.upper()}", ""), global_temp)
         role_cfg.top_p = _as_float(env.get(f"LLM_TOP_P_{role.upper()}", ""), global_top_p)

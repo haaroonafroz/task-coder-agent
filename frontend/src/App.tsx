@@ -7,7 +7,7 @@ import {
   type CSSProperties,
   type MouseEvent as ReactMouseEvent,
 } from "react";
-import type { DecisionAction, Message, ReviewFixMode } from "./api/types";
+import type { ChatMode, DecisionAction, Message, ReviewFixMode } from "./api/types";
 import { api } from "./api/client";
 import {
   useSessions,
@@ -88,7 +88,9 @@ export default function App() {
         break;
       case "plan.created":
       case "plan.updated":
+      case "plan.ready":
         refreshPlan();
+        refreshDecision();
         break;
       case "tool.result": {
         const tool = lastEv.data?.tool as string | undefined;
@@ -149,8 +151,9 @@ export default function App() {
       triggerRun: boolean,
       model?: string,
       reviewFixMode?: ReviewFixMode,
+      chatMode?: ChatMode,
     ) => {
-      const msg = await sendMessage(content, triggerRun, model, reviewFixMode);
+      const msg = await sendMessage(content, triggerRun, model, reviewFixMode, chatMode);
       if (msg && triggerRun) {
         refreshRuns();
         refreshSessions();
@@ -258,6 +261,7 @@ export default function App() {
         resolvingDecision={resolvingDecision}
         onSend={handleSend}
         onResolveDecision={handleResolveDecision}
+        onCancelRun={handleCancelRun}
       />
 
       <div className="right-resizer" onMouseDown={handleResizeStart} />

@@ -4,12 +4,14 @@ export type ModelChoice = string;
 export type RunKind = "auto" | "new" | "resume" | "repair";
 export type ExecutionRoute = "auto" | "mission" | "hotfix" | "review";
 export type ReviewFixMode = "ask" | "auto";
+export type ChatMode = "ask" | "plan" | "build";
 export type DecisionAction =
   | "apply_fix"
   | "dismiss"
   | "escalate_mission"
   | "run_smoke"
-  | "setup_env";
+  | "setup_env"
+  | "approve_plan";
 
 export interface PendingDecision {
   type: string;
@@ -53,6 +55,7 @@ export interface Session {
   status: string;
   selected_model: string;
   thinking_profile: string;
+  chat_mode?: ChatMode;
   created_at: string;
   phoenix_session_id: string | null;
   phoenix_project: string | null;
@@ -77,6 +80,7 @@ export interface Message {
   run_id: string | null;
   run_kind?: RunKind;
   execution_route?: ExecutionRoute;
+  chat_mode?: ChatMode;
 }
 
 export interface Run {
@@ -101,6 +105,8 @@ export interface Run {
   run_kind: RunKind;
   execution_route?: ExecutionRoute;
   review_fix_mode?: ReviewFixMode;
+  chat_mode?: ChatMode;
+  skip_orchestration?: boolean;
   plan_id: string | null;
 }
 
@@ -117,6 +123,7 @@ export interface Plan {
   mission_id?: string;
   title?: string;
   milestones: Milestone[];
+  approval_state?: string;
 }
 
 export interface Handoff {
@@ -288,7 +295,9 @@ export type AgentRole =
   | "reviewer"
   | "validator"
   | "verify_hotfix"
-  | "triage";
+  | "triage"
+  | "ask"
+  | "compact";
 
 export interface LLMMetrics {
   call_id: string;
@@ -316,6 +325,8 @@ export interface ToolCallEntry {
   reasoning?: string;
   ts: string;
   milestone_id?: string;
+  args?: Record<string, unknown>;
+  success?: boolean;
 }
 
 export interface AgentTurn {

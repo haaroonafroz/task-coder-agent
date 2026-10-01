@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from src.llm_client import ModelChoice
 
 ExecutionRoute = Literal["auto", "mission", "hotfix", "review"]
+ChatMode = Literal["ask", "plan", "build"]
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +67,7 @@ class SessionUpdate(BaseModel):
     status: Optional[str] = None
     selected_model: Optional[ModelChoice] = None
     thinking_profile: Optional[str] = None
+    chat_mode: Optional[ChatMode] = None
 
 
 class SessionResponse(BaseModel):
@@ -74,6 +76,7 @@ class SessionResponse(BaseModel):
     status: str
     selected_model: str
     thinking_profile: str
+    chat_mode: ChatMode = "ask"
     created_at: str
     phoenix_session_id: Optional[str] = None
     phoenix_project: Optional[str] = None
@@ -103,6 +106,7 @@ class MessageCreate(BaseModel):
     run_kind: Literal["auto", "new", "resume", "repair"] = "auto"
     execution_route: ExecutionRoute = "auto"
     review_fix_mode: Literal["auto", "ask"] = "ask"
+    chat_mode: ChatMode = "build"
 
 
 class PendingDecisionResponse(BaseModel):
@@ -117,7 +121,12 @@ class PendingDecisionResponse(BaseModel):
 
 class DecisionCreate(BaseModel):
     action: Literal[
-        "apply_fix", "dismiss", "escalate_mission", "run_smoke", "setup_env"
+        "apply_fix",
+        "dismiss",
+        "escalate_mission",
+        "run_smoke",
+        "setup_env",
+        "approve_plan",
     ]
 
 
@@ -136,6 +145,7 @@ class MessageResponse(BaseModel):
     run_id: Optional[str] = None
     run_kind: Optional[str] = None
     execution_route: Optional[str] = None
+    chat_mode: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +158,8 @@ class RunCreate(BaseModel):
     run_kind: Literal["auto", "new", "resume", "repair"] = "auto"
     execution_route: ExecutionRoute = "auto"
     review_fix_mode: Literal["auto", "ask"] = "ask"
+    chat_mode: ChatMode = "build"
+    skip_orchestration: bool = False
 
 
 class RunResponse(BaseModel):
@@ -165,6 +177,8 @@ class RunResponse(BaseModel):
     execution_route: str = "auto"
     plan_id: Optional[str] = None
     review_fix_mode: str = "ask"
+    chat_mode: ChatMode = "build"
+    skip_orchestration: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +189,7 @@ class PlanResponse(BaseModel):
     mission_id: Optional[str] = None
     title: Optional[str] = None
     milestones: list[dict[str, Any]] = Field(default_factory=list)
+    approval_state: Optional[str] = None
 
 
 class HandoffResponse(BaseModel):

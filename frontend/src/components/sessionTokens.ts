@@ -29,6 +29,8 @@ export interface SessionUsageSummary extends SessionTokenTotals {
 }
 
 const ROLE_ORDER = [
+  "ask",
+  "compact",
   "triage",
   "reviewer",
   "orchestrator",

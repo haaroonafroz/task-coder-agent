@@ -77,6 +77,7 @@ class SessionContext:
     phoenix_session_id: Optional[str] = None
     phoenix_project: Optional[str] = None
     thinking_profile: str = "auto"
+    chat_mode: str = "ask"
     reflection_memory_ids_used: list[str] = field(default_factory=list)
     project_profile: Optional[dict[str, Any]] = None
     git_preflight: Optional[dict[str, Any]] = None
@@ -129,6 +130,7 @@ class SessionContext:
             "phoenix_session_id": self.phoenix_session_id,
             "phoenix_project": self.phoenix_project,
             "thinking_profile": self.thinking_profile,
+            "chat_mode": self.chat_mode,
             "reflection_memory_ids_used": self.reflection_memory_ids_used,
             "project_profile": self.project_profile,
             "git_preflight": self.git_preflight,
@@ -229,6 +231,7 @@ class SessionManager:
             created_at=now,
             status="created",
             thinking_profile=thinking_profile,
+            chat_mode="ask",
             phoenix_project=phoenix_project,
             phoenix_session_id=session_id,  # bind 1:1 by default
             project_profile=profile,
@@ -362,6 +365,7 @@ class SessionManager:
             phoenix_session_id=meta.get("phoenix_session_id"),
             phoenix_project=meta.get("phoenix_project"),
             thinking_profile=meta.get("thinking_profile", "auto"),
+            chat_mode=meta.get("chat_mode", "ask"),
             reflection_memory_ids_used=meta.get("reflection_memory_ids_used", []),
             project_profile=meta.get("project_profile"),
             git_preflight=meta.get("git_preflight"),

@@ -59,6 +59,7 @@ from src.sandbox.dependency_check import (
     planned_module_names,
 )
 from src.agents.tool_diagnostics import (
+    compact_event_args,
     compact_tool_result,
     event_diagnostics,
     tool_failure_signature,
@@ -200,6 +201,7 @@ def run_worker(
             f"{_workspace_context_block(target_files)}\n"
             f"{_worker_milestone_brief(ms)}\n"
             f"## Current Mission\n{plan.get('title', '')}\n\n"
+            f"{_user_preferences_block(plan)}"
             f"## Milestone to Implement\n"
             f"**ID**: {ms_id}\n"
             f"**Title**: {milestone.get('title', '')}\n"
@@ -509,6 +511,7 @@ def run_worker(
                     "tool.called",
                     milestone_id=ms_id,
                     tool=tool_name,
+                    args=compact_event_args(tool_args),
                     args_keys=list(tool_args.keys()),
                     reasoning=reasoning,
                     call_index=tool_call_count + 1,
@@ -902,6 +905,13 @@ def _workspace_context_block(target_files: list[str] | None = None) -> str:
         f"{targets_note}\n"
         f"### Current directory tree\n```\n{tree}\n```\n"
     )
+
+
+def _user_preferences_block(plan: dict) -> str:
+    text = str(plan.get("user_preferences") or "").strip()
+    if not text:
+        return ""
+    return f"## User Preferences (authoritative)\n{text[:3000]}\n\n"
 
 
 def _worker_milestone_brief(ms: dict) -> str:
