@@ -66,17 +66,25 @@ def normalize_workspace_path(path: str) -> str:
     return p.lstrip("/")
 
 
-def resolve_workspace_path(path: str) -> Path:
-    """Resolve a workspace-relative path to an absolute Path under the active workspace root."""
-    p = Path(normalize_workspace_path(path))
-    if p.is_absolute():
-        return p
-    root = get_workspace_root()
-    resolved = (root / p).resolve()
-    # Safety: block path escape
-    root_resolved = root.resolve()
-    if root_resolved not in resolved.parents and resolved != root_resolved:
-        raise ValueError(f"Path escapes workspace: {path}")
+def resolve_workspace_path(path: str, *, root: Path | None = None) -> Path:
+    """Resolve a path to an absolute Path under the workspace root.
+
+    Accepts workspace-relative paths (preferred), optional ``workspace/`` prefix,
+    and absolute paths only when they resolve inside ``root``.
+    """
+    root_resolved = (root or get_workspace_root()).resolve()
+    stripped = path.strip().replace("\\", "/")
+    candidate = Path(stripped)
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+    else:
+        normalized = normalize_workspace_path(path)
+        rel = normalized if normalized else "."
+        resolved = (root_resolved / Path(rel)).resolve()
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError(f"Path escapes workspace: {path}") from exc
     return resolved
 
 

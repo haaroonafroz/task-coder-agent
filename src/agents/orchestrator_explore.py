@@ -9,10 +9,11 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from src.agents.tool_diagnostics import compact_tool_result, event_diagnostics
+from src.agents.tool_diagnostics import compact_event_args, compact_tool_result, event_diagnostics
 from src.agents.utils import parse_agent_turn, validate_plan_payload, trim_conversation
 from src.events import EventEmitter
-from src.llm_client import ModelChoice, call_llm, resolve_model_config
+from src.llm_client import ModelChoice, call_llm, span_model_name
+from src.settings import get_settings
 from src.telemetry import span_llm_call, span_tool_call, TelemetryContext
 from src.tools import dispatch
 from src.tools.tool_contracts import normalize_tool_args, validate_tool_call
@@ -34,11 +35,6 @@ _TEXT_SUFFIXES = {
 }
 _SKIP_DIRS = {".git", ".pytest_cache", ".venv", "__pycache__", "node_modules", "target"}
 
-MAX_ORCHESTRATOR_EXPLORE_CALLS = int(os.getenv("MAX_ORCHESTRATOR_EXPLORE_CALLS", "10"))
-MAX_ORCHESTRATOR_EXPLORE_LIGHT = int(os.getenv("MAX_ORCHESTRATOR_EXPLORE_LIGHT", "5"))
-ORCHESTRATOR_EXPLORE_ENABLED = os.getenv(
-    "ORCHESTRATOR_EXPLORE_ENABLED", "true"
-).lower() not in ("0", "false", "no")
 MAX_ORCHESTRATOR_BATCH_CALLS = 3
 _NON_JSON_RETRIES = 2
 
@@ -89,9 +85,11 @@ def should_explore(
     run_kind: str,
     workspace_root: Optional[Path],
     *,
-    enabled: bool = ORCHESTRATOR_EXPLORE_ENABLED,
+    enabled: Optional[bool] = None,
 ) -> tuple[bool, str]:
     """Return (explore, mode) where mode is ``full``, ``light``, or ``none``."""
+    if enabled is None:
+        enabled = get_settings().runtime.orchestrator_explore_enabled
     if not enabled or workspace_root is None or not workspace_root.exists():
         return False, "none"
     if run_kind == "repair":
@@ -104,10 +102,11 @@ def should_explore(
 
 
 def explore_budget(mode: str) -> int:
+    rt = get_settings().runtime
     if mode == "light":
-        return MAX_ORCHESTRATOR_EXPLORE_LIGHT
+        return rt.max_orchestrator_explore_light
     if mode == "full":
-        return MAX_ORCHESTRATOR_EXPLORE_CALLS
+        return rt.max_orchestrator_explore_calls
     return 0
 
 
@@ -185,6 +184,7 @@ def run_orchestration_explore(
     explore_mode: str,
     session: Optional[TelemetryContext],
     emitter: Optional[EventEmitter],
+    preference_brief: str = "",
 ) -> dict[str, Any]:
     """Exploration loop ending in a validated plan JSON object."""
     budget = explore_budget(explore_mode)
@@ -197,8 +197,15 @@ def run_orchestration_explore(
         f"{orientation_block}\n\n"
         f"## Run Mode\n{run_kind}\n\n"
         f"## Parent Plan\n{parent_plan_id or '(none)'}\n\n"
-        f"## User Request\n{user_request}\n\n"
     )
+    pref = (preference_brief or "").strip()
+    if pref:
+        user_turn += (
+            "## User Preferences (authoritative — captured in Ask mode)\n"
+            f"{pref}\n\n"
+            "Treat these as established product constraints. Do not re-ask them.\n\n"
+        )
+    user_turn += f"## User Request\n{user_request}\n\n"
     if previous_plan:
         user_turn += (
             "## Previous Plan (summary)\n"
@@ -229,16 +236,12 @@ def run_orchestration_explore(
 
     while tool_call_count < budget:
         messages = trim_conversation(conversation, max_turns=16)
-        span_model = (
-            resolve_model_config(model, "orchestrator").model_name
-            if model != "auto"
-            else model
-        )
+        span_model = span_model_name(model, "orchestrator")
         with span_llm_call("orchestrator", "explore", span_model, session=session):
             llm_result = call_llm(
                 messages=messages,
                 model=model,
-                max_tokens=int(os.getenv("MAX_TOKENS_ORCHESTRATOR", "24576")),
+                max_tokens=get_settings().roles.orchestrator.max_tokens,
                 system_prompt=orchestrator_md,
                 json_mode=True,
                 role="orchestrator",
@@ -331,6 +334,7 @@ def run_orchestration_explore(
                 emitter.emit(
                     "tool.called",
                     tool=tool_name,
+                    args=compact_event_args(tool_args),
                     args_keys=list(tool_args.keys()),
                     reasoning=reasoning,
                     call_index=tool_call_count + 1,

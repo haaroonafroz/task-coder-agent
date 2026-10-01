@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -10,13 +9,13 @@ from src.agents.worker import run_worker
 from src.agents.contracts import normalize_hotfix_result
 from src.events import EventEmitter
 from src.llm_client import ModelChoice
+from src.settings import get_settings
 from src.telemetry import TelemetryContext
 
 _CONFIG_DIR = Path(__file__).parent.parent.parent / "config"
 _HOTFIX_MD = (_CONFIG_DIR / "hotfix.md").read_text(encoding="utf-8")
-
-MAX_HOTFIX_TOOL_CALLS = int(os.getenv("MAX_HOTFIX_TOOL_CALLS", "10"))
-MAX_TOKENS_HOTFIX = int(os.getenv("MAX_TOKENS_HOTFIX", "12288"))
+MAX_HOTFIX_TOOL_CALLS = 10
+MAX_TOKENS_HOTFIX = 12288
 
 
 def run_hotfix(
@@ -62,8 +61,8 @@ def run_hotfix(
         prior_failure_state=prior_failure_state,
         agent_role="hotfix",
         system_prompt=_HOTFIX_MD,
-        max_tool_calls=MAX_HOTFIX_TOOL_CALLS,
-        max_tokens=MAX_TOKENS_HOTFIX,
+        max_tool_calls=get_settings().runtime.max_hotfix_tool_calls,
+        max_tokens=get_settings().roles.hotfix.max_tokens,
     )
     result["hotfix_result"] = normalize_hotfix_result(result).to_dict()
     if emitter:

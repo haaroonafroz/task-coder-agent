@@ -1,5 +1,6 @@
 import type { AgentTurn, ToolCallEntry } from "../api/types";
 import { LLMStatsBar } from "./LLMStatsBar";
+import { Markdown } from "./Markdown";
 import { formatTs, personaLabel } from "../hooks/useChatTurns";
 
 interface Props {
@@ -7,28 +8,59 @@ interface Props {
   contextLength?: number | null;
 }
 
-function ToolRow({ entry }: { entry: ToolCallEntry }) {
-  return (
-    <div className="tool-call-row">
-      <span className="tool-call-name">{entry.tool}</span>
-      {entry.reasoning && <span className="tool-call-reason">{entry.reasoning}</span>}
-    </div>
+function toolCallJson(entry: ToolCallEntry): string {
+  return JSON.stringify(
+    {
+      tool: entry.tool,
+      args: entry.args || {},
+      ...(entry.reasoning ? { reasoning: entry.reasoning } : {}),
+    },
+    null,
+    2,
   );
 }
 
-function formatOutput(text: string, outputKind?: string): string {
-  if (!text) return "";
-  if (outputKind !== "json") return text;
+function ToolRow({ entry }: { entry: ToolCallEntry }) {
+  const detail = toolCallJson(entry);
+  return (
+    <details className="tool-call-row">
+      <summary>
+        <span className="tool-call-name">{entry.tool}</span>
+        {entry.reasoning && <span className="tool-call-reason">{entry.reasoning}</span>}
+      </summary>
+      <pre className="tool-call-json">{detail}</pre>
+    </details>
+  );
+}
+
+function visibleOutput(text: string): string {
+  const stripped = text.trim();
+  if (!stripped) return "";
+  if (!stripped.startsWith("{")) return stripped;
   try {
-    return JSON.stringify(JSON.parse(text), null, 2);
+    const parsed = JSON.parse(stripped) as Record<string, unknown>;
+    if (typeof parsed.answer === "string" && parsed.answer.trim()) {
+      return parsed.answer;
+    }
+    if (
+      parsed.tool
+      || parsed.calls
+      || parsed.action
+      || parsed.status === "complete"
+      || parsed.status === "blocked"
+      || parsed.status === "request_scope"
+    ) {
+      return "";
+    }
   } catch {
-    return text;
+    if (/"tool"\s*:|"calls"\s*:/.test(stripped)) return "";
   }
+  return stripped;
 }
 
 export function PersonaTurn({ turn, contextLength }: Props) {
   const hasThinking = turn.thinking.trim().length > 0;
-  const output = formatOutput(turn.output, turn.metrics?.output_kind);
+  const output = visibleOutput(turn.output);
 
   return (
     <div className={`message agent-turn ${turn.streaming ? "streaming" : ""}`}>
@@ -38,16 +70,10 @@ export function PersonaTurn({ turn, contextLength }: Props) {
       </div>
 
       {hasThinking && (
-        <details className="thinking-block" open={turn.streaming}>
+        <details className="thinking-block" open={turn.streaming && !output}>
           <summary>Thinking</summary>
           <pre>{turn.thinking}</pre>
         </details>
-      )}
-
-      {output && (
-        <div className="output-block">
-          <pre>{output}</pre>
-        </div>
       )}
 
       {turn.tools.length > 0 && (
@@ -55,6 +81,12 @@ export function PersonaTurn({ turn, contextLength }: Props) {
           {turn.tools.map((entry, index) => (
             <ToolRow key={`${entry.tool}-${entry.ts}-${index}`} entry={entry} />
           ))}
+        </div>
+      )}
+
+      {output && (
+        <div className="output-block">
+          <Markdown text={output} />
         </div>
       )}
 

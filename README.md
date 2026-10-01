@@ -1,17 +1,25 @@
-# Missions Architecture — Self-Improving Multi-Agent Coding Runtime
+# Missions — Self-Improving Multi-Agent Coding Runtime
 
-A serial multi-agent system for building software with **small local LLMs**. A
-focused Triage router selects the full Mission pipeline, a scoped Hotfix
-profile, or a read-only Code Review profile. Changed code always passes through
-the Validator; broad review findings escalate to the Orchestrator.
+A serial multi-agent harness for building and repairing software. A focused
+Triage router selects the full Mission pipeline, a scoped Hotfix profile, or a
+read-only Code Review profile. Changed code always passes through the Validator;
+broad review findings escalate to the Orchestrator.
 
-This repo is a proof of concept: the architecture (not raw model scale) is what makes local 27B-class models usable for non-trivial coding tasks.
+The harness is **inference-agnostic**. It talks OpenAI-compatible
+`/v1/chat/completions` to llama.cpp, Ollama, LM Studio, vLLM, OpenAI, Gemini, or
+OpenRouter. It does **not** start a model server. You point it at a local URL or
+a cloud API key from the UI or `settings.json`.
+
+This repo is a proof of concept: the architecture (not raw model scale) is what
+makes 27B-class local models — and mixed local/cloud setups — usable for
+non-trivial coding tasks.
 
 ---
 
 ## Why this architecture exists
 
-Large cloud models tolerate sloppy agent design. Small local models do not. This stack applies standard software-engineering discipline to the agent loop:
+Large cloud models tolerate sloppy agent design. Small local models do not. This
+stack applies standard software-engineering discipline to the agent loop:
 
 | Principle | How it is enforced |
 |---|---|
@@ -22,7 +30,7 @@ Large cloud models tolerate sloppy agent design. Small local models do not. This
 | **Grounded context** | Core inspection/edit/check tools remain available across retries; Qdrant adds niche capabilities. A JSON memory store records failures and milestone state; Cognee is opt-in and fire-and-forget when enabled. |
 | **Diff-first editing** | Full `write_file` rewrites of existing files >60 lines are rejected unless the file was read first this milestone (or `rewrite=true`). Keeps decode cost low and regressions rare. |
 | **Serial execution** | One LLM call at a time — required on dual 16 GB GPUs where parallel agents would OOM. |
-| **Observability** | Arize Phoenix traces Orchestrator / Worker / Validator calls; `llm.call` events with token counts and prefill/decode timing land in `events.jsonl`; the web UI streams session events in real time. |
+| **Observability** | Arize Phoenix traces Orchestrator / Worker / Validator calls; `llm.call` events with token counts and prefill/decode timing land in `events.jsonl`; the web UI streams session events and session-level token totals in real time. |
 
 ---
 
@@ -80,349 +88,523 @@ User request → lifecycle resolution → Triage route
 └─────────────────────────────────────────┘
 ```
 
-On **PASS**, the runtime commits workspace changes and writes handoff JSON under the active session. On crash, the session-local `plan.json`, event log, handoffs, and memory store allow resume.
+On **PASS**, the runtime commits workspace changes and writes handoff JSON under
+the active session. On crash, the session-local `plan.json`, event log, handoffs,
+and memory store allow resume.
+
+---
+
+## Requirements
+
+- **OS:** Linux (macOS works with policy-only sandbox; no bubblewrap)
+- **Python:** 3.10+
+- **Node.js 18+** (to build the web UI)
+- **An OpenAI-compatible LLM endpoint** — llama.cpp, Ollama, LM Studio, vLLM,
+  OpenAI, Gemini, or OpenRouter. The harness does **not** start a model server.
+- **Optional:** `bubblewrap` (`bwrap`) for a kernel jail on attached folders
+- **Optional:** GPU + llama.cpp if you want local inference (see `scripts/`)
+
+---
+
+## Getting started
+
+Inference stays outside this repo. Install the harness, then point it at a `/v1`
+URL or a cloud key.
+
+### 1. Clone and install (native, recommended)
+
+Native install can attach any host folder. Docker cannot, unless you bind-mount
+it.
+
+```bash
+git clone <this-repo> missions
+cd missions
+bash scripts/install.sh
+source .venv/bin/activate
+missions doctor
+missions serve
+```
+
+`install.sh` creates `.venv`, installs the package (`missions` CLI), builds
+`frontend/dist`, runs `missions init`, and prints `missions doctor`.
+
+Open **http://127.0.0.1:8088**. On first boot with no providers, a setup wizard
+asks for a local OpenAI-compatible URL (for example
+`http://127.0.0.1:8001/v1` or Ollama `http://127.0.0.1:11434/v1`) or a cloud API
+key.
+
+```bash
+missions doctor    # install / config diagnostics
+missions init      # write default settings.json (no overwrite unless --force)
+```
+
+Debian/Ubuntu jail for attached repos:
+
+```bash
+sudo apt install bubblewrap
+```
+
+Without bubblewrap, external folders still run, using command policy only.
+
+### 2. Where state lives
+
+Harness state is **not** required to live in the git checkout.
+
+| `TASK_CODER_HOME` | Used when |
+|---|---|
+| `$TASK_CODER_HOME` | You set it (recommended for a clean install) |
+| repository root | The checkout already has `sessions/` or `.env` (developer machine) |
+| `~/.missions` | New users with neither of the above |
+
+Under that home directory:
+
+```
+settings.json     # non-secret config (providers, roles, qdrant, sandbox)
+secrets.json      # API keys (mode 0600) — never commit this
+sessions/         # per-session plans, events, handoffs
+managed-workspaces/
+qdrant/           # embedded vector index (default)
+```
+
+Copying `settings.json` / `secrets.json` from another machine is fine. Do **not**
+paste `.env` comment suffixes into JSON (for example
+`"executor": "auto      # auto | native | bwrap"`). Literals must be a single
+token: `"auto"`, `"balanced"`. Restart `missions serve` after hand-editing JSON;
+settings are loaded once at process start.
+
+### 3. Manual install (developers)
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+python -m playwright install chromium   # optional, ui_smoke
+npm --prefix frontend install
+npm --prefix frontend run build
+missions init
+missions serve --reload
+```
+
+Existing `.env` files are imported **once** into `settings.json` / `secrets.json`
+on first boot. After that, edit JSON or the Settings UI — a `.env` is not
+required.
+
+Hot-reload frontend during UI work:
+
+```bash
+missions serve --host 127.0.0.1 --port 8088
+npm --prefix frontend run dev
+```
+
+Vite on `http://127.0.0.1:5173` proxies `/api/*` to port 8088. After changing
+the React app, rebuild before expecting `http://127.0.0.1:8088` (which serves
+`frontend/dist`) to update:
+
+```bash
+npm --prefix frontend run build
+```
+
+Then hard-refresh the browser (Ctrl+Shift+R).
+
+### 4. Docker (managed workspaces / cloud-only)
+
+```bash
+docker compose up --build
+```
+
+Open `http://localhost:8088`. This image does **not** start llama.cpp. Point
+Settings at `http://host.docker.internal:11434/v1` (Ollama) or a cloud key.
+
+Docker cannot see arbitrary host paths. To attach a project, bind-mount it and
+type the **container** path in the UI:
+
+```yaml
+volumes:
+  - missions-data:/data
+  - ${HOME}/projects:/host-projects
+```
+
+Use `/host-projects/my-app` as the workspace path. Prefer the native install if
+you work on many local repos.
+
+### 5. Optional local llama.cpp
+
+The TurboQuant / dual-V100 scripts are an **inference sidecar**, not part of
+harness install:
+
+```bash
+bash scripts/build_llamacpp.sh
+bash scripts/download_models.sh --qwen3627b
+bash scripts/start_server_speculative.sh
+```
+
+Then add or enable provider `local` with `http://127.0.0.1:8001/v1`. Start that
+server **before** selecting `local` in the UI. A disabled provider is skipped
+(the picker shows it as disabled; Auto uses the enabled fallback chain).
+
+---
+
+## Configure LLMs
+
+A selectable “model” in the UI is a **provider**: `id` + `base_url` + `adapter`
++ `model` name + its own secret. Two OpenAI rows do not share a key.
+
+### Settings UI (preferred)
+
+**Settings → Models**: add a preset (llama.cpp, Ollama, OpenAI, Gemini,
+OpenRouter, …), set the model id the server actually serves, paste the API key
+on that card, click **Test**. The UI writes `secrets.json` as
+`provider.<that-id>` and appends the id to `fallback_order`.
+
+**Settings → Agent**: per-role temperature, max tokens, thinking effort. Those
+are *values*. The client maps them onto whatever wire fields the model accepts.
+
+### `settings.json` / `secrets.json`
+
+The following `settings.json` can be used as-is or configured according to user prefernces. It contains examples of locally served as well as cloud API LLM providers. The `id` item is also used as is in the `secrets.json` to map the API key (shown later in the example `secrets.json`):
+
+```json
+{
+  "llm": {
+    "providers": [
+      {
+        "id": "local",
+        "label": "llama.cpp (local)",
+        "base_url": "http://localhost:8001/v1",
+        "adapter": "llamacpp_qwen",
+        "model": "qwen3.8-27b-mtp",
+        "models_by_role": {},
+        "compat": "auto",
+        "enabled": true,
+        "context_length": 32768
+      },
+      {
+        "id": "gemini",
+        "label": "Gemini",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "adapter": "gemini_openai",
+        "model": "gemini-3.1-flash-lite",
+        "models_by_role": {},
+        "compat": "auto",
+        "enabled": true,
+        "context_length": null
+      },
+      {
+        "id": "gpt4o",
+        "label": "OpenAI (gpt4o)",
+        "base_url": "https://api.openai.com/v1",
+        "adapter": "openai",
+        "model": "gpt-4o",
+        "models_by_role": {
+          "worker": "gpt-4o-mini",
+          "hotfix": "gpt-4o-mini"
+        },
+        "compat": "auto",
+        "enabled": true,
+        "context_length": null
+      },
+      {
+        "id": "gpt-6-luna",
+        "label": "OpenAI (gpt-6-luna)",
+        "base_url": "https://api.openai.com/v1",
+        "adapter": "openai",
+        "model": "gpt-6-luna",
+        "models_by_role": {
+          "worker": "gpt-6-luna",
+          "hotfix": "gpt-6-luna"
+        },
+        "compat": "auto",
+        "enabled": true,
+        "context_length": null
+      }
+    ],
+    "default_provider": "local",
+    "fallback_order": [
+      "local",
+      "gemini",
+      "gpt4o"
+    ],
+    "seed": 42,
+    "context_length": 32768
+  },
+  "roles": {
+    "triage": {
+      "temperature": 0.7,
+      "top_p": 0.95,
+      "max_tokens": 8192,
+      "thinking": "low",
+      "thinking_enabled": true
+    },
+    "orchestrator": {
+      "temperature": 0.7,
+      "top_p": 0.95,
+      "max_tokens": 24576,
+      "thinking": "xhigh",
+      "thinking_enabled": true
+    },
+    "worker": {
+      "temperature": 0.7,
+      "top_p": 0.8,
+      "max_tokens": 12289,
+      "thinking": "minimal",
+      "thinking_enabled": true
+    },
+    "hotfix": {
+      "temperature": 0.7,
+      "top_p": 0.8,
+      "max_tokens": 12288,
+      "thinking": "low",
+      "thinking_enabled": true
+    },
+    "reviewer": {
+      "temperature": 0.7,
+      "top_p": 0.95,
+      "max_tokens": 16384,
+      "thinking": "medium",
+      "thinking_enabled": true
+    },
+    "validator": {
+      "temperature": 0.6,
+      "top_p": 0.95,
+      "max_tokens": 16384,
+      "thinking": "medium",
+      "thinking_enabled": true
+    }
+  },
+  "qdrant": {
+    "mode": "http",
+    "path": "~/.missions/qdrant", //for locally hosted qdrant collection
+    "url": "https://....cloud.qdrant.io", // cloud hosted qdrant collection
+    "collection": "agent_skills",
+    "dense_name": "dense",
+    "sparse_name": "sparse",
+    "dense_dims": 768
+  },
+  "embeddings": {
+    "backend": "auto",
+    "hf_model": "BAAI/bge-base-en-v1.5",
+    "openai_model": "text-embedding-3-small",
+    "openai_dims": 768
+  },
+  "runtime": {
+    "max_worker_batch_calls": 3,
+    "max_worker_history_turns": 40,
+    "max_worker_tool_calls": 100,
+    "worker_contract_autorun_max": 8,
+    "worker_autorun_stdout_chars": 600,
+    "worker_autorun_stderr_chars": 400,
+    "max_same_tool_failures": 2,
+    "max_consecutive_tool_failures": 5,
+    "max_replans_per_milestone": 2,
+    "max_hotfix_tool_calls": 100,
+    "max_review_tool_calls": 150,
+    "worker_ui_nudge_after": 4,
+    "worker_ui_strong_nudge_after": 8,
+    "max_orchestrator_explore_calls": 50,
+    "max_orchestrator_explore_light": 25,
+    "orchestrator_explore_enabled": true,
+    "log_level": "ERROR",
+    "sandbox": {
+      "executor": "auto",
+      "mode": "balanced",
+      "require_bwrap": false
+    }
+  },
+  "observability": {
+    "api_telemetry": true,
+    "phoenix_host": "http://127.0.0.1",
+    "phoenix_port": 6006,
+    "phoenix_external": true,
+    "auto_eval": false,
+    "eval_llm_judge": false,
+    "eval_phoenix_export": true
+  },
+  "memory": {
+    "backend": "json"
+  }
+}
+```
+Example `secrets.json`
+
+```json
+{
+  "provider.gpt4o": "sk-...",
+  "provider.gpt-6-luna": "sk-...",
+  "qdrant": "<Qdrant API key if using cloud hosting>", //optional
+  "hf": "<huggingface token for downloading models>", //optional
+}
+```
+
+Rules:
+
+- **`id`** is the dropdown value. **`model`** is the string sent to the API.
+- **`models_by_role`** optionally overrides `model` per agent (`worker`,
+  `hotfix`, …). Omit it to use one model for every role.
+- **`enabled`**: `false` drops the provider from Auto and from runnable
+  selections. Re-enable it in Settings when the server is back.
+- **`fallback_order`**: Auto walks this list, skipping disabled ids. A new
+  provider is **not** used by Auto until you add its id here (the Settings UI
+  does that when you add a preset).
+- **`adapter`**: `generic` or `openai` (stock Chat Completions),
+  `gemini_openai` (Gemini thinking extras), `llamacpp_qwen` (Qwen
+  `chat_template_kwargs`).
+- **`compat`**: `auto` (default), `classic` (`max_tokens` + sampling), or
+  `openai_reasoning` (`max_completion_tokens`, no sampling). `auto` on the
+  `openai` adapter treats `gpt-5*` / `gpt-6*` / `o1` / `o3` / `o4` as reasoning
+  models. If the API still returns `unsupported_parameter`, the **same**
+  provider is retried with that field renamed or dropped.
+- Secrets are **`provider.<id>`**, not a shared OpenAI key. `OPENAI_API_KEY` in
+  the environment is applied only to ids `gpt4o` and `openai`.
+- Custom ids (for example `gpt-6-luna`) are added by editing JSON; the Models
+  tab only inserts preset ids. Give that id its own `secrets.json` entry and
+  put it on `fallback_order` if Auto should use it.
+
+Hand-edits require a process restart. `missions doctor` lists each provider’s
+on/off state and URL.
+
+### Qdrant and embeddings
+
+Default is **embedded** Qdrant via `qdrant-client` 1.18.0 (compatible with
+server 1.18.x, including 1.18.2) under `$TASK_CODER_HOME/qdrant`. No Cloud
+collection is required. Switch to HTTP/Cloud in Settings → Integrations, or set
+`MISSIONS_QDRANT_MODE=http` and `QDRANT_URL`. Embeddings default to local
+`BAAI/bge-base-en-v1.5`; keyword ranking is the fallback if the encoder is
+unavailable.
+
+---
+
+## Running a mission
+
+### Web UI
+
+```bash
+source .venv/bin/activate
+missions serve
+```
+
+Open `http://127.0.0.1:8088`.
+
+- **Sessions:** create a managed greenfield workspace or attach an existing
+  folder (read/write or read-only).
+- **Chat:** Ask / Plan / Build mode dropdown, user messages, streaming agent
+  turns, mission recap. Per-turn stats (prefill / generated / context bar) sit
+  under each agent bubble.
+- **Run inspector (right):** current stage, **session token totals**, expandable
+  **By agent** breakdown (tokens + tool counts), milestone events, workspace
+  files.
+- **Stop:** cancels the current run cooperatively at the next agent checkpoint
+  (does not kill `missions serve` or the model server). Type `/exit` in chat
+  to cancel the current run the same way.
+- **Settings:** providers, role knobs, Qdrant, sandbox.
+
+### Chat modes
+
+The composer dropdown is a **session chat mode**, separate from review/hotfix
+routing. The model cannot switch modes from inside a prompt.
+
+- **Ask** (default in the UI): conversation plus a bounded set of read-only
+  workspace tools. It can inspect files, search code, and view project/Git
+  context, but cannot write, install, run commands, or start services. Use it
+  to capture preferences before a build and to question the current code or a
+  completed mission afterward. A rolling `conversation_brief.json` is what
+  Plan and Build see — not the full transcript.
+- **Plan**: only the orchestrator (plus optional read-only explore) runs. The
+  draft is shown as a plan card. Send changes to patch it, or approve with
+  **Build** / a short phrase (`lgtm`, `go`, `build`). Workers do not start.
+- **Build**: the existing serial pipeline. If a draft plan is waiting, Build
+  executes it without re-planning. API clients that omit `chat_mode` still
+  **build**, so older callers keep today’s behavior.
+
+`python -m src.main --chat-mode ask|plan|build "..."` selects the same modes
+from the CLI (default `build`).
+
+Mockups of the control UI (not live captures):
+
+![Missions Control UI overview](docs/screenshots/control-ui-overview.svg)
+
+![Run inspector milestone and workspace detail](docs/screenshots/run-inspector-detail.svg)
+
+Theme is a dark control UI. Sensitive files (`.env`, keys) are hidden in the
+workspace browser.
+
+### CLI
+
+```bash
+python -m src.main "Build a Python module that validates email addresses with tests"
+
+python -m src.main --model local   "..."   # one provider id
+python -m src.main --model gpt4o   "..."
+python -m src.main --model auto    "..."   # walks fallback_order
+
+python -m src.main --workspace /home/me/projects/billing-api \
+  "Fix the failing invoice test"
+
+python -m src.main --workspace /home/me/projects/billing-api --read-only \
+  --execution-route review "Review this project for correctness bugs"
+```
+
+`test_project.txt` has copy-paste example missions.
+
+### Repair / resume
+
+A follow-up on a completed session starts a `repair` run in the same workspace.
+Plans are archived under `sessions/<id>/plans/`.
+
+```bash
+python -m src.main --session <session-id> --run-kind repair \
+  "Fix the runtime error and add a regression test"
+python -m src.main --session <session-id> --run-kind resume \
+  "Continue the interrupted run"
+```
+
+Deleting a session never deletes an attached external workspace. Managed
+workspaces are deleted with their session.
+
+```bash
+rm -rf "$TASK_CODER_HOME/sessions/<session-id>" \
+       "$TASK_CODER_HOME/managed-workspaces/<session-id>"
+```
+
+Artifacts after a run:
+
+- **Managed code:** `managed-workspaces/<session-id>/`
+- **External code:** remains at the attached path
+- **Plan / events / handoffs / runs:** under `sessions/<session-id>/`
 
 ---
 
 ## Project layout
 
 ```
-config/
-  triage.md            # Request routing among mission/hotfix/review
-  orchestrator.md      # Planning persona + contract rules + patch-ops format
-  worker.md            # Implementation persona + batched tool-call format
-  hotfix.md            # Localized minimal-patch persona
-  code_review.md       # Read-only evidence-backed review persona
-  validator.md        # Adversarial QA persona + diff review
-  skills.md            # Tool capabilities (chunked for Qdrant indexing)
-
+config/                # Agent personas and skills.md (Qdrant index)
 src/
-  main.py              # MissionsRuntime — serial pipeline + replan circuit breakers
-  llm_client.py        # local → gemini → gpt4o fallback chain; per-role temp/tokens
-  tool_registry.py     # Cloud Qdrant + BGE embeddings + keyword boost
-  memory_layer.py      # JSON store (default) + Cognee (opt-in, fire-and-forget)
-  telemetry.py         # Arize Phoenix OpenTelemetry
-  api/                 # FastAPI control plane for sessions, runs, events, files
-  agents/
-    contracts.py       # Route, Hotfix packet, and Review report contracts
-    triage.py          # Focused execution-route selection
-    hotfix.py          # Scoped profile using hardened Worker loop mechanics
-    code_review.py     # Read-only inspection and finding classification
-    orchestrator.py    # Phase 1 + 1.5: plan + patch-based replan + corrective JSON
-    worker.py          # Phase 3: json_mode, batched calls, contract auto-run, resume
-    validator.py       # Phase 4: diff injection, failure signatures, raw output
-    plan_ops.py        # Deterministic plan patch validation + application
-    plan_lint.py       # Pre-execution plan lint (schema, contracts, deps)
-    utils.py           # JSON parsing, conversation trim, failure fingerprints
-  tools/               # file ops, git ops, polyglot checks, managed UI tools
-
-frontend/
-  src/                 # React control UI
-  src/components/      # Chat feed, session sidebar, run inspector, file explorer
-
-sessions/<session-id>/
-  session.json         # Session metadata
-  plan.json            # Live milestone plan (patched in place)
-  events.jsonl         # Append-only event stream (incl. llm.call metrics)
-  memory_store.json    # JSON memory (synchronous source of truth)
-  handoffs/            # Per-milestone telemetry
-  .venv/               # Harness environment for managed workspaces
-
-managed-workspaces/<session-id>/
-  ...                  # Harness-owned greenfield code
-
-src/workspace/         # Bindings, inspection, environments, Git state, locks
-
-docs/screenshots/      # README demo visualizations
-test_project.txt       # Copy-paste example mission commands
-scripts/
-  build_llamacpp.sh    # Build TurboQuant llama.cpp for V100+
-  download_models.sh   # HuggingFace GGUF downloads
-  start_server_speculative.sh  # MTP llama-server on port 8001
+  cli.py               # missions serve | init | doctor
+  settings/            # schema + settings.json / secrets.json store
+  llm_client.py        # named providers, adapters, request-shape compat
+  tool_registry.py     # embedded or HTTP Qdrant + BGE / keyword fallback
+  api/                 # FastAPI: sessions, runs, events, settings, files
+  agents/              # triage, orchestrator, worker, hotfix, review, validator
+  sandbox/             # bubblewrap or native+policy
+frontend/              # React control UI (build → frontend/dist)
+scripts/install.sh     # Native install
+Dockerfile             # App-only image (no inference)
 ```
 
-Legacy MBPP speculative-decoding benchmark code remains under `pipeline/`, `run_experiment.py`, and `analysis/` for reference.
+Session state lives under `$TASK_CODER_HOME` (see above), not necessarily in
+this tree.
+
+Legacy MBPP speculative-decoding benchmark code remains under `pipeline/`,
+`run_experiment.py`, and `analysis/` for reference.
 
 ---
 
-## Requirements
-
-- **OS:** Linux with CUDA (tested on dual Tesla V100 16 GB)
-- **Python:** 3.10+
-- **GPU driver + CUDA toolkit** (for building llama.cpp with `nvcc`)
-- **HuggingFace account** with accepted model licenses (Gemma 4 if used)
-- **Optional cloud services:** Qdrant Cloud (skill routing), OpenAI (embeddings + optional Cognee), Gemini/GPT-4o fallback
-
----
-
-## Installation
-
-### 1. Clone and create a virtual environment
-
-```bash
-cd coding-agent
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python -m playwright install chromium
-```
-
-The Chromium browser is installed once in the harness environment and is used
-by managed `ui_smoke` validation. It is not installed into mission workspaces.
-
-Install the React control UI dependencies:
-
-```bash
-npm --prefix frontend install
-```
-
-### 2. Configure environment
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` with at minimum:
-
-```ini
-HF_TOKEN=hf_...
-
-# Local llama-server (Missions default backend)
-LLM_SPECULATIVE_URL=http://localhost:8001/v1
-TARGET_MODEL_GGUF=/path/to/models/your-model.gguf
-MODEL_ALIAS=your-model-alias
-TARGET_MODEL=your-model-alias
-
-# Per-role sampling (tool-calling needs near-deterministic decoding)
-LLM_TEMPERATURE_WORKER=0.2
-LLM_TEMPERATURE_ORCHESTRATOR=0.5
-LLM_TEMPERATURE_VALIDATOR=0.2
-
-# Worker protocol
-MAX_WORKER_BATCH_CALLS=3
-WORKER_CONTRACT_AUTORUN_MAX=8
-
-# Tool-call circuit breakers
-MAX_SAME_TOOL_FAILURES=2
-MAX_CONSECUTIVE_TOOL_FAILURES=5
-
-# Replan circuit breaker
-MAX_REPLANS_PER_MILESTONE=2
-
-# Memory backend: json (default, zero latency) | cognee (opt-in)
-MISSIONS_MEMORY_BACKEND=json
-
-# Qdrant Cloud (skill routing)
-QDRANT_URL=https://....cloud.qdrant.io:6333
-QDRANT_API_KEY=...
-QDRANT_COLLECTION=agent_skills
-
-# Optional fallbacks
-GEMINI_API_KEY=...
-OPENAI_API_KEY=...
-```
-
-### 3. Build llama.cpp (TurboQuant fork)
-
-Pre-built binaries often lack reliable `sm_70` (V100) kernels. Build from source:
-
-```bash
-bash scripts/build_llamacpp.sh
-export PATH="$HOME/llama-cpp-turboquant/build/bin:$PATH"
-```
-
-Add the `export PATH=...` line to your shell profile.
-
-### 4. Download a model
-
-#### Qwen3.6 / Qwopus3.6 (recommended for this repo)
-
-These families ship **MTP draft weights inside a single GGUF file**. No separate draft download is required. The server uses `--spec-type draft-mtp` on that one file.
-
-```bash
-# Qwen3.6 27B MTP (default in download script)
-bash scripts/download_models.sh --qwen3627b
-
-# Qwopus3.6 27B MTP
-bash scripts/download_models.sh --qwopus3627b
-```
-
-Copy the printed `TARGET_MODEL_GGUF`, `MODEL_ALIAS`, and `TARGET_MODEL` lines into `.env`.
-
-#### Gemma 4 (separate draft file required)
-
-Gemma 4 MTP uses a **target GGUF plus a separate assistant/draft GGUF**. Download both:
-
-```bash
-bash scripts/download_models.sh --e4b   # or --e2b, --26b, --31b
-```
-
-Set `TARGET_MODEL_GGUF` and `DRAFT_MODEL_GGUF` in `.env`. For Gemma, uncomment the draft-related lines in `scripts/download_models.sh` and `scripts/start_server_speculative.sh`, and pass the draft model to `llama-server` (e.g. `--model-draft "$DRAFT_FILE"`).
-
-| Family | Draft model | Download |
-|---|---|---|
-| Qwen3.6 MTP | Built into target GGUF | `--qwen3627b` |
-| Qwopus3.6 MTP | Built into target GGUF | `--qwopus3627b` |
-| Gemma 4 | Separate assistant GGUF | `--e4b` / `--e2b` / `--26b` / `--31b` |
-
-### 5. Start the local inference server
-
-Only **one** llama-server should run during Missions (serial design + VRAM budget):
-
-```bash
-bash scripts/start_server_speculative.sh
-curl http://localhost:8001/v1/models   # confirm live
-```
-
-The Missions runtime connects to `LLM_SPECULATIVE_URL` (port **8001**) with `model=auto`, which tries local first.
-
-**MTP / speculative decoding** accelerates token generation on supported models, shortening Orchestrator → Worker → Validator iteration cycles on the same hardware.
-
-### 6. Optional: Phoenix observability
-
-```bash
-# Terminal 1 — keep running
-phoenix serve
-# Dashboard: http://127.0.0.1:6006
-```
-
-Set in `.env`:
-
-```ini
-PHOENIX_HOST=127.0.0.1
-PHOENIX_PORT=6006
-PHOENIX_EXTERNAL=true
-```
-
-Or set `PHOENIX_EXTERNAL=false` to let the runtime launch Phoenix in-process.
-
----
-
-## Running a mission
-
-### Web control UI
-
-The recommended interactive path is the browser UI. It exposes a chat-style request box, a session sidebar, a live activity feed, and a resizable run inspector that shows milestone progress, scoped events, and the session file tree.
-
-Start the API server:
-
-```bash
-source .venv/bin/activate
-python -m src.api --host 127.0.0.1 --port 8088 error
-```
-
-Start the frontend in another terminal:
-
-```bash
-npm --prefix frontend run dev
-```
-
-Open `http://127.0.0.1:5173`. Vite proxies `/api/*` to the FastAPI server on `127.0.0.1:8088`.
-
-The UI is organized around:
-
-- **Sessions:** create a managed greenfield workspace or attach an existing
-  folder with read/write or read-only access.
-- **Live activity feed:** center chat stream combining user messages, assistant summaries, and SSE events such as `plan.created`, `tool.called`, `validation.finished`, and `mission.complete`.
-- **Run inspector:** resizable right panel with milestone accordions. Each milestone expands into only the events tagged with that milestone id.
-- **Workspace files:** file browser rooted at the bound project. Sensitive
-  files such as `.env`, private keys, and credential files are not exposed.
-- **Theme:** neutral black/gray UI with white/gray emphasis instead of the older blue theme.
-
-> Token-level model deltas are not streamed to the UI yet. The backend already consumes provider streams internally; exposing `llm.delta` events would be the next step if you want live generated-token rendering in the chat feed.
-
-### Demo visualizations
-
-These SVGs are documentation mockups of the current UI design, not browser captures. Replace them with real screenshots after launching the app if you want exact runtime captures.
-
-![Missions Control UI overview](docs/screenshots/control-ui-overview.svg)
-
-![Run inspector milestone and workspace detail](docs/screenshots/run-inspector-detail.svg)
-
-### Quick smoke test
-
-```bash
-source .venv/bin/activate
-python -m src.main "Build a Python module that validates email addresses with tests"
-```
-
-### Example projects
-
-`test_project.txt` contains five ready-made missions (arithmetic evaluator, password checker, inventory tracker, text stats, roman numerals). Each line is a full `python -m src.main "..."` command — copy and run.
-
-```bash
-# Example: safe math expression evaluator
-python -m src.main "Build a Python module that safely evaluates basic math expressions (+, -, *, /, parentheses, integers and floats). Split it into tokenizer.py and evaluator.py. Include tests for valid expressions, division by zero, malformed input, whitespace, and nested parentheses."
-```
-
-### CLI options
-
-```bash
-python -m src.main --model local   "..."   # force local llama-server
-python -m src.main --model gemini  "..."   # force Gemini
-python -m src.main --model gpt4o   "..."   # force OpenAI
-python -m src.main --model auto    "..."   # local → gemini → gpt4o (default)
-
-python -m src.main --no-telemetry "..."    # disable Phoenix spans
-python -m src.main --no-memory    "..."    # disable memory layer entirely
-```
-
-### Repairing a completed session
-
-Submitting a follow-up request to a completed session automatically starts a
-`repair` run in the existing workspace. Repair runs perform a read-only triage
-pass, create a new plan linked to the previous plan, and never reuse the
-previous plan's completed milestone state. Plans are archived under
-`sessions/<session-id>/plans/`.
-
-The lifecycle can also be selected explicitly from the CLI:
-
-```bash
-python -m src.main --session <session-id> --run-kind repair \
-  "Fix the runtime error reported above and add a regression test"
-python -m src.main --session <session-id> --run-kind resume \
-  "Continue the interrupted run"
-python -m src.main --session <session-id> --run-kind new \
-  "Start a separate task in this workspace"
-
-# Attach an existing project (external repositories are never auto-committed)
-python -m src.main --workspace /home/me/projects/billing-api \
-  "Fix the failing invoice test"
-
-# Review with a read-only project binding
-python -m src.main --workspace /home/me/projects/billing-api --read-only \
-  --execution-route review "Review this project for correctness bugs"
-```
-
-### Reset between missions
-
-```bash
-rm -rf sessions/<session-id> managed-workspaces/<session-id>
-```
-
-Deleting a session never deletes an attached external workspace. Managed
-workspaces are deleted with their owning session.
-Set `TASK_CODER_HOME=/path/to/state` to store session state and managed
-workspaces outside this repository.
-
-Artifacts after a run:
-
-- **Managed code:** `managed-workspaces/<session-id>/`
-- **External code:** remains at the attached user path
-- **Plan:** `sessions/<session-id>/plan.json`
-- **Events:** `sessions/<session-id>/events.jsonl`
-- **Handoffs:** `sessions/<session-id>/handoffs/*.json`
-- **Run records:** `sessions/<session-id>/runs/*.json`
-- **Server log:** `experiments/logs/speculative_server.log`
-
----
-
-## Architecture details (local LLM PoC)
+## Architecture details
 
 ### Small context, small tool surface
 
 The Worker receives a small persistent core surface and can discover niche
-capabilities. `tool_registry.py` indexes `config/skills.md` into **Qdrant Cloud** with:
+capabilities. `tool_registry.py` indexes `config/skills.md` into Qdrant
+(embedded by default, or HTTP/Cloud) with:
 
 - **Dense vectors:** `BAAI/bge-base-en-v1.5` (768-dim, local via HuggingFace)
 - **Sparse vectors:** BM25-style TF-IDF with per-skill **keyword boost** from `Keywords:` metadata
@@ -440,7 +622,11 @@ JSON object:
 - A batch of up to 3 calls: `{"calls": [...]}` — one LLM round trip instead of three
 - A status signal: `{"status": "complete" | "blocked" | "request_scope"}`
 
-Native chat messages (system + alternating user/assistant) are sent to the LLM — never a flattened single-turn blob — so the rendered prompt stays append-only and llama.cpp's prefix cache stays hot across turns. On validator FAIL, the conversation **resumes** (not cold-restarts) with the validator's raw contract output appended.
+Native chat messages (system + alternating user/assistant) are sent to the LLM —
+never a flattened single-turn blob — so the rendered prompt stays append-only and
+llama.cpp's prefix cache stays hot across turns. On validator FAIL, the
+conversation **resumes** (not cold-restarts) with the validator's raw contract
+output appended.
 
 ### Progressive tool discovery and enforcement
 
@@ -471,7 +657,7 @@ five consecutive failed calls trips the Worker circuit breaker.
 ### Harness-side validation feedback
 
 After every successful `write_file` / `patch_file`, the harness automatically
-runs the Validator-compiled test or lint check and appends result to the
+runs the Validator-compiled test or lint check and appends the result to the
 worker's next turn. UI checks are run by the Validator after the worker
 signals completion.
 
@@ -528,15 +714,13 @@ Issues the linter can't auto-fix go to the Orchestrator for one patch-ops repair
 - Validator failure logs as negative constraints on retry
 - Structural queries to ground the Worker in prior codebase facts
 
-**Cognee** is opt-in (`MISSIONS_MEMORY_BACKEND=cognee`). When enabled, writes are **fire-and-forget** on a background event loop — they never block the serial pipeline. The JSON store is always written first for durability.
+**Cognee** is opt-in (`MISSIONS_MEMORY_BACKEND=cognee` or Settings → memory backend). When enabled, writes are **fire-and-forget** on a background event loop — they never block the serial pipeline. The JSON store is always written first for durability.
 
 ### Serial execution and VRAM
 
 Parallel multi-agent inference doubles KV-cache pressure and OOMs on 2×16 GB cards. This runtime enforces **one active LLM role at a time**, dedicating the full VRAM budget to whichever agent is running.
 
----
-
-## Model families and MTP throughput
+### Model families, MTP, and thinking
 
 | Model | MTP draft | Notes |
 |---|---|---|
@@ -544,9 +728,15 @@ Parallel multi-agent inference doubles KV-cache pressure and OOMs on 2×16 GB ca
 | **Qwopus3.6** | In-file (`--spec-type draft-mtp`)| Single GGUF from `Jackrong/Qwopus3.6-27B-v2-MTP-GGUF` |
 | **Gemma 4** | Separate assistant GGUF | Target + `*-assistant*` draft; enable draft flags in server script |
 
-Higher throughput from MTP means faster milestone retries and shorter end-to-end missions on the same GPU — important when a 27B local model needs several Validator cycles per feature.
+Higher throughput from MTP means faster milestone retries and shorter end-to-end missions on the same GPU.
 
-For **Qwen3 thinking models**, the client sends `chat_template_kwargs: {"enable_thinking": false}` for thinking-off roles — the `/no_think` prompt prefix is silently ignored by Qwen jinja templates, so without this kwarg the model emits ~270 hidden reasoning tokens per turn, exhausting the completion budget. Per-role thinking levels are env-tunable (`LOCAL_THINKING_LEVEL_ORCHESTRATOR` / `_VALIDATOR`).
+For **Qwen3 thinking models**, adapter `llamacpp_qwen` sends
+`chat_template_kwargs.enable_thinking` from Settings → Agent (per-role
+`thinking` / `thinking_enabled`). The `/no_think` prompt prefix is silently
+ignored by Qwen jinja templates; without the kwarg the model can emit hundreds
+of hidden reasoning tokens per turn. Gemini uses `thinking_config` on adapter
+`gemini_openai`. Newer OpenAI reasoning models use `compat: auto` (or
+`openai_reasoning`) as described under Configure LLMs.
 
 ---
 
@@ -554,17 +744,23 @@ For **Qwen3 thinking models**, the client sends `chat_template_kwargs: {"enable_
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `Connection refused` on port 8001 | llama-server not running | `bash scripts/start_server_speculative.sh` |
-| Empty Worker output, slow turns | Qwen thinking tokens not disabled | Ensure `llm_client.py` sends `enable_thinking: false`; check `LOCAL_THINKING_LEVEL_*` in `.env` |
-| Gemini 400 `Unknown name "seed"` | Gemini rejects OpenAI-only params | Use `--model local` or ensure latest `llm_client.py` strips unsupported params |
-| `[Memory] Cognee write scheduling failed` | Missing `LLM_API_KEY` for Cognee's internal LLM | Set `LLM_API_KEY` + `LLM_PROVIDER=openai` in `.env` (only when `MISSIONS_MEMORY_BACKEND=cognee`) |
-| Qdrant connection errors | Bad URL/key or collection missing | Verify `QDRANT_*` vars; router falls back to keyword matching |
-| Phoenix dashboard empty | Nothing listening on 6006 | Run `phoenix serve` with `PHOENIX_EXTERNAL=true` |
+| `missions doctor` ValidationError on `sandbox.executor` / `mode` | Copied `settings.json` still has `.env` comments in the string | Use `"auto"` / `"balanced"` only; upgrade past the load sanitizer, or edit the two fields |
+| Provider in the dropdown shows **(unavailable)** | `GET {base_url}/models` failed (usually missing key) | Put the key in `secrets.json` as `provider.<id>`; Test in Settings |
+| Provider shows **(disabled)** / `Unknown or disabled provider` | `"enabled": false` or session pinned to that id | Enable it in Settings, or pick Auto / another provider |
+| `Unsupported parameter: max_tokens` | gpt-5 / gpt-6 / o-series Chat Completions | Leave `compat` on `auto`; restart serve so the client remap is loaded |
+| `Connection refused` on port 8001 | llama-server not running | `bash scripts/start_server_speculative.sh` (or your own `/v1` server) |
+| Empty Worker output, slow turns (Qwen) | Thinking not disabled for the worker | Settings → Agent → worker thinking off; adapter `llamacpp_qwen` |
+| Gemini 400 `Unknown name "seed"` | Gemini rejects OpenAI-only params | Adapter `gemini_openai` strips `seed` / `stream_options` |
+| Session token totals missing in the inspector | UI is the old `frontend/dist` bundle | `npm --prefix frontend run build`, hard-refresh 8088 |
+| `[Memory] Cognee write scheduling failed` | Missing key for Cognee's internal LLM | Set Cognee LLM env only when memory backend is `cognee` |
+| Qdrant connection errors | HTTP/Cloud URL or key wrong | Settings → Integrations; embedded mode needs no URL. Keyword fallback still works |
+| Phoenix dashboard empty | Nothing listening on 6006 | `phoenix serve` or disable API telemetry in Settings |
 | Worker edits tests, instant FAIL | Spec-gaming guardrail | Expected — fix implementation, not tests |
 | `REWRITE REJECTED` on write_file | Diff-first enforcement | `read_file` the target first, then `patch_file`; or pass `"rewrite": true` |
 | `MILESTONE BOUNDARY BREACH` | Write jail | Only write to files listed in the milestone's `target_files` |
-| `replan_budget_exhausted` | Replan circuit breaker | Check `failure_signature` in events — the same structural flaw recurred; fix the plan manually |
-| Stale plan resumes wrong mission | Old session state | Create a new session in the UI or delete the stale `sessions/<session-id>/` directory |
+| `replan_budget_exhausted` | Replan circuit breaker | Same `failure_signature` recurred; fix the plan |
+| Stale plan resumes wrong mission | Old session state | New session in the UI, or delete `sessions/<id>/` |
+| Hand-edited `settings.json` ignored | Process already loaded settings | Restart `missions serve` |
 
 ---
 

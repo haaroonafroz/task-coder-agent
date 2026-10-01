@@ -34,6 +34,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from src.llm_client import ModelChoice
+from src.settings import resolve_home
+from src.session_usage import merge_token_usage
 from src.workspace.models import WorkspaceBinding
 from src.workspace.service import WorkspaceService, default_managed_root
 
@@ -41,11 +43,8 @@ _ROOT = Path(__file__).parent.parent
 
 
 def get_default_sessions_root() -> Path:
-    """Keep repository-local state by default, with an optional home override."""
-    task_coder_home = os.getenv("TASK_CODER_HOME", "").strip()
-    if task_coder_home:
-        return Path(task_coder_home).expanduser() / "sessions"
-    return _ROOT / "sessions"
+    """Session state lives under ``$TASK_CODER_HOME/sessions``."""
+    return resolve_home() / "sessions"
 
 
 _SESSIONS_ROOT = get_default_sessions_root()
@@ -78,9 +77,16 @@ class SessionContext:
     phoenix_session_id: Optional[str] = None
     phoenix_project: Optional[str] = None
     thinking_profile: str = "auto"
+    chat_mode: str = "ask"
     reflection_memory_ids_used: list[str] = field(default_factory=list)
     project_profile: Optional[dict[str, Any]] = None
     git_preflight: Optional[dict[str, Any]] = None
+    token_usage: dict[str, int] = field(default_factory=lambda: {
+        "prompt": 0,
+        "generated": 0,
+        "calls": 0,
+        "estimated_calls": 0,
+    })
 
     # ------------------------------------------------------------------
     # Convenience
@@ -124,9 +130,16 @@ class SessionContext:
             "phoenix_session_id": self.phoenix_session_id,
             "phoenix_project": self.phoenix_project,
             "thinking_profile": self.thinking_profile,
+            "chat_mode": self.chat_mode,
             "reflection_memory_ids_used": self.reflection_memory_ids_used,
             "project_profile": self.project_profile,
             "git_preflight": self.git_preflight,
+            "token_usage": self.token_usage or {
+                "prompt": 0,
+                "generated": 0,
+                "calls": 0,
+                "estimated_calls": 0,
+            },
         }
 
 
@@ -218,6 +231,7 @@ class SessionManager:
             created_at=now,
             status="created",
             thinking_profile=thinking_profile,
+            chat_mode="ask",
             phoenix_project=phoenix_project,
             phoenix_session_id=session_id,  # bind 1:1 by default
             project_profile=profile,
@@ -280,20 +294,36 @@ class SessionManager:
         # readers (e.g. the API server thread) never see a partial file.
         import os
         import tempfile
-        data = json.dumps(ctx.to_meta_dict(), indent=2)
-        fd, tmp = tempfile.mkstemp(
-            dir=str(ctx.meta_path.parent), suffix=".tmp", prefix="session_"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(data)
-            os.replace(tmp, ctx.meta_path)
-        except Exception:
+
+        from src.session_usage import META_LOCK, merge_token_usage
+
+        with META_LOCK:
+            existing: dict[str, Any] = {}
+            if ctx.meta_path.is_file():
+                try:
+                    existing = json.loads(ctx.meta_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    existing = {}
+            data = ctx.to_meta_dict()
+            data["token_usage"] = merge_token_usage(
+                existing.get("token_usage") if isinstance(existing, dict) else None,
+                data.get("token_usage"),
+            )
+            ctx.token_usage = data["token_usage"]
+            payload = json.dumps(data, indent=2)
+            fd, tmp = tempfile.mkstemp(
+                dir=str(ctx.meta_path.parent), suffix=".tmp", prefix="session_"
+            )
             try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(payload)
+                os.replace(tmp, ctx.meta_path)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
 
     # ------------------------------------------------------------------
     # Internal
@@ -335,7 +365,9 @@ class SessionManager:
             phoenix_session_id=meta.get("phoenix_session_id"),
             phoenix_project=meta.get("phoenix_project"),
             thinking_profile=meta.get("thinking_profile", "auto"),
+            chat_mode=meta.get("chat_mode", "ask"),
             reflection_memory_ids_used=meta.get("reflection_memory_ids_used", []),
             project_profile=meta.get("project_profile"),
             git_preflight=meta.get("git_preflight"),
+            token_usage=merge_token_usage(meta.get("token_usage")),
         )

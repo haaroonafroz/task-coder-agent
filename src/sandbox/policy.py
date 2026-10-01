@@ -172,7 +172,11 @@ class PolicyVerdict:
 
 
 def get_sandbox_mode() -> SandboxMode:
-    raw = os.getenv("SANDBOX_MODE", "balanced").strip().lower()
+    try:
+        from src.settings import get_settings
+        raw = get_settings().runtime.sandbox.mode
+    except Exception:
+        raw = os.getenv("SANDBOX_MODE", "balanced").strip().lower()
     try:
         return SandboxMode(raw)
     except ValueError:

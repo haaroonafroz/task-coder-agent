@@ -7,7 +7,7 @@ import {
   type CSSProperties,
   type MouseEvent as ReactMouseEvent,
 } from "react";
-import type { DecisionAction, Message, ReviewFixMode } from "./api/types";
+import type { ChatMode, DecisionAction, Message, ReviewFixMode } from "./api/types";
 import { api } from "./api/client";
 import {
   useSessions,
@@ -22,6 +22,8 @@ import {
 import { SessionSidebar } from "./components/SessionSidebar";
 import { ChatPanel } from "./components/ChatPanel";
 import { RunInspector } from "./components/RunInspector";
+import { SettingsPanel } from "./components/SettingsPanel";
+import { SetupWizard } from "./components/SetupWizard";
 
 const RIGHT_PANEL_MIN = 360;
 const RIGHT_PANEL_MAX = 820;
@@ -35,9 +37,19 @@ export default function App() {
     return Number.isFinite(parsed) ? parsed : RIGHT_PANEL_DEFAULT;
   });
   const resizingRef = useRef(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [needsSetup, setNeedsSetup] = useState<boolean | null>(null);
 
   const { sessions, refresh: refreshSessions } = useSessions();
   const { session, setSession } = useSession(activeSid);
+
+  useEffect(() => {
+    api.getSettings()
+      .then((data) => {
+        setNeedsSetup(data.settings.llm.providers.length === 0);
+      })
+      .catch(() => setNeedsSetup(false));
+  }, []);
   const { messages, sending, sendMessage, appendMessage } = useMessages(activeSid);
   const { decision, resolving: resolvingDecision, refresh: refreshDecision, resolve: resolveDecision } =
     useDecision(activeSid);
@@ -76,7 +88,9 @@ export default function App() {
         break;
       case "plan.created":
       case "plan.updated":
+      case "plan.ready":
         refreshPlan();
+        refreshDecision();
         break;
       case "tool.result": {
         const tool = lastEv.data?.tool as string | undefined;
@@ -137,8 +151,9 @@ export default function App() {
       triggerRun: boolean,
       model?: string,
       reviewFixMode?: ReviewFixMode,
+      chatMode?: ChatMode,
     ) => {
-      const msg = await sendMessage(content, triggerRun, model, reviewFixMode);
+      const msg = await sendMessage(content, triggerRun, model, reviewFixMode, chatMode);
       if (msg && triggerRun) {
         refreshRuns();
         refreshSessions();
@@ -210,6 +225,20 @@ export default function App() {
     "--right-panel-width": `${rightPanelWidth}px`,
   } as CSSProperties;
 
+  if (needsSetup === null) {
+    return <div className="wizard-overlay"><div className="wizard-card">Loading…</div></div>;
+  }
+  if (needsSetup) {
+    return (
+      <SetupWizard
+        onComplete={() => {
+          setNeedsSetup(false);
+          refreshSessions();
+        }}
+      />
+    );
+  }
+
   return (
     <div className="app-layout" style={layoutStyle}>
       {/* Left: Sessions */}
@@ -218,6 +247,7 @@ export default function App() {
         activeSid={activeSid}
         onSelect={handleSelectSession}
         onCreated={refreshSessions}
+        onOpenSettings={() => setSettingsOpen(true)}
       />
 
       {/* Center: Chat */}
@@ -231,6 +261,7 @@ export default function App() {
         resolvingDecision={resolvingDecision}
         onSend={handleSend}
         onResolveDecision={handleResolveDecision}
+        onCancelRun={handleCancelRun}
       />
 
       <div className="right-resizer" onMouseDown={handleResizeStart} />
@@ -246,6 +277,10 @@ export default function App() {
         onOpenFile={openFile}
         onRefreshWorkspace={refreshTree}
         onCancelRun={handleCancelRun}
+      />
+      <SettingsPanel
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
       />
     </div>
   );

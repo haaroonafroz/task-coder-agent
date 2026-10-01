@@ -1,0 +1,31 @@
+# App-only compose. Inference stays on the host or another profile.
+#
+#   docker compose up --build
+#   open http://localhost:8088
+#
+# Local Ollama/llama.cpp on the host:
+#   Settings → base URL http://host.docker.internal:11434/v1  (or :8001/v1)
+#
+# Attach a host project (optional):
+#   extra bind mount, then type the *container* path in the UI.
+
+services:
+  app:
+    build: .
+    ports:
+      - "8088:8088"
+    environment:
+      TASK_CODER_HOME: /data
+      MISSIONS_CONTAINER: "true"
+      SANDBOX_EXECUTOR: native
+      MISSIONS_QDRANT_MODE: embedded
+      MISSIONS_API_TELEMETRY: "false"
+    volumes:
+      - missions-data:/data
+      # Uncomment to attach a host projects directory:
+      # - ${HOME}/projects:/host-projects
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  missions-data:

@@ -32,7 +32,10 @@ export function LLMStatsBar({ metrics, contextLength }: Props) {
       <div className="llm-stats-row">
         <span>prefill {prefillSpeed}</span>
         <span>decode {decodeSpeed}</span>
-        <span>{metrics.tokens_prompt} prompt · {metrics.tokens_generated} generated</span>
+        <span>
+          {metrics.tokens_prompt} prompt · {metrics.tokens_generated} generated
+          {metrics.tokens_estimated ? " (est.)" : ""}
+        </span>
       </div>
       {contextMax && (
         <div className="llm-context-row">

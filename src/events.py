@@ -112,6 +112,10 @@ class EventEmitter:
         self._lock = threading.Lock()
         self._path.parent.mkdir(parents=True, exist_ok=True)
 
+    @property
+    def events_path(self) -> Path:
+        return self._path
+
     # ------------------------------------------------------------------
     # Emission
     # ------------------------------------------------------------------

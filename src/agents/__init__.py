@@ -8,7 +8,9 @@ Agent phase implementations for the Missions Runtime.
   utils        — Shared JSON parsing, conversation, and filesystem utilities
 """
 
-from src.agents.orchestrator import run_orchestration, replan_mission
+from src.agents.orchestrator import run_orchestration, replan_mission, adjust_plan_from_user
+from src.agents.ask import run_ask
+from src.agents.compact import compact_conversation
 from src.agents.code_review import run_code_review
 from src.agents.hotfix import run_hotfix
 from src.agents.triage import run_triage
@@ -21,6 +23,9 @@ __all__ = [
     "run_hotfix",
     "run_orchestration",
     "replan_mission",
+    "adjust_plan_from_user",
+    "run_ask",
+    "compact_conversation",
     "run_worker",
     "run_validator",
 ]

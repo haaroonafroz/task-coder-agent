@@ -300,7 +300,11 @@ def uninstall_dependency(package_name: str) -> dict[str, Any]:
 # search_grep
 # ---------------------------------------------------------------------------
 
-def search_grep(query: str, target_dir: str = ".") -> dict[str, Any]:
+def search_grep(
+    query: str,
+    target_dir: str = ".",
+    max_results: int = 200,
+) -> dict[str, Any]:
     """
     Regex search across all files in target_dir using Python's re module.
 
@@ -308,7 +312,8 @@ def search_grep(query: str, target_dir: str = ".") -> dict[str, Any]:
 
     Args:
         query:      Python regex pattern.
-        target_dir: Directory relative to workspace/ (default: workspace root).
+        target_dir:  Directory relative to workspace/ (default: workspace root).
+        max_results: Hard ceiling on returned matches.
 
     Returns:
         {"success": bool, "matches": [{"file", "line_no", "text"}], "match_count": int, "cwd": str}
@@ -333,10 +338,19 @@ def search_grep(query: str, target_dir: str = ".") -> dict[str, Any]:
             "error": f"Directory not found: {normalize_workspace_path(target_dir)}",
         }
 
+    max_results = min(500, max(1, int(max_results)))
     ws_root = get_workspace_root().resolve()
 
     rg_result = _run_argv(
-        ["rg", "--line-number", "--no-heading", query, str(target.relative_to(ws_root))],
+        [
+            "rg",
+            "--line-number",
+            "--no-heading",
+            "--max-count",
+            str(max_results),
+            query,
+            str(target.relative_to(ws_root)),
+        ],
         cwd=ws_root,
         timeout=30,
     )
@@ -346,13 +360,19 @@ def search_grep(query: str, target_dir: str = ".") -> dict[str, Any]:
             parts = line.split(":", 2)
             if len(parts) >= 3:
                 abs_file = ws_root / parts[0]
+                if is_sensitive_workspace_path(abs_file):
+                    continue
                 try:
                     rel_file = str(abs_file.resolve().relative_to(ws_root))
                 except ValueError:
                     rel_file = parts[0]
                 matches.append({"file": rel_file, "line_no": parts[1], "text": parts[2]})
             elif len(parts) == 2:
+                if is_sensitive_workspace_path(ws_root / parts[0]):
+                    continue
                 matches.append({"file": parts[0], "line_no": parts[1], "text": ""})
+            if len(matches) >= max_results:
+                break
         return {
             "success": True,
             "matches": matches,
@@ -381,6 +401,10 @@ def search_grep(query: str, target_dir: str = ".") -> dict[str, Any]:
                         "line_no": str(line_no),
                         "text": line,
                     })
+                    if len(matches) >= max_results:
+                        break
+            if len(matches) >= max_results:
+                break
         except Exception:
             continue
 

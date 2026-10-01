@@ -14,7 +14,7 @@ from src.agents.contracts import normalize_escalation_decision
 from src.agents.llm_stream_events import stream_context_for
 from src.agents.utils import parse_json_from_text
 from src.events import EventEmitter
-from src.llm_client import ModelChoice, call_llm, resolve_model_config
+from src.llm_client import ModelChoice, call_llm, span_model_name
 from src.telemetry import TelemetryContext, span_llm_call
 
 _ROOT = Path(__file__).parent.parent.parent
@@ -62,9 +62,7 @@ def run_escalation_triage(
         f"## Project\n```json\n{json.dumps(project_profile or {}, indent=2)[:3000]}\n```\n\n"
         "Emit the escalation JSON now."
     )
-    span_model = (
-        resolve_model_config(model, "triage").model_name if model != "auto" else model
-    )
+    span_model = span_model_name(model, "triage")
     try:
         with span_llm_call("escalation", "triage", span_model, session=session):
             result = call_llm(

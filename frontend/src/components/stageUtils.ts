@@ -17,6 +17,8 @@ export function stageFromEventType(eventType: string): string {
     "review.started": "Code Review",
     "review.completed": "Review Complete",
     "review.escalated": "Escalating Review",
+    "verify_hotfix.started": "Verify-Hotfix",
+    "verify_hotfix.completed": "Verify-Hotfix Complete",
     "tool.called": "Tool Execution",
     "tool.result": "Tool Execution",
     "validation.started": "Validation",

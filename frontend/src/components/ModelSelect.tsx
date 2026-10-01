@@ -1,18 +1,18 @@
+import { useEffect } from "react";
 import type { ModelChoice, ModelInfo } from "../api/types";
 
 /** Human-readable label for a backend option in the model selector. */
 export function formatModelOption(m: ModelInfo): string {
-  if (m.key === "auto") return "Auto";
+  if (m.key === "auto") return m.model?.startsWith("(auto") ? "Auto" : "Auto";
 
+  const label = m.label || (m.key === "gpt4o" ? "OpenAI" : m.key);
   const orch = m.models_by_role?.orchestrator ?? m.model;
   const worker = m.models_by_role?.worker;
-  const keyLabel =
-    m.key === "gpt4o" ? "GPT" : m.key.charAt(0).toUpperCase() + m.key.slice(1);
-
-  if (worker && worker !== orch) {
-    return `${keyLabel} (${orch} / worker ${worker})`;
+  if (worker && worker !== orch && orch) {
+    return `${label} (${orch} / worker ${worker})`;
   }
-  return `${keyLabel} (${orch})`;
+  if (orch) return `${label} (${orch})`;
+  return String(label);
 }
 
 interface Props {
@@ -28,10 +28,15 @@ export function ModelSelect({ value, models, onChange, className }: Props) {
       ? models
       : ([
           { key: "auto", model: "Auto", base_url: "", available: true, error: null },
-          { key: "local", model: "Local", base_url: "", available: true, error: null },
-          { key: "gemini", model: "Gemini", base_url: "", available: true, error: null },
-          { key: "gpt4o", model: "GPT", base_url: "", available: true, error: null },
         ] as ModelInfo[]);
+
+  useEffect(() => {
+    if (!value || value === "auto" || options.length === 0) return;
+    const selected = options.find((m) => m.key === value);
+    if (!selected || selected.enabled === false || !selected.available) {
+      onChange("auto");
+    }
+  }, [value, options, onChange]);
 
   return (
     <select
@@ -40,9 +45,17 @@ export function ModelSelect({ value, models, onChange, className }: Props) {
       onChange={(e) => onChange(e.target.value as ModelChoice)}
     >
       {options.map((m) => (
-        <option key={m.key} value={m.key} disabled={m.key !== "auto" && !m.available}>
+        <option
+          key={m.key}
+          value={m.key}
+          disabled={m.key !== "auto" && (m.enabled === false || !m.available)}
+        >
           {formatModelOption(m)}
-          {m.key !== "auto" && !m.available ? " (unavailable)" : ""}
+          {m.key !== "auto" && m.enabled === false
+            ? " (disabled)"
+            : m.key !== "auto" && !m.available
+              ? " (unavailable)"
+              : ""}
         </option>
       ))}
     </select>

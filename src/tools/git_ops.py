@@ -8,8 +8,42 @@ from typing import Any
 from src.sandbox.context import get_sandbox_context
 from src.sandbox.executor import get_executor
 from src.sandbox.policy import NetworkMode
+from src.tools.paths import is_sensitive_workspace_path
 
 _REPO_ROOT = Path(__file__).parent.parent.parent  # legacy fallback
+
+
+def _filter_sensitive_diff(diff_text: str) -> str:
+    """Remove complete unified-diff sections for known secret-bearing paths."""
+    sections: list[str] = []
+    current: list[str] = []
+    current_sensitive = False
+
+    def _flush() -> None:
+        if current and not current_sensitive:
+            sections.extend(current)
+
+    for line in diff_text.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            _flush()
+            current = [line]
+            header = line[len("diff --git "):].strip()
+            left, separator, right = header.partition(" b/")
+            left_path = left.removeprefix("a/").strip('"')
+            right_path = right.strip('"') if separator else ""
+            current_sensitive = (
+                is_sensitive_workspace_path(left_path)
+                or is_sensitive_workspace_path(right_path)
+            )
+        else:
+            current.append(line)
+            if line.startswith(("--- ", "+++ ")):
+                marker_path = line[4:].strip().strip('"')
+                marker_path = marker_path.removeprefix("a/").removeprefix("b/")
+                if marker_path != "/dev/null" and is_sensitive_workspace_path(marker_path):
+                    current_sensitive = True
+    _flush()
+    return "".join(sections)
 
 
 def _git_root() -> Path:
@@ -134,13 +168,13 @@ def git_diff() -> dict[str, Any]:
     if not result["success"] and result["stderr"]:
         result = _git("diff", "--cached", cwd=root)
 
-    diff_text = result["stdout"] or "(no changes)"
+    diff_text = _filter_sensitive_diff(result["stdout"]) or "(no changes)"
     ctx = get_sandbox_context()
     preflight = ctx.git_preflight if ctx is not None else None
     return {
         "success": True,
         "diff": diff_text,
-        "has_changes": bool(result["stdout"].strip()),
+        "has_changes": bool(diff_text.strip() and diff_text != "(no changes)"),
         "preexisting_changes": preflight or {},
         "note": (
             "Diff may include user changes that existed before this run; compare "

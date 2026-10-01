@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from src.llm_client import ModelChoice
 
 ExecutionRoute = Literal["auto", "mission", "hotfix", "review"]
+ChatMode = Literal["ask", "plan", "build"]
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +67,7 @@ class SessionUpdate(BaseModel):
     status: Optional[str] = None
     selected_model: Optional[ModelChoice] = None
     thinking_profile: Optional[str] = None
+    chat_mode: Optional[ChatMode] = None
 
 
 class SessionResponse(BaseModel):
@@ -74,6 +76,7 @@ class SessionResponse(BaseModel):
     status: str
     selected_model: str
     thinking_profile: str
+    chat_mode: ChatMode = "ask"
     created_at: str
     phoenix_session_id: Optional[str] = None
     phoenix_project: Optional[str] = None
@@ -82,6 +85,14 @@ class SessionResponse(BaseModel):
     events_path: str
     workspace: WorkspaceResponse
     project_profile: Optional[dict[str, Any]] = None
+    token_usage: dict[str, int] = Field(
+        default_factory=lambda: {
+            "prompt": 0,
+            "generated": 0,
+            "calls": 0,
+            "estimated_calls": 0,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +106,7 @@ class MessageCreate(BaseModel):
     run_kind: Literal["auto", "new", "resume", "repair"] = "auto"
     execution_route: ExecutionRoute = "auto"
     review_fix_mode: Literal["auto", "ask"] = "ask"
+    chat_mode: ChatMode = "build"
 
 
 class PendingDecisionResponse(BaseModel):
@@ -109,7 +121,12 @@ class PendingDecisionResponse(BaseModel):
 
 class DecisionCreate(BaseModel):
     action: Literal[
-        "apply_fix", "dismiss", "escalate_mission", "run_smoke", "setup_env"
+        "apply_fix",
+        "dismiss",
+        "escalate_mission",
+        "run_smoke",
+        "setup_env",
+        "approve_plan",
     ]
 
 
@@ -128,6 +145,7 @@ class MessageResponse(BaseModel):
     run_id: Optional[str] = None
     run_kind: Optional[str] = None
     execution_route: Optional[str] = None
+    chat_mode: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +158,8 @@ class RunCreate(BaseModel):
     run_kind: Literal["auto", "new", "resume", "repair"] = "auto"
     execution_route: ExecutionRoute = "auto"
     review_fix_mode: Literal["auto", "ask"] = "ask"
+    chat_mode: ChatMode = "build"
+    skip_orchestration: bool = False
 
 
 class RunResponse(BaseModel):
@@ -157,6 +177,8 @@ class RunResponse(BaseModel):
     execution_route: str = "auto"
     plan_id: Optional[str] = None
     review_fix_mode: str = "ask"
+    chat_mode: ChatMode = "build"
+    skip_orchestration: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +189,7 @@ class PlanResponse(BaseModel):
     mission_id: Optional[str] = None
     title: Optional[str] = None
     milestones: list[dict[str, Any]] = Field(default_factory=list)
+    approval_state: Optional[str] = None
 
 
 class HandoffResponse(BaseModel):
@@ -234,6 +257,12 @@ class ModelInfo(BaseModel):
     models_by_role: dict[str, str] = Field(default_factory=dict)
     thinking_by_role: dict[str, str] = Field(default_factory=dict)
     context_length: Optional[int] = None
+    label: Optional[str] = None
+    adapter: Optional[str] = None
+    compat: Optional[str] = None
+    enabled: bool = True
+    api_key_set: bool = False
+    discovered_models: list[str] = Field(default_factory=list)
 
 
 class ToolParamSchema(BaseModel):
@@ -274,6 +303,11 @@ class UploadResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str  # "ok" | "degraded"
     version: str = "1"
+    home: str = ""
+    qdrant: dict[str, Any] = Field(default_factory=dict)
+    embeddings: str = "none"
+    sandbox: dict[str, Any] = Field(default_factory=dict)
+    providers_configured: int = 0
 
 
 class ReadyResponse(BaseModel):
@@ -305,3 +339,31 @@ class SessionEvalReportResponse(BaseModel):
     event_count: int
     deterministic_only: bool = True
     weights: dict[str, float] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+class SettingsResponse(BaseModel):
+    settings: dict[str, Any]
+    home: str
+    presets: list[dict[str, Any]] = Field(default_factory=list)
+    migrated_from_env: bool = False
+    container: bool = False
+
+
+class SettingsUpdate(BaseModel):
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProviderProbeRequest(BaseModel):
+    base_url: str
+    api_key: Optional[str] = None
+    provider_id: Optional[str] = None
+
+
+class ProviderProbeResponse(BaseModel):
+    ok: bool
+    models: list[str] = Field(default_factory=list)
+    error: Optional[str] = None

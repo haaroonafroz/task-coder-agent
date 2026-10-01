@@ -11,7 +11,7 @@ from src.agents.orchestrator_explore import build_workspace_orientation
 from src.agents.utils import parse_json_from_text
 from src.agents.llm_stream_events import stream_context_for
 from src.events import EventEmitter
-from src.llm_client import ModelChoice, call_llm, resolve_model_config
+from src.llm_client import ModelChoice, call_llm, span_model_name
 from src.telemetry import TelemetryContext, span_llm_call
 
 _ROOT = Path(__file__).parent.parent.parent
@@ -73,11 +73,7 @@ def run_triage(
         previous_plan=previous_plan,
         project_profile=project_profile,
     )
-    span_model = (
-        resolve_model_config(model, "triage").model_name
-        if model != "auto"
-        else model
-    )
+    span_model = span_model_name(model, "triage")
     last_error = "unknown"
     result_text = ""
 

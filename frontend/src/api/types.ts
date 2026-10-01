@@ -1,15 +1,17 @@
 // TypeScript types mirroring the Phase 3 FastAPI Pydantic schemas.
 
-export type ModelChoice = "auto" | "local" | "gemini" | "gpt4o";
+export type ModelChoice = string;
 export type RunKind = "auto" | "new" | "resume" | "repair";
 export type ExecutionRoute = "auto" | "mission" | "hotfix" | "review";
 export type ReviewFixMode = "ask" | "auto";
+export type ChatMode = "ask" | "plan" | "build";
 export type DecisionAction =
   | "apply_fix"
   | "dismiss"
   | "escalate_mission"
   | "run_smoke"
-  | "setup_env";
+  | "setup_env"
+  | "approve_plan";
 
 export interface PendingDecision {
   type: string;
@@ -53,6 +55,7 @@ export interface Session {
   status: string;
   selected_model: string;
   thinking_profile: string;
+  chat_mode?: ChatMode;
   created_at: string;
   phoenix_session_id: string | null;
   phoenix_project: string | null;
@@ -61,6 +64,12 @@ export interface Session {
   events_path: string;
   workspace: WorkspaceBinding;
   project_profile?: Record<string, unknown> | null;
+  token_usage?: {
+    prompt: number;
+    generated: number;
+    calls: number;
+    estimated_calls?: number;
+  };
 }
 
 export interface Message {
@@ -71,6 +80,7 @@ export interface Message {
   run_id: string | null;
   run_kind?: RunKind;
   execution_route?: ExecutionRoute;
+  chat_mode?: ChatMode;
 }
 
 export interface Run {
@@ -95,6 +105,8 @@ export interface Run {
   run_kind: RunKind;
   execution_route?: ExecutionRoute;
   review_fix_mode?: ReviewFixMode;
+  chat_mode?: ChatMode;
+  skip_orchestration?: boolean;
   plan_id: string | null;
 }
 
@@ -111,6 +123,7 @@ export interface Plan {
   mission_id?: string;
   title?: string;
   milestones: Milestone[];
+  approval_state?: string;
 }
 
 export interface Handoff {
@@ -143,6 +156,79 @@ export interface ModelInfo {
   models_by_role?: Record<string, string>;
   thinking_by_role?: Record<string, string>;
   context_length?: number | null;
+  label?: string | null;
+  adapter?: string | null;
+  compat?: string | null;
+  enabled?: boolean;
+  api_key_set?: boolean;
+  discovered_models?: string[];
+}
+
+export interface ProviderPreset {
+  id: string;
+  label: string;
+  base_url: string;
+  adapter: string;
+  model?: string;
+  models_by_role?: Record<string, string>;
+  context_length?: number;
+}
+
+export interface MissionsSettingsPayload {
+  llm: {
+    providers: Array<{
+      id: string;
+      label: string;
+      base_url: string;
+      adapter: string;
+      model: string;
+      models_by_role: Record<string, string>;
+      compat?: string;
+      enabled: boolean;
+      context_length: number | null;
+      api_key: string;
+      api_key_set: boolean;
+    }>;
+    default_provider: string;
+    fallback_order: string[];
+    seed: number;
+    context_length: number;
+  };
+  roles: Record<string, {
+    temperature: number;
+    top_p: number;
+    max_tokens: number;
+    thinking: string;
+    thinking_enabled: boolean;
+  }>;
+  qdrant: {
+    mode: "embedded" | "http" | "off";
+    path: string;
+    url: string;
+    api_key: string;
+    api_key_set: boolean;
+    collection: string;
+    dense_name: string;
+    sparse_name: string;
+    dense_dims: number;
+  };
+  embeddings: {
+    backend: "auto" | "hf" | "openai" | "none";
+    hf_model: string;
+    openai_model: string;
+    openai_dims: number;
+  };
+  runtime: Record<string, unknown>;
+  observability: Record<string, unknown>;
+  memory: { backend: string };
+}
+
+export interface SettingsResponse {
+  settings: MissionsSettingsPayload;
+  home: string;
+  presets: ProviderPreset[];
+  migrated_from_env: boolean;
+  container: boolean;
 }
 
 export interface ToolParam {
@@ -208,7 +294,10 @@ export type AgentRole =
   | "hotfix"
   | "reviewer"
   | "validator"
-  | "triage";
+  | "verify_hotfix"
+  | "triage"
+  | "ask"
+  | "compact";
 
 export interface LLMMetrics {
   call_id: string;
@@ -228,6 +317,7 @@ export interface LLMMetrics {
   thinking_chars?: number;
   output_chars?: number;
   fallback_used?: boolean;
+  tokens_estimated?: boolean;
 }
 
 export interface ToolCallEntry {
@@ -235,6 +325,8 @@ export interface ToolCallEntry {
   reasoning?: string;
   ts: string;
   milestone_id?: string;
+  args?: Record<string, unknown>;
+  success?: boolean;
 }
 
 export interface AgentTurn {
